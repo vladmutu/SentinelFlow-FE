@@ -162,6 +162,8 @@ function DashboardHeader({
 
         <a
           href={installUrl}
+          target="_blank"
+          rel="noopener noreferrer"
           className="inline-flex items-center rounded-lg border border-slate-600 bg-slate-800/70 px-3 py-2 text-xs font-semibold uppercase tracking-[0.1em] text-slate-200 transition hover:border-cyan-300/60 hover:text-cyan-100"
         >
           Manage Repository Access
@@ -184,36 +186,36 @@ function DashboardHeader({
 }
 
 function RepositoryCard({ repo }: { repo: RepositoryItem }) {
+  const repoUrl = `/dashboard/repo/${encodeURIComponent(repo.name)}`;
+
   return (
-    <article className="group rounded-2xl border border-slate-700/70 bg-slate-900/55 p-5 transition duration-200 hover:-translate-y-0.5 hover:border-cyan-300/45 hover:bg-slate-900/85 hover:shadow-[0_18px_36px_-24px_rgba(34,211,238,0.85)]">
-      <div className="flex items-start justify-between gap-3">
-        <h2 className="line-clamp-1 text-lg font-semibold text-slate-100">{repo.name}</h2>
-        <span
-          className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${
-            repo.visibility === "private"
-              ? "border-amber-300/35 bg-amber-400/10 text-amber-200"
-              : "border-emerald-300/35 bg-emerald-400/10 text-emerald-200"
-          }`}
-        >
-          {repo.visibility === "private" ? "Private" : "Public"}
-        </span>
-      </div>
+    <Link href={repoUrl} className="block">
+      <article className="group rounded-2xl border border-slate-700/70 bg-slate-900/55 p-5 transition duration-200 hover:-translate-y-0.5 hover:border-cyan-300/45 hover:bg-slate-900/85 hover:shadow-[0_18px_36px_-24px_rgba(34,211,238,0.85)]">
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="line-clamp-1 text-lg font-semibold text-slate-100">{repo.name}</h2>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${
+              repo.visibility === "private"
+                ? "border-amber-300/35 bg-amber-400/10 text-amber-200"
+                : "border-emerald-300/35 bg-emerald-400/10 text-emerald-200"
+            }`}
+          >
+            {repo.visibility === "private" ? "Private" : "Public"}
+          </span>
+        </div>
 
-      <p className="mt-3 line-clamp-3 min-h-[4.3rem] text-sm leading-relaxed text-slate-300">{repo.description}</p>
+        <p className="mt-3 line-clamp-3 min-h-[4.3rem] text-sm leading-relaxed text-slate-300">{repo.description}</p>
 
-      <div className="mt-5 flex items-center justify-between">
-        <p className="rounded-full border border-slate-700 bg-slate-900/90 px-2.5 py-1 text-xs font-medium text-slate-300">
-          {repo.language}
-        </p>
-      </div>
-
-      <button
-        type="button"
-        className="mt-5 inline-flex w-full items-center justify-center rounded-xl border border-cyan-300/40 bg-cyan-400/15 px-4 py-2.5 text-sm font-semibold text-cyan-100 transition hover:border-cyan-200/80 hover:bg-cyan-400/25 hover:text-white"
-      >
-        Scan Dependencies
-      </button>
-    </article>
+        <div className="mt-5 flex items-center justify-between">
+          <p className="rounded-full border border-slate-700 bg-slate-900/90 px-2.5 py-1 text-xs font-medium text-slate-300">
+            {repo.language}
+          </p>
+          <span className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-300/90 transition group-hover:text-cyan-200">
+            Open Details
+          </span>
+        </div>
+      </article>
+    </Link>
   );
 }
 
@@ -229,6 +231,8 @@ function EmptyRepositoriesState({ installUrl }: { installUrl: string }) {
       </p>
       <a
         href={installUrl}
+        target="_blank"
+        rel="noopener noreferrer"
         className="mt-6 inline-flex items-center justify-center rounded-xl border border-cyan-200/70 bg-cyan-400/20 px-6 py-3 text-sm font-semibold tracking-wide text-cyan-100 transition hover:bg-cyan-400/30 hover:text-white"
       >
         Select Repositories to Scan
