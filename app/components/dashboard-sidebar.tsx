@@ -1,4 +1,8 @@
+"use client";
+
 import { GithubSession, Repository } from "@/app/types/dashboard";
+import { clientSessionStorage } from "@/app/lib/auth/client-session";
+import { clearCacheNamespace } from "@/app/lib/browser-cache";
 
 interface DashboardSidebarProps {
   session: GithubSession;
@@ -37,7 +41,17 @@ export function DashboardSidebar({
             <p className="truncate text-xs text-muted">@{session.login}</p>
           </div>
         </div>
-        <form action="/api/auth/logout" method="post">
+        <form
+          action="/api/auth/logout"
+          method="post"
+          onSubmit={() => {
+            clientSessionStorage.clearToken();
+            clearCacheNamespace("dashboard-snapshot");
+            clearCacheNamespace("repo-tree");
+            clearCacheNamespace("scan-results");
+            clearCacheNamespace("dependency-graph");
+          }}
+        >
           <button type="submit" className="button-secondary w-full">
             Sign out
           </button>

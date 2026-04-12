@@ -4,11 +4,15 @@ import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-const TOKEN_STORAGE_KEY = "sentinel_token";
+import { clientSessionStorage } from "@/app/lib/auth/client-session";
+import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
+
 const SESSION_ENDPOINT = "http://localhost:8000/api/auth/me";
 const REPOS_ENDPOINT = "http://localhost:8000/api/repos";
 const GITHUB_APP_NAME = process.env.NEXT_PUBLIC_GITHUB_APP_NAME;
 const GITHUB_INSTALLATION_URL = `https://github.com/apps/${GITHUB_APP_NAME}/installations/new`;
+const DASHBOARD_CACHE_TTL_MS = 1000 * 60 * 20;
+const DASHBOARD_CACHE_MAX_BYTES = 1_000_000;
 
 type DashboardUser = {
   login: string;
@@ -18,10 +22,25 @@ type DashboardUser = {
 type RepositoryItem = {
   id: string;
   name: string;
+  full_name?: string;
   visibility: "public" | "private";
   description: string;
   language: string;
 };
+
+function normalizeLanguageToEcosystem(language: string): "npm" | "pypi" | null {
+  const normalized = language.trim().toLowerCase();
+
+  if (!normalized || normalized === "unknown") {
+    return null;
+  }
+
+  if (normalized.includes("python")) {
+    return "pypi";
+  }
+
+  return "npm";
+}
 
 type DashboardState = {
   user: DashboardUser | null;
@@ -54,17 +73,14 @@ type RepoApiPayload = {
 
 type ReposResponsePayload = RepoApiPayload[] | { repos?: RepoApiPayload[] };
 
-const tokenStorage = {
-  read() {
-    return localStorage.getItem(TOKEN_STORAGE_KEY);
-  },
-  save(token: string) {
-    localStorage.setItem(TOKEN_STORAGE_KEY, token);
-  },
-  clear() {
-    localStorage.removeItem(TOKEN_STORAGE_KEY);
-  },
+type DashboardCacheSnapshot = {
+  user: DashboardUser;
+  repos: RepositoryItem[];
 };
+
+function buildDashboardCacheKey(token: string) {
+  return createCacheKey("dashboard-snapshot", hashString(token));
+}
 
 function normalizeUser(payload: UserApiPayload): DashboardUser {
   const source = payload.user ?? payload;
@@ -91,6 +107,7 @@ function toRepositoryItem(payload: RepoApiPayload, index: number): RepositoryIte
         : fallbackName;
   const description = typeof payload.description === "string" ? payload.description : "No description provided.";
   const language = typeof payload.language === "string" && payload.language.length > 0 ? payload.language : "Unknown";
+  const fullName = typeof payload.full_name === "string" && payload.full_name.length > 0 ? payload.full_name : undefined;
 
   const visibility =
     payload.visibility === "private" || payload.private === true
@@ -100,6 +117,7 @@ function toRepositoryItem(payload: RepoApiPayload, index: number): RepositoryIte
   return {
     id,
     name,
+    full_name: fullName,
     visibility,
     description,
     language,
@@ -186,7 +204,19 @@ function DashboardHeader({
 }
 
 function RepositoryCard({ repo }: { repo: RepositoryItem }) {
-  const repoUrl = `/dashboard/repo/${encodeURIComponent(repo.name)}`;
+  const ecosystem = normalizeLanguageToEcosystem(repo.language);
+  const params = new URLSearchParams();
+
+  if (repo.language && repo.language !== "Unknown") {
+    params.set("language", repo.language);
+  }
+
+  if (ecosystem) {
+    params.set("ecosystem", ecosystem);
+  }
+
+  const queryString = params.toString();
+  const repoUrl = `/dashboard/repo/${encodeURIComponent(repo.name)}${queryString ? `?${queryString}` : ""}`;
 
   return (
     <Link href={repoUrl} className="block">
@@ -285,10 +315,12 @@ function useDashboardData() {
     let isActive = true;
 
     const loadDashboardData = async () => {
-      const effectiveToken = tokenFromQuery ?? tokenStorage.read();
+      const effectiveToken = tokenFromQuery ?? clientSessionStorage.readToken();
+      const dashboardCacheKey = effectiveToken ? buildDashboardCacheKey(effectiveToken) : null;
+      const cachedSnapshot = dashboardCacheKey ? getCachedValue<DashboardCacheSnapshot>(dashboardCacheKey) : null;
 
       if (tokenFromQuery) {
-        tokenStorage.save(tokenFromQuery);
+        clientSessionStorage.saveToken(tokenFromQuery);
         router.replace("/dashboard");
       }
 
@@ -298,6 +330,15 @@ function useDashboardData() {
           setState((current) => ({ ...current, isLoading: false }));
         }
         return;
+      }
+
+      if (cachedSnapshot) {
+        setState({
+          user: cachedSnapshot.user,
+          repos: cachedSnapshot.repos,
+          isLoading: false,
+          error: null,
+        });
       }
 
       try {
@@ -328,24 +369,36 @@ function useDashboardData() {
         }
 
         const reposPayload = (await reposResponse.json()) as ReposResponsePayload;
+        const normalizedUser = normalizeUser(mePayload);
+        const normalizedRepos = normalizeRepos(reposPayload);
 
         if (!isActive) {
           return;
         }
 
-        setState({
-          user: normalizeUser(mePayload),
-          repos: normalizeRepos(reposPayload),
+        const nextState = {
+          user: normalizedUser,
+          repos: normalizedRepos,
           isLoading: false,
           error: null,
-        });
+        };
+
+        setState(nextState);
+
+        if (dashboardCacheKey) {
+          setCachedValue(dashboardCacheKey, { user: normalizedUser, repos: normalizedRepos }, {
+            ttlMs: DASHBOARD_CACHE_TTL_MS,
+            scope: "both",
+            maxPersistentSizeBytes: DASHBOARD_CACHE_MAX_BYTES,
+          });
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unexpected error while loading dashboard data.";
 
         const invalidSession = message.includes("Session invalid") || message.includes("401");
 
         if (invalidSession) {
-          tokenStorage.clear();
+          clientSessionStorage.clearToken();
         }
 
         if (!isActive) {
@@ -356,6 +409,14 @@ function useDashboardData() {
           setIsUnauthorized(true);
           setState((current) => ({ ...current, isLoading: false }));
           router.push("/");
+          return;
+        }
+
+        if (cachedSnapshot) {
+          setState((current) => ({
+            ...current,
+            isLoading: false,
+          }));
           return;
         }
 

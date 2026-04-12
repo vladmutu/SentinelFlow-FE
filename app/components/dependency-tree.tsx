@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import dagre from "dagre";
 import {
   Background,
@@ -14,9 +14,12 @@ import {
   type Node,
   type NodeProps,
   type NodeTypes,
+  useEdgesState,
+  useNodesState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
+import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
 
 interface DependencyTreeProps {
   nodes: DependencyNode[];
@@ -29,16 +32,104 @@ type ScanResultMapEntry = {
   malware_score?: number | null;
 };
 
-const NODE_WIDTH = 420;
-const NODE_HEIGHT = 138;
+type GraphNodeData = {
+  label: string;
+  malwareStatus: string;
+  malwareScore: number | null;
+  compact: boolean;
+  hasChildren: boolean;
+  expanded: boolean;
+  hiddenChildrenCount: number;
+};
 
-function CustomNode({ data }: NodeProps) {
-  const nodeData = (data as { label?: unknown; malwareStatus?: unknown; malwareScore?: unknown } | undefined) ?? {};
-  const label = nodeData.label;
-  const rawLabel = typeof label === "string" ? label : "unknown@unknown";
-  const splitAt = rawLabel.lastIndexOf("@");
-  const packageName = splitAt > 0 ? rawLabel.slice(0, splitAt) : rawLabel;
-  const version = splitAt > 0 ? rawLabel.slice(splitAt + 1) : "unknown";
+type GraphNodeRecord = {
+  id: string;
+  label: string;
+  childrenIds: string[];
+};
+
+type GraphIndex = {
+  rootIds: string[];
+  nodeMap: Map<string, GraphNodeRecord>;
+  totalNodes: number;
+};
+
+const LARGE_GRAPH_NODE_THRESHOLD = 80;
+const NODE_SIZE = {
+  full: { width: 420, height: 138 },
+  compact: { width: 300, height: 108 },
+} as const;
+const GRAPH_INDEX_CACHE_TTL_MS = 1000 * 60 * 60;
+const GRAPH_LAYOUT_CACHE_TTL_MS = 1000 * 60 * 60;
+const GRAPH_CACHE_MAX_BYTES = 1_500_000;
+
+type GraphIndexSnapshot = {
+  rootIds: string[];
+  records: Array<GraphNodeRecord>;
+  totalNodes: number;
+};
+
+type GraphLayoutSnapshot = {
+  nodes: Node<GraphNodeData>[];
+  edges: Edge[];
+};
+
+function buildTreeSignature(tree: DependencyNode[]): string {
+  const parts: string[] = [];
+
+  const walk = (node: DependencyNode) => {
+    parts.push(`${node.name}@${node.version}`);
+    const children = node.children ?? [];
+    parts.push(`[${children.length}]`);
+    children.forEach(walk);
+    parts.push(";");
+  };
+
+  tree.forEach(walk);
+  return hashString(parts.join("|"));
+}
+
+function buildScanSignature(scanResultsMap: Record<string, ScanResultMapEntry>): string {
+  const parts = Object.keys(scanResultsMap)
+    .sort()
+    .map((key) => {
+      const entry = scanResultsMap[key] ?? {};
+      return `${key}:${entry.malware_status ?? "unknown"}:${entry.malware_score ?? "null"}`;
+    });
+
+  return hashString(parts.join("|"));
+}
+
+function buildExpandedSignature(expandedNodeIds: Set<string>) {
+  return Array.from(expandedNodeIds).sort().join("|");
+}
+
+function serializeGraphIndex(index: GraphIndex): GraphIndexSnapshot {
+  return {
+    rootIds: index.rootIds,
+    totalNodes: index.totalNodes,
+    records: Array.from(index.nodeMap.values()),
+  };
+}
+
+function restoreGraphIndex(snapshot: GraphIndexSnapshot): GraphIndex {
+  return {
+    rootIds: snapshot.rootIds,
+    totalNodes: snapshot.totalNodes,
+    nodeMap: new Map(snapshot.records.map((record) => [record.id, record])),
+  };
+}
+
+function CustomNodeView({ data }: NodeProps) {
+  const nodeData = (data as Partial<GraphNodeData> | undefined) ?? {};
+  const label = typeof nodeData.label === "string" ? nodeData.label : "unknown@unknown";
+  const splitAt = label.lastIndexOf("@");
+  const packageName = splitAt > 0 ? label.slice(0, splitAt) : label;
+  const version = splitAt > 0 ? label.slice(splitAt + 1) : "unknown";
+  const compact = nodeData.compact === true;
+  const hasChildren = nodeData.hasChildren === true;
+  const expanded = nodeData.expanded === true;
+  const hiddenChildrenCount = typeof nodeData.hiddenChildrenCount === "number" ? nodeData.hiddenChildrenCount : 0;
   const malwareStatus = typeof nodeData.malwareStatus === "string" ? nodeData.malwareStatus.toLowerCase() : "unknown";
   const malwareScore = typeof nodeData.malwareScore === "number" ? nodeData.malwareScore : null;
 
@@ -71,61 +162,73 @@ function CustomNode({ data }: NodeProps) {
               label: "Not Scanned",
             };
 
+  const containerClassName = compact
+    ? `relative min-w-[280px] rounded-xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-4 py-4 ${appearance.borderClass}`
+    : `relative min-w-[400px] rounded-2xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-6 py-5 ${appearance.borderClass} ${appearance.glow}`;
+
   return (
-    <div
-      className={`relative min-w-[400px] rounded-2xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-6 py-5 ${appearance.borderClass} ${appearance.glow}`}
-    >
+    <div className={containerClassName}>
       <Handle type="target" position={Position.Top} className="!h-3.5 !w-3.5 !border-cyan-300 !bg-cyan-400" />
       <div className="absolute right-4 top-4">
         <span className={`rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] ${appearance.badgeClass}`}>
           {appearance.label}
         </span>
       </div>
-      <p className="line-clamp-1 text-[22px] font-semibold leading-tight text-slate-100">{packageName}</p>
-      <p className="mt-2 text-[18px] font-medium tracking-wide text-cyan-200/90">v{version}</p>
+
+      <p className={compact ? "line-clamp-1 text-[18px] font-semibold leading-tight text-slate-100" : "line-clamp-1 text-[22px] font-semibold leading-tight text-slate-100"}>
+        {packageName}
+      </p>
+      <p className={compact ? "mt-1 text-[15px] font-medium tracking-wide text-cyan-200/90" : "mt-2 text-[18px] font-medium tracking-wide text-cyan-200/90"}>
+        v{version}
+      </p>
       {malwareScore !== null ? (
-        <p className="mt-2 text-xs font-medium uppercase tracking-[0.14em] text-slate-300">Score {(malwareScore * 100).toFixed(1)}%</p>
+        <p className={compact ? "mt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-slate-300" : "mt-2 text-xs font-medium uppercase tracking-[0.14em] text-slate-300"}>
+          Score {(malwareScore * 100).toFixed(1)}%
+        </p>
       ) : null}
+
+      {compact && hasChildren ? (
+        <div className="mt-3 flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.16em] text-slate-400">
+          <span>{expanded ? "Expanded" : `Click to expand ${hiddenChildrenCount} child${hiddenChildrenCount === 1 ? "" : "ren"}`}</span>
+        </div>
+      ) : null}
+
       <Handle type="source" position={Position.Bottom} className="!h-3.5 !w-3.5 !border-cyan-300 !bg-cyan-400" />
     </div>
   );
 }
 
 const nodeTypes: NodeTypes = {
-  custom: CustomNode,
+  custom: memo(CustomNodeView),
 };
 
-function toGraphElements(tree: DependencyNode[], scanResultsMap: Record<string, ScanResultMapEntry>) {
-  const initialNodes: Node[] = [];
-  const initialEdges: Edge[] = [];
+function buildGraphIndex(tree: DependencyNode[]): GraphIndex {
+  const nodeMap = new Map<string, GraphNodeRecord>();
+  const rootIds: string[] = [];
+  let totalNodes = 0;
 
-  const walk = (node: DependencyNode, parentId?: string, path = "root") => {
-    const nodeId = `${path}:${node.name}@${node.version}`;
+  const walk = (node: DependencyNode, parentId: string | undefined, path: string) => {
+    totalNodes += 1;
+    const id = `${path}:${node.name}@${node.version}`;
+    const childrenIds: string[] = [];
 
-    initialNodes.push({
-      id: nodeId,
-      type: "custom",
-      position: { x: 0, y: 0 },
-      data: {
-        label: `${node.name}@${node.version}`,
-        malwareStatus: scanResultsMap[`${node.name}@${node.version}`]?.malware_status ?? "unknown",
-        malwareScore: scanResultsMap[`${node.name}@${node.version}`]?.malware_score ?? null,
-      },
+    nodeMap.set(id, {
+      id,
+      label: `${node.name}@${node.version}`,
+      childrenIds,
     });
 
     if (parentId) {
-      initialEdges.push({
-        id: `${parentId}->${nodeId}`,
-        source: parentId,
-        target: nodeId,
-        type: "default",
-        animated: true,
-        style: { stroke: "#14b8a6", strokeWidth: 2 },
-      });
+      const parentRecord = nodeMap.get(parentId);
+      if (parentRecord) {
+        parentRecord.childrenIds.push(id);
+      }
+    } else {
+      rootIds.push(id);
     }
 
     (node.children ?? []).forEach((child, index) => {
-      walk(child, nodeId, `${nodeId}:${index}`);
+      walk(child, id, `${id}:${index}`);
     });
   };
 
@@ -133,22 +236,83 @@ function toGraphElements(tree: DependencyNode[], scanResultsMap: Record<string, 
     walk(rootNode, undefined, `root-${index}`);
   });
 
-  return { initialNodes, initialEdges };
+  return { rootIds, nodeMap, totalNodes };
 }
 
-function getLayoutedElements(nodes: Node[], edges: Edge[]) {
+function materializeVisibleGraph(
+  index: GraphIndex,
+  scanResultsMap: Record<string, ScanResultMapEntry>,
+  expandedNodeIds: Set<string>,
+  compactMode: boolean,
+) {
+  const nodes: Node<GraphNodeData>[] = [];
+  const edges: Edge[] = [];
+
+  const visit = (nodeId: string, parentId?: string) => {
+    const record = index.nodeMap.get(nodeId);
+    if (!record) {
+      return;
+    }
+
+    const splitAt = record.label.lastIndexOf("@");
+    const packageName = splitAt > 0 ? record.label.slice(0, splitAt) : record.label;
+    const version = splitAt > 0 ? record.label.slice(splitAt + 1) : "unknown";
+    const match = scanResultsMap[record.label];
+    const hasChildren = record.childrenIds.length > 0;
+    const expanded = !compactMode || expandedNodeIds.has(nodeId);
+
+    nodes.push({
+      id: nodeId,
+      type: "custom",
+      position: { x: 0, y: 0 },
+      data: {
+        label: `${packageName}@${version}`,
+        malwareStatus: match?.malware_status ?? "unknown",
+        malwareScore: match?.malware_score ?? null,
+        compact: compactMode,
+        hasChildren,
+        expanded: compactMode ? expanded : true,
+        hiddenChildrenCount: compactMode && !expanded ? record.childrenIds.length : 0,
+      },
+    });
+
+    if (parentId) {
+      edges.push({
+        id: `${parentId}->${nodeId}`,
+        source: parentId,
+        target: nodeId,
+        type: "default",
+        animated: !compactMode,
+        style: { stroke: "#14b8a6", strokeWidth: 2 },
+      });
+    }
+
+    if (!compactMode || expanded) {
+      record.childrenIds.forEach((childId) => {
+        visit(childId, nodeId);
+      });
+    }
+  };
+
+  index.rootIds.forEach((rootId) => visit(rootId));
+
+  return { nodes, edges };
+}
+
+function layoutElements(nodes: Node<GraphNodeData>[], edges: Edge[], compactMode: boolean) {
+  const nodeSize = compactMode ? NODE_SIZE.compact : NODE_SIZE.full;
   const graph = new dagre.graphlib.Graph();
   graph.setDefaultEdgeLabel(() => ({}));
   graph.setGraph({
     rankdir: "TB",
-    nodesep: 70,
-    ranksep: 180,
-    marginx: 24,
-    marginy: 24,
+    nodesep: compactMode ? 40 : 70,
+    ranksep: compactMode ? 120 : 180,
+    marginx: compactMode ? 16 : 24,
+    marginy: compactMode ? 16 : 24,
   });
 
   nodes.forEach((node) => {
-    graph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+    graph.setNode(node.id, { width: nodeSize.width, height: nodeSize.height });
   });
 
   edges.forEach((edge) => {
@@ -159,11 +323,12 @@ function getLayoutedElements(nodes: Node[], edges: Edge[]) {
 
   const layoutedNodes = nodes.map((node) => {
     const position = graph.node(node.id);
+
     return {
       ...node,
       position: {
-        x: position.x - NODE_WIDTH / 2,
-        y: position.y - NODE_HEIGHT / 2,
+        x: position.x - nodeSize.width / 2,
+        y: position.y - nodeSize.height / 2,
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
@@ -175,62 +340,121 @@ function getLayoutedElements(nodes: Node[], edges: Edge[]) {
 
 export function DependencyTree({ nodes, ecosystem, scanResultsMap = {} }: DependencyTreeProps) {
   const filtered = useMemo(() => nodes.filter((node) => node.ecosystem === ecosystem), [nodes, ecosystem]);
-
-  const { layoutedNodes, layoutedEdges } = useMemo(() => {
-    const { initialNodes, initialEdges } = toGraphElements(filtered, scanResultsMap);
-    const { nodes: graphNodes, edges: graphEdges } = getLayoutedElements(initialNodes, initialEdges);
-    return { layoutedNodes: graphNodes, layoutedEdges: graphEdges };
-  }, [filtered, scanResultsMap]);
-
-  const flowKey = useMemo(
-    () => `${ecosystem}:${layoutedNodes.map((node) => node.id).join("|")}:${layoutedEdges.map((edge) => edge.id).join("|")}`,
-    [ecosystem, layoutedNodes, layoutedEdges],
+  const treeSignature = useMemo(() => buildTreeSignature(filtered), [filtered]);
+  const scanSignature = useMemo(() => buildScanSignature(scanResultsMap), [scanResultsMap]);
+  const graphIndexCacheKey = useMemo(() => createCacheKey("dependency-graph-index", ecosystem, treeSignature), [ecosystem, treeSignature]);
+  const cachedGraphIndex = useMemo(() => getCachedValue<GraphIndexSnapshot>(graphIndexCacheKey), [graphIndexCacheKey]);
+  const graphIndex = useMemo(
+    () => (cachedGraphIndex ? restoreGraphIndex(cachedGraphIndex) : buildGraphIndex(filtered)),
+    [cachedGraphIndex, filtered],
   );
+  const largeGraphMode = graphIndex.totalNodes >= LARGE_GRAPH_NODE_THRESHOLD;
+  const defaultExpandedNodeIds = useMemo(
+    () => (largeGraphMode && ecosystem === "pypi" ? new Set(graphIndex.rootIds) : new Set<string>()),
+    [graphIndex.rootIds, ecosystem, largeGraphMode],
+  );
+  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set());
+  const [reactFlowInstance, setReactFlowInstance] = useState<Parameters<NonNullable<React.ComponentProps<typeof ReactFlow>["onInit"]>>[0] | null>(null);
+  const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node>([]);
+  const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
-  const [reactFlowInstance, setReactFlowInstance] = useState<
-    Parameters<NonNullable<React.ComponentProps<typeof ReactFlow>["onInit"]>>[0] | null
-  >(null);
+  useEffect(() => {
+    if (!cachedGraphIndex) {
+      setCachedValue(graphIndexCacheKey, serializeGraphIndex(graphIndex), {
+        ttlMs: GRAPH_INDEX_CACHE_TTL_MS,
+        scope: "both",
+        maxPersistentSizeBytes: GRAPH_CACHE_MAX_BYTES,
+      });
+    }
+  }, [cachedGraphIndex, graphIndex, graphIndexCacheKey]);
+
+  useEffect(() => {
+    setExpandedNodeIds(defaultExpandedNodeIds);
+  }, [defaultExpandedNodeIds]);
+
+  const layoutCacheKey = useMemo(
+    () => createCacheKey("dependency-graph-layout", ecosystem, treeSignature, scanSignature, largeGraphMode, buildExpandedSignature(expandedNodeIds)),
+    [ecosystem, treeSignature, scanSignature, largeGraphMode, expandedNodeIds],
+  );
+  const cachedLayout = useMemo(() => getCachedValue<GraphLayoutSnapshot>(layoutCacheKey), [layoutCacheKey]);
+  const layoutedGraph = useMemo(() => {
+    if (cachedLayout) {
+      return cachedLayout;
+    }
+
+    const visibleGraph = materializeVisibleGraph(graphIndex, scanResultsMap, expandedNodeIds, largeGraphMode);
+    return layoutElements(visibleGraph.nodes, visibleGraph.edges, largeGraphMode);
+  }, [cachedLayout, graphIndex, scanResultsMap, expandedNodeIds, largeGraphMode]);
+
+  useEffect(() => {
+    if (!cachedLayout) {
+      setCachedValue(layoutCacheKey, layoutedGraph, {
+        ttlMs: GRAPH_LAYOUT_CACHE_TTL_MS,
+        scope: "both",
+        maxPersistentSizeBytes: GRAPH_CACHE_MAX_BYTES,
+      });
+    }
+  }, [cachedLayout, layoutedGraph, layoutCacheKey]);
+
+  useEffect(() => {
+    setFlowNodes(layoutedGraph.nodes);
+    setFlowEdges(layoutedGraph.edges);
+  }, [layoutedGraph, setFlowNodes, setFlowEdges]);
 
   useEffect(() => {
     if (!reactFlowInstance) {
       return;
     }
 
-    reactFlowInstance.setNodes((currentNodes) =>
-      currentNodes.map((node) => {
-        const label = (node.data as { label?: unknown } | undefined)?.label;
-        const packageKey = typeof label === "string" ? label : "";
-        const match = scanResultsMap[packageKey];
+    reactFlowInstance.fitView({
+      padding: largeGraphMode ? 0.12 : 0.2,
+      includeHiddenNodes: false,
+    });
+  }, [reactFlowInstance, layoutedGraph.nodes, layoutedGraph.edges, largeGraphMode]);
 
-        return {
-          ...node,
-          data: {
-            ...(node.data as Record<string, unknown>),
-            malwareStatus: match?.malware_status ?? "unknown",
-            malwareScore: match?.malware_score ?? null,
-          },
-        };
-      }),
-    );
-  }, [reactFlowInstance, scanResultsMap]);
+  const handleNodeClick = useCallback(
+    (_event: React.MouseEvent, node: Node) => {
+      const nodeData = (node.data as Partial<GraphNodeData> | undefined) ?? {};
+
+      if (!largeGraphMode || nodeData.hasChildren !== true) {
+        return;
+      }
+
+      setExpandedNodeIds((current) => {
+        const next = new Set(current);
+
+        if (next.has(node.id)) {
+          next.delete(node.id);
+        } else {
+          next.add(node.id);
+        }
+
+        return next;
+      });
+    },
+    [largeGraphMode],
+  );
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-[radial-gradient(circle_at_10%_10%,rgba(15,23,42,0.96),rgba(2,6,23,0.98)_48%)]">
       <ReactFlow
-        key={flowKey}
-        defaultNodes={layoutedNodes}
-        defaultEdges={layoutedEdges}
         onInit={setReactFlowInstance}
+        nodes={flowNodes}
+        edges={flowEdges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeClick={handleNodeClick}
         nodeTypes={nodeTypes}
         panOnScroll={true}
         panOnDrag={true}
         zoomOnScroll={true}
-        nodesDraggable={true}
-        elementsSelectable={true}
+        nodesDraggable={!largeGraphMode}
+        elementsSelectable={!largeGraphMode}
         zoomOnDoubleClick={true}
+        onlyRenderVisibleElements={largeGraphMode}
         fitView={true}
         fitViewOptions={{
-          padding: 0.2,
+          padding: largeGraphMode ? 0.12 : 0.2,
           includeHiddenNodes: false,
         }}
         minZoom={0.2}
@@ -238,35 +462,37 @@ export function DependencyTree({ nodes, ecosystem, scanResultsMap = {} }: Depend
         proOptions={{ hideAttribution: true }}
       >
         <Background color="rgba(51, 65, 85, 0.45)" gap={26} size={1.2} variant={BackgroundVariant.Dots} />
-        <MiniMap
-          pannable
-          zoomable
-          nodeColor={(node) => {
-            const nodeData = (node.data as { malwareStatus?: unknown } | undefined) ?? {};
-            const status = typeof nodeData.malwareStatus === "string" ? nodeData.malwareStatus.toLowerCase() : "unknown";
+        {!largeGraphMode ? (
+          <MiniMap
+            pannable
+            zoomable
+            nodeColor={(node) => {
+              const nodeData = (node.data as { malwareStatus?: unknown } | undefined) ?? {};
+              const status = typeof nodeData.malwareStatus === "string" ? nodeData.malwareStatus.toLowerCase() : "unknown";
 
-            if (status === "malicious") {
-              return "#fb7185";
-            }
+              if (status === "malicious") {
+                return "#fb7185";
+              }
 
-            if (status === "suspicious") {
-              return "#f59e0b";
-            }
+              if (status === "suspicious") {
+                return "#f59e0b";
+              }
 
-            if (status === "clean" || status === "benign") {
-              return "#34d399";
-            }
+              if (status === "clean" || status === "benign") {
+                return "#34d399";
+              }
 
-            return "#22d3ee";
-          }}
-          className="!border !border-slate-700/90 !bg-slate-900/90"
-          bgColor="#020617"
-          maskColor="rgba(2, 6, 23, 0.55)"
-          maskStrokeColor="#0f172a"
-          nodeStrokeColor="#0f172a"
-          nodeStrokeWidth={2}
-          nodeBorderRadius={8}
-        />
+              return "#22d3ee";
+            }}
+            className="!border !border-slate-700/90 !bg-slate-900/90"
+            bgColor="#020617"
+            maskColor="rgba(2, 6, 23, 0.55)"
+            maskStrokeColor="#0f172a"
+            nodeStrokeColor="#0f172a"
+            nodeStrokeWidth={2}
+            nodeBorderRadius={8}
+          />
+        ) : null}
         <Controls
           showInteractive={true}
           className="!border !border-teal-400/60 !bg-slate-900/95 !text-teal-200 !shadow-[0_0_24px_-12px_rgba(20,184,166,0.95)] [&_button]:!bg-slate-800/95 [&_button]:!text-teal-100 [&_button:hover]:!bg-teal-500/25 [&_button]:!border-b [&_button]:!border-teal-400/40"
