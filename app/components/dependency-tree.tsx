@@ -25,6 +25,9 @@ interface DependencyTreeProps {
   nodes: DependencyNode[];
   ecosystem: Ecosystem;
   scanResultsMap?: Record<string, ScanResultMapEntry>;
+  selectedPackageLabels?: string[];
+  selectionEnabled?: boolean;
+  onPackageToggleSelect?: (packageLabel: string) => void;
 }
 
 type ScanResultMapEntry = {
@@ -40,6 +43,7 @@ type GraphNodeData = {
   hasChildren: boolean;
   expanded: boolean;
   hiddenChildrenCount: number;
+  selected: boolean;
 };
 
 type GraphNodeRecord = {
@@ -130,6 +134,7 @@ function CustomNodeView({ data }: NodeProps) {
   const hasChildren = nodeData.hasChildren === true;
   const expanded = nodeData.expanded === true;
   const hiddenChildrenCount = typeof nodeData.hiddenChildrenCount === "number" ? nodeData.hiddenChildrenCount : 0;
+  const selected = nodeData.selected === true;
   const malwareStatus = typeof nodeData.malwareStatus === "string" ? nodeData.malwareStatus.toLowerCase() : "unknown";
   const malwareScore = typeof nodeData.malwareScore === "number" ? nodeData.malwareScore : null;
 
@@ -163,8 +168,8 @@ function CustomNodeView({ data }: NodeProps) {
             };
 
   const containerClassName = compact
-    ? `relative min-w-[280px] rounded-xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-4 py-4 ${appearance.borderClass}`
-    : `relative min-w-[400px] rounded-2xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-6 py-5 ${appearance.borderClass} ${appearance.glow}`;
+    ? `relative min-w-[280px] rounded-xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-4 py-4 ${appearance.borderClass} ${selected ? "ring-2 ring-cyan-300/80 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]" : ""}`
+    : `relative min-w-[400px] rounded-2xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-6 py-5 ${appearance.borderClass} ${appearance.glow} ${selected ? "ring-2 ring-cyan-300/80 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]" : ""}`;
 
   return (
     <div className={containerClassName}>
@@ -174,6 +179,11 @@ function CustomNodeView({ data }: NodeProps) {
           {appearance.label}
         </span>
       </div>
+      {selected ? (
+        <div className="absolute bottom-4 right-4 rounded-full border border-cyan-300/50 bg-cyan-500/15 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-cyan-100">
+          Selected
+        </div>
+      ) : null}
 
       <p className={compact ? "line-clamp-1 text-[18px] font-semibold leading-tight text-slate-100" : "line-clamp-1 text-[22px] font-semibold leading-tight text-slate-100"}>
         {packageName}
@@ -273,6 +283,7 @@ function materializeVisibleGraph(
         hasChildren,
         expanded: compactMode ? expanded : true,
         hiddenChildrenCount: compactMode && !expanded ? record.childrenIds.length : 0,
+        selected: false,
       },
     });
 
@@ -338,7 +349,15 @@ function layoutElements(nodes: Node<GraphNodeData>[], edges: Edge[], compactMode
   return { nodes: layoutedNodes, edges };
 }
 
-export function DependencyTree({ nodes, ecosystem, scanResultsMap = {} }: DependencyTreeProps) {
+export function DependencyTree({
+  nodes,
+  ecosystem,
+  scanResultsMap = {},
+  selectedPackageLabels = [],
+  selectionEnabled = false,
+  onPackageToggleSelect,
+}: DependencyTreeProps) {
+  const selectedLabelSet = useMemo(() => new Set(selectedPackageLabels), [selectedPackageLabels]);
   const filtered = useMemo(() => nodes.filter((node) => node.ecosystem === ecosystem), [nodes, ecosystem]);
   const treeSignature = useMemo(() => buildTreeSignature(filtered), [filtered]);
   const scanSignature = useMemo(() => buildScanSignature(scanResultsMap), [scanResultsMap]);
@@ -397,9 +416,17 @@ export function DependencyTree({ nodes, ecosystem, scanResultsMap = {} }: Depend
   }, [cachedLayout, layoutedGraph, layoutCacheKey]);
 
   useEffect(() => {
-    setFlowNodes(layoutedGraph.nodes);
+    setFlowNodes(
+      layoutedGraph.nodes.map((node) => ({
+        ...node,
+        data: {
+          ...node.data,
+          selected: selectedLabelSet.has(typeof node.data.label === "string" ? node.data.label : ""),
+        },
+      })),
+    );
     setFlowEdges(layoutedGraph.edges);
-  }, [layoutedGraph, setFlowNodes, setFlowEdges]);
+  }, [layoutedGraph, selectedLabelSet, setFlowNodes, setFlowEdges]);
 
   useEffect(() => {
     if (!reactFlowInstance) {
@@ -415,6 +442,10 @@ export function DependencyTree({ nodes, ecosystem, scanResultsMap = {} }: Depend
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node) => {
       const nodeData = (node.data as Partial<GraphNodeData> | undefined) ?? {};
+
+      if (selectionEnabled && typeof nodeData.label === "string" && onPackageToggleSelect) {
+        onPackageToggleSelect(nodeData.label);
+      }
 
       if (!largeGraphMode || nodeData.hasChildren !== true) {
         return;
@@ -432,7 +463,7 @@ export function DependencyTree({ nodes, ecosystem, scanResultsMap = {} }: Depend
         return next;
       });
     },
-    [largeGraphMode],
+    [largeGraphMode, onPackageToggleSelect, selectionEnabled],
   );
 
   return (
