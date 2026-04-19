@@ -1,6 +1,7 @@
 "use client";
 
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AddDependencyPanel } from "@/app/components/add-dependency-panel";
 import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
@@ -768,6 +769,21 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     [nodes, repositoryEcosystem],
   );
   const selectedScanPackageSet = useMemo(() => new Set(selectedScanPackages), [selectedScanPackages]);
+  const addDependencyEcosystems = useMemo(() => {
+    const nodeEcosystems = Array.from(
+      new Set(
+        nodes
+          .map((node) => node.ecosystem)
+          .filter((ecosystem): ecosystem is Ecosystem => ecosystem === "npm" || ecosystem === "pypi"),
+      ),
+    );
+
+    if (nodeEcosystems.length > 0) {
+      return nodeEcosystems;
+    }
+
+    return repositoryEcosystem ? [repositoryEcosystem] : [];
+  }, [nodes, repositoryEcosystem]);
   const isPartialScan = scanScope === "partial";
   const canStartScan = !isScanRunning && (scanScope === "full" || selectedScanPackages.length > 0);
   const toggleSelectedScanPackage = useCallback((packageLabel: string) => {
@@ -1641,7 +1657,14 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           ) : null}
 
           {activeSection === "add" ? (
-            <div className="flex h-full w-full items-center justify-center text-slate-300">Add Dependency content coming soon.</div>
+            <div className="h-full overflow-hidden px-4 pb-6 pt-4">
+              <AddDependencyPanel
+                apiBaseUrl={API_BASE_URL}
+                initialEcosystem={addDependencyEcosystems[0] ?? repositoryEcosystem ?? "npm"}
+                allowedEcosystems={addDependencyEcosystems}
+                resolveRepoCoordinates={resolveRepoCoordinates}
+              />
+            </div>
           ) : null}
           </main>
         </div>
