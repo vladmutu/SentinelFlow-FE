@@ -24,6 +24,8 @@ export interface PackageSearchResult {
 export interface PackageSearchResponse {
   ecosystem: Ecosystem;
   query: string;
+  page: number;
+  limit: number;
   total: number;
   results: PackageSearchResult[];
   did_you_mean: string | null;
@@ -143,7 +145,7 @@ function compareSearchResultRelevance(query: string, left: PackageSearchResult, 
   return leftDistanceFromQuery - rightDistanceFromQuery;
 }
 
-function normalizeSearchResponse(ecosystem: Ecosystem, query: string, payload: unknown): PackageSearchResponse {
+function normalizeSearchResponse(ecosystem: Ecosystem, query: string, page: number, limit: number, payload: unknown): PackageSearchResponse {
   const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
   const rawResults = Array.isArray(record.results) ? record.results : [];
 
@@ -183,6 +185,8 @@ function normalizeSearchResponse(ecosystem: Ecosystem, query: string, payload: u
   return {
     ecosystem,
     query,
+    page: typeof record.page === "number" && Number.isFinite(record.page) && record.page >= 1 ? Math.floor(record.page) : page,
+    limit: typeof record.limit === "number" && Number.isFinite(record.limit) && record.limit >= 1 ? Math.floor(record.limit) : limit,
     total: typeof record.total === "number" && Number.isFinite(record.total) ? record.total : sortedResults.length,
     results: sortedResults,
     did_you_mean: typeof record.did_you_mean === "string" && record.did_you_mean.trim().length > 0 ? record.did_you_mean.trim() : null,
@@ -253,13 +257,14 @@ export async function searchPackages(
   context: DependencyApiContext,
   ecosystem: Ecosystem,
   query: string,
-  _limit = 10,
+  page = 1,
+  limit = 8,
   options?: { signal?: AbortSignal },
 ): Promise<PackageSearchResponse> {
-  void _limit;
-  const sanitizedLimit = Number.MAX_SAFE_INTEGER;
+  const sanitizedPage = Math.max(1, Math.floor(page));
+  const sanitizedLimit = Math.max(1, limit);
   const trimmedQuery = query.trim();
-  const url = `${context.baseUrl}/api/repos/packages/search?ecosystem=${encodeURIComponent(ecosystem)}&q=${encodeURIComponent(trimmedQuery)}&limit=${sanitizedLimit}`;
+  const url = `${context.baseUrl}/api/repos/packages/search?ecosystem=${encodeURIComponent(ecosystem)}&q=${encodeURIComponent(trimmedQuery)}&page=${sanitizedPage}&limit=${sanitizedLimit}`;
 
   const response = await fetch(url, {
     method: "GET",
@@ -277,7 +282,7 @@ export async function searchPackages(
     throw new DependencyApiError(response.status, toErrorMessage(payload, `Package search failed (${response.status}).`));
   }
 
-  return normalizeSearchResponse(ecosystem, trimmedQuery, payload);
+  return normalizeSearchResponse(ecosystem, trimmedQuery, sanitizedPage, sanitizedLimit, payload);
 }
 
 export async function fetchPackageVersions(

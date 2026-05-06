@@ -595,23 +595,6 @@ function normalizeDependencyTree(payload: unknown, ecosystem: Ecosystem): Depend
   return rootNode ? [rootNode] : [];
 }
 
-function collectUniquePackageLabels(nodes: DependencyNode[], ecosystem: Ecosystem): string[] {
-  const labels = new Set<string>();
-
-  const walk = (node: DependencyNode) => {
-    if (node.ecosystem !== ecosystem) {
-      return;
-    }
-
-    labels.add(`${node.name}@${node.version}`);
-    (node.children ?? []).forEach(walk);
-  };
-
-  nodes.forEach(walk);
-
-  return Array.from(labels).sort((left, right) => left.localeCompare(right));
-}
-
 async function fetchDependencyTreeForEcosystem(
   owner: string,
   repoName: string,
@@ -738,14 +721,18 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [scanProgress, setScanProgress] = useState(0);
   const [scanStatus, setScanStatus] = useState("Waiting to start malware scan.");
   const [scanDetails, setScanDetails] = useState<ScanJobResponse | null>(null);
-  const [isScanModalOpen, setIsScanModalOpen] = useState(false);
   const [activeSection, setActiveSection] = useState("graph");
+  const [graphScanView, setGraphScanView] = useState<"progress" | "results">("progress");
   const [isHydrated, setIsHydrated] = useState(false);
   const [scanScope, setScanScope] = useState<ScanScope>("full");
   const [selectedScanPackages, setSelectedScanPackages] = useState<string[]>([]);
   const [isAgentChatOpen, setIsAgentChatOpen] = useState(true);
   const [isCancellingScan, setIsCancellingScan] = useState(false);
   const [liveElapsedSeconds, setLiveElapsedSeconds] = useState(0);
+  const [analysisPackageSearch, setAnalysisPackageSearch] = useState("");
+  const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
+  const [detailsPackageSearch, setDetailsPackageSearch] = useState("");
+  const [selectedDetailsPackage, setSelectedDetailsPackage] = useState<string | null>(null);
   const isMountedRef = useRef(true);
   const scanPollTimerRef = useRef<number | null>(null);
   const elapsedTickerRef = useRef<number | null>(null);
@@ -764,11 +751,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     [scanResultRows],
   );
   const canCancelScan = scanJobId !== null && (scanDisplay.phase === "pending" || scanDisplay.phase === "running");
-  const availableScanPackages = useMemo(
-    () => collectUniquePackageLabels(nodes, repositoryEcosystem ?? "npm"),
-    [nodes, repositoryEcosystem],
-  );
-  const selectedScanPackageSet = useMemo(() => new Set(selectedScanPackages), [selectedScanPackages]);
+  const canShowGraphScanResults = scanDisplay.phase === "completed" || hasScanned;
   const addDependencyEcosystems = useMemo(() => {
     const nodeEcosystems = Array.from(
       new Set(
@@ -786,8 +769,28 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   }, [nodes, repositoryEcosystem]);
   const isPartialScan = scanScope === "partial";
   const canStartScan = !isScanRunning && (scanScope === "full" || selectedScanPackages.length > 0);
+  const availablePackagesForAnalysis = useMemo(() => {
+    const labels = new Set<string>();
+    const walk = (node: DependencyNode) => {
+      labels.add(`${node.name}@${node.version}`);
+      (node.children ?? []).forEach(walk);
+    };
+    nodes.forEach(walk);
+    return Array.from(labels).sort((left, right) => left.localeCompare(right));
+  }, [nodes]);
+  const filteredPackagesForAnalysis = useMemo(() => {
+    const query = analysisPackageSearch.trim().toLowerCase();
+    if (!query) return availablePackagesForAnalysis;
+    return availablePackagesForAnalysis.filter((pkg) => pkg.toLowerCase().includes(query));
+  }, [availablePackagesForAnalysis, analysisPackageSearch]);
+  const canStartPartialAnalysisScan = !isScanRunning && selectedAnalysisPackages.length > 0;
   const toggleSelectedScanPackage = useCallback((packageLabel: string) => {
     setSelectedScanPackages((current) =>
+      current.includes(packageLabel) ? current.filter((item) => item !== packageLabel) : [...current, packageLabel],
+    );
+  }, []);
+  const toggleSelectedAnalysisPackage = useCallback((packageLabel: string) => {
+    setSelectedAnalysisPackages((current) =>
       current.includes(packageLabel) ? current.filter((item) => item !== packageLabel) : [...current, packageLabel],
     );
   }, []);
@@ -802,7 +805,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
   const sections = [
     { key: "graph", label: "Dependency Graph" },
-    { key: "details", label: "Details" },
+    { key: "static-analysis", label: "Static Analysis" },
+    { key: "dynamic-analysis", label: "Dynamic Analysis" },
+    { key: "details", label: "Package Details" },
+    { key: "sbom", label: "SBOM" },
+    { key: "history", label: "Scan History" },
     { key: "add", label: "Add Dependency" },
   ] as const;
 
@@ -841,7 +848,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     setHasScanned(false);
     setScanScope("full");
     setSelectedScanPackages([]);
-    setIsCancellingScan(false);
     setLiveElapsedSeconds(0);
     setRepositoryLanguage("");
     setRepositoryEcosystem(null);
@@ -1362,13 +1368,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
   const triggerPackageScan = useCallback(async () => {
     setScanError(null);
-    setIsScanModalOpen(true);
     setIsScanRunning(true);
-    setIsCancellingScan(false);
     setScanStatus("pending");
     setScanProgress(0);
     setLiveElapsedSeconds(0);
     setScanResultRows([]);
+    setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
     scanRetryAttemptRef.current = 0;
 
@@ -1439,6 +1444,82 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages]);
 
+  const triggerPartialAnalysisScan = useCallback(async () => {
+    if (selectedAnalysisPackages.length === 0 || isScanRunning) {
+      return;
+    }
+    setScanError(null);
+    setIsScanRunning(true);
+    setScanStatus("pending");
+    setScanProgress(0);
+    setLiveElapsedSeconds(0);
+    setScanResultRows([]);
+    setGraphScanView("progress");
+    liveResultKeysRef.current = new Set();
+    scanRetryAttemptRef.current = 0;
+
+    try {
+      const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
+      const token = clientSessionStorage.readToken();
+      const scanResultsCacheKey = token ? buildScanResultsCacheKey(token, owner, repoName) : null;
+      const triggerBody: Record<string, unknown> = { ecosystem, selected_packages: selectedAnalysisPackages };
+
+      if (scanResultsCacheKey) {
+        setCachedValue(scanResultsCacheKey, {}, {
+          ttlMs: SCAN_RESULTS_CACHE_TTL_MS,
+          scope: "both",
+          maxPersistentSizeBytes: MAX_CACHE_BYTES,
+        });
+      }
+
+      const triggerResponse = await fetch(
+        `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...headers,
+          },
+          body: JSON.stringify(triggerBody),
+          credentials: "include",
+        },
+      );
+
+      if (!triggerResponse.ok) {
+        throw new Error(`Could not trigger package scan (${triggerResponse.status}).`);
+      }
+
+      const triggerPayload = (await triggerResponse.json()) as ScanTriggerResponse;
+
+      if (!triggerPayload.job_id) {
+        throw new Error("Scan trigger did not return a job id.");
+      }
+
+      setHasScanned(true);
+      setScanJobId(triggerPayload.job_id);
+      setScanStatus("pending");
+      setScanDetails({ status: "pending", scanned_packages: 0, total_unique_packages: 0, progress_percent: 0 });
+
+      if (scanPollTimerRef.current !== null) {
+        window.clearTimeout(scanPollTimerRef.current);
+      }
+
+      scanPollTimerRef.current = window.setTimeout(() => {
+        void pollScanJob(owner, repoName, triggerPayload.job_id, headers);
+      }, SCAN_POLL_INTERVAL_MS);
+
+    } catch (scanError) {
+      const message = scanError instanceof Error ? scanError.message : "Unexpected error while running package scan.";
+      setScanError(message);
+      setScanStatus("failed");
+      setHasScanned(false);
+    } finally {
+      if (!scanPollTimerRef.current) {
+        setIsScanRunning(false);
+      }
+    }
+  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages, isScanRunning]);
+
   const cancelScanJob = useCallback(async () => {
     if (!scanJobId || isCancellingScan) {
       return;
@@ -1451,37 +1532,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const cancelUrl = `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan/${encodeURIComponent(scanJobId)}/cancel`;
 
-      const tryCancelRequest = async () => {
-        const response = await fetch(cancelUrl, {
-          method: "POST",
-          headers,
-          credentials: "include",
-        });
+      const response = await fetch(cancelUrl, {
+        method: "POST",
+        headers,
+        credentials: "include",
+      });
 
-        if (!response.ok) {
-          const cancelError = new Error(`Cancel request failed (${response.status}).`) as Error & { status: number };
-          cancelError.status = response.status;
-          throw cancelError;
-        }
-
-        return response;
-      };
-
-      let cancelResponse: Response;
-      try {
-        cancelResponse = await tryCancelRequest();
-      } catch (firstError) {
-        const message = firstError instanceof Error ? firstError.message.toLowerCase() : "";
-        const isNetworkError = message.includes("network") || message.includes("failed to fetch") || message.includes("timeout");
-
-        if (!isNetworkError) {
-          throw firstError;
-        }
-
-        cancelResponse = await tryCancelRequest();
+      if (!response.ok) {
+        const cancelError = new Error(`Cancel request failed (${response.status}).`) as Error & { status: number };
+        cancelError.status = response.status;
+        throw cancelError;
       }
 
-      const payload = (await cancelResponse.json()) as { status?: unknown; message?: unknown };
+      const payload = (await response.json()) as { status?: unknown };
       const cancelledStatus = normalizeStatusValue(payload.status);
 
       if (scanPollTimerRef.current !== null) {
@@ -1489,13 +1552,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         scanPollTimerRef.current = null;
       }
 
+      if (elapsedTickerRef.current !== null) {
+        window.clearInterval(elapsedTickerRef.current);
+        elapsedTickerRef.current = null;
+      }
+
       setIsScanRunning(false);
-      setScanStatus(cancelledStatus === "cancelled" ? "Scan cancelled by user" : "Scan cancellation acknowledged");
+      setScanStatus(cancelledStatus === "cancelled" ? "Scan cancelled by user." : "Scan cancellation acknowledged.");
       setScanDetails((current) => ({
         ...(current ?? {}),
         status: "cancelled",
       }));
       setScanError(null);
+      setGraphScanView("progress");
     } catch (cancelError) {
       const status =
         typeof cancelError === "object" && cancelError !== null && "status" in cancelError && typeof (cancelError as { status?: unknown }).status === "number"
@@ -1503,11 +1572,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           : null;
 
       if (status === 400) {
-        setScanError("Cannot cancel: job already completed.");
+        setScanError("Cannot stop: job already completed.");
       } else if (status === 404) {
         setScanError("Scan job not found.");
       } else {
-        setScanError("Unable to cancel scan. Please try again.");
+        setScanError(cancelError instanceof Error ? cancelError.message : "Unable to stop scan. Please try again.");
       }
     } finally {
       setIsCancellingScan(false);
@@ -1539,20 +1608,29 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         </header>
 
         <div className="flex flex-row items-center space-x-6 border-b border-gray-800 bg-gray-950 px-6 py-3">
-          {sections.map((section) => (
-            <button
-              key={section.key}
-              type="button"
-              onClick={() => setActiveSection(section.key)}
-              className={`border-b-2 pb-2 text-sm font-medium transition ${
-                activeSection === section.key
-                  ? "border-teal-500 text-teal-400"
-                  : "border-transparent text-gray-400 hover:text-gray-200"
-              }`}
-            >
-              {section.label}
-            </button>
-          ))}
+          {sections.map((section) => {
+            const isDisabled = isLoadingTree && section.key !== "graph";
+            return (
+              <button
+                key={section.key}
+                type="button"
+                onClick={() => {
+                  if (!isDisabled) {
+                    setActiveSection(section.key);
+                  }
+                }}
+                disabled={isDisabled}
+                className={`border-b-2 pb-2 text-sm font-medium transition ${
+                  activeSection === section.key
+                    ? "border-teal-500 text-teal-400"
+                    : "border-transparent text-gray-400 hover:text-gray-200"
+                } ${isDisabled ? "cursor-not-allowed opacity-50" : ""}`}
+                title={isDisabled ? "Available after dependency graph loads" : undefined}
+              >
+                {section.label}
+              </button>
+            );
+          })}
         </div>
 
         <div className="relative flex-1 overflow-hidden">
@@ -1560,70 +1638,113 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           {activeSection === "graph" ? (
             <div className="relative h-full w-full px-4 pb-0 pt-4">
               <div className="relative h-full overflow-hidden rounded-2xl border border-gray-800 bg-gray-950/90">
-                <div
-                  className="absolute left-4 top-4 z-10 max-w-md cursor-pointer rounded-2xl border border-gray-700/80 bg-gray-950/90 px-4 py-3 shadow-[0_18px_50px_-24px_rgba(2,6,23,0.95)] backdrop-blur"
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setIsScanModalOpen(true)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      setIsScanModalOpen(true);
-                    }
-                  }}
-                >
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Malware Package Scan</p>
-                  <p className="mt-1 text-sm text-slate-400">
-                    Run malware scans on all detected packages and highlight graph nodes by risk.
-                  </p>
-                  {shouldShowScanRuntime ? (
-                    <span
-                      className={`mt-2 inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] ${
-                        scanDisplay.phase === "completed"
-                          ? "border-emerald-300/50 bg-emerald-500/15 text-emerald-100"
-                          : scanDisplay.phase === "cancelled"
-                            ? "border-slate-300/50 bg-slate-500/15 text-slate-100"
-                            : scanDisplay.phase === "failed"
-                              ? "border-rose-300/50 bg-rose-500/15 text-rose-100"
-                              : scanDisplay.phase === "running"
-                                ? "border-cyan-300/50 bg-cyan-500/15 text-cyan-100"
-                                : "border-amber-300/50 bg-amber-500/15 text-amber-100"
-                      }`}
-                    >
-                      {scanDisplay.phase}
-                    </span>
-                  ) : null}
+                <div className="absolute left-4 top-4 z-10 max-w-md rounded-2xl border border-gray-700/80 bg-gray-950/90 px-4 py-3 shadow-[0_18px_50px_-24px_rgba(2,6,23,0.95)] backdrop-blur">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Malware Package Scan</p>
+                      <p className="mt-1 text-sm text-slate-400">Progress stays in the graph. Results appear here after completion.</p>
+                    </div>
+                    {canShowGraphScanResults ? (
+                      <button
+                        type="button"
+                        onClick={() => setGraphScanView((current) => (current === "progress" ? "results" : "progress"))}
+                        className={`rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
+                          graphScanView === "results"
+                            ? "border-cyan-300/70 bg-cyan-500/20 text-cyan-50"
+                            : "border-gray-700 bg-gray-900 text-slate-300 hover:border-gray-500"
+                        }`}
+                      >
+                        {graphScanView === "results" ? "Show Progress" : "View Results"}
+                      </button>
+                    ) : null}
+                  </div>
 
-                  {shouldShowScanRuntime ? (
-                    <div className="mt-3">
-                      <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                        <div
-                          className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : scanDisplay.phase === "pending" ? "animate-pulse bg-cyan-300/90" : "bg-cyan-400"}`}
-                          style={{ width: `${Math.max(0, Math.min(100, scanDisplay.progressPercent))}%` }}
-                        />
-                      </div>
-                      <p className="mt-1 text-[11px] uppercase tracking-[0.12em] text-slate-500">{scanDisplay.progressLabel}</p>
-                      <p className="mt-1 text-xs text-slate-400">{scanDisplay.primaryCountLabel}</p>
-                      {scanDisplay.secondaryCountLabel ? <p className="mt-1 text-xs text-slate-500">{scanDisplay.secondaryCountLabel}</p> : null}
-                      <div className="mt-2 flex flex-wrap gap-3 text-[11px] uppercase tracking-[0.12em] text-slate-500">
-                        {scanDisplay.etaLabel ? <span>{scanDisplay.etaLabel}</span> : null}
-                        {scanDisplay.speedLabel ? <span>{scanDisplay.speedLabel}</span> : null}
-                        {runtimeElapsedLabel ? <span>{runtimeElapsedLabel}</span> : null}
+                  {graphScanView === "progress" ? (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-xs text-slate-400">{scanStatus}</p>
+                      {shouldShowScanRuntime ? (
+                        <span
+                          className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] ${
+                            scanDisplay.phase === "completed"
+                              ? "border-emerald-300/50 bg-emerald-500/15 text-emerald-100"
+                              : scanDisplay.phase === "cancelled"
+                                ? "border-slate-300/50 bg-slate-500/15 text-slate-100"
+                                : scanDisplay.phase === "failed"
+                                  ? "border-rose-300/50 bg-rose-500/15 text-rose-100"
+                                  : scanDisplay.phase === "running"
+                                    ? "border-cyan-300/50 bg-cyan-500/15 text-cyan-100"
+                                    : "border-amber-300/50 bg-amber-500/15 text-amber-100"
+                          }`}
+                        >
+                          {scanDisplay.phase}
+                        </span>
+                      ) : null}
+
+                      {shouldShowScanRuntime ? (
+                        <div>
+                          <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                            <div
+                              className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : scanDisplay.phase === "pending" ? "animate-pulse bg-cyan-300/90" : "bg-cyan-400"}`}
+                              style={{ width: `${Math.max(0, Math.min(100, scanDisplay.progressPercent))}%` }}
+                            />
+                          </div>
+                          <p className="mt-1 text-[11px] uppercase tracking-[0.12em] text-slate-500">{scanDisplay.progressLabel}</p>
+                          <p className="mt-1 text-xs text-slate-400">{scanDisplay.primaryCountLabel}</p>
+                          {scanDisplay.secondaryCountLabel ? <p className="mt-1 text-xs text-slate-500">{scanDisplay.secondaryCountLabel}</p> : null}
+                          <div className="mt-2 flex flex-wrap gap-3 text-[11px] uppercase tracking-[0.12em] text-slate-500">
+                            {scanDisplay.etaLabel ? <span>{scanDisplay.etaLabel}</span> : null}
+                            {scanDisplay.speedLabel ? <span>{scanDisplay.speedLabel}</span> : null}
+                            {runtimeElapsedLabel ? <span>{runtimeElapsedLabel}</span> : null}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      <div className="pt-1">
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void triggerPackageScan();
+                            }}
+                            disabled={!canStartScan}
+                            className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {scanStartLabel}
+                          </button>
+                          {canCancelScan ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void cancelScanJob();
+                              }}
+                              disabled={isCancellingScan}
+                              className="inline-flex items-center rounded-lg border border-rose-400/40 bg-rose-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {isCancellingScan ? "Stopping..." : "Stop Scan"}
+                            </button>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                   ) : null}
 
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void triggerPackageScan();
-                    }}
-                    disabled={!canStartScan}
-                    className="mt-3 inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {scanStartLabel}
-                  </button>
+                      {graphScanView === "results" && canShowGraphScanResults ? (
+                    <div className="mt-3 rounded-xl border border-gray-800 bg-gray-900/70 p-3 text-xs text-slate-300">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Results</p>
+                      {latestScanSummary.status === null ? (
+                        <p className="mt-2 text-slate-400">No completed scan results are available yet.</p>
+                      ) : (
+                        <div className="mt-2 space-y-1">
+                          <p>Status: {latestScanSummary.status}</p>
+                          <p>
+                            Processed: {latestScanSummary.processed ?? "-"} / {latestScanSummary.total ?? "-"}
+                          </p>
+                          <p>Completed: {formatTimestampForDisplay(latestScanSummary.completedAt)}</p>
+                          <p className="pt-1 text-slate-400">Results are highlighted directly on the dependency graph below.</p>
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="absolute inset-0 h-full w-full">
@@ -1652,8 +1773,535 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
             </div>
           ) : null}
 
+          {activeSection === "static-analysis" ? (
+            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
+                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Static Analysis</p>
+                    <p className="mt-1 text-sm text-slate-300">Review the latest completed scan snapshot and package findings.</p>
+                  </div>
+
+                  <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                    <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">
+                      Select packages for analysis
+                    </label>
+                    <input
+                      type="text"
+                      value={analysisPackageSearch}
+                      onChange={(event) => setAnalysisPackageSearch(event.target.value)}
+                      placeholder="Search packages..."
+                      className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60"
+                    />
+                    {selectedAnalysisPackages.length > 0 ? (
+                      <div className="flex flex-wrap gap-2 rounded-md bg-slate-950/40 p-2">
+                        {selectedAnalysisPackages.map((pkg) => (
+                          <div
+                            key={pkg}
+                            className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/50 bg-cyan-500/20 px-2.5 py-1 text-xs text-cyan-100"
+                          >
+                            <span className="truncate font-medium">{pkg}</span>
+                            <button
+                              type="button"
+                              onClick={() => toggleSelectedAnalysisPackage(pkg)}
+                              className="ml-0.5 flex h-4 w-4 items-center justify-center rounded-full hover:bg-cyan-400/30 transition"
+                              title="Remove package"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="max-h-40 overflow-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      {filteredPackagesForAnalysis.length === 0 ? (
+                        <p className="p-2 text-xs text-slate-400">No packages found.</p>
+                      ) : (
+                        <div className="space-y-1">
+                          {filteredPackagesForAnalysis.map((pkg) => {
+                            const isSelected = selectedAnalysisPackages.includes(pkg);
+                            return (
+                              <button
+                                key={pkg}
+                                type="button"
+                                onClick={() => toggleSelectedAnalysisPackage(pkg)}
+                                className={`w-full rounded-md border px-3 py-2 text-left text-xs transition ${
+                                  isSelected
+                                    ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100 font-medium"
+                                    : "border-slate-700 bg-slate-950/40 text-slate-300 hover:border-slate-600 hover:bg-slate-900/50"
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <span className="truncate">{pkg}</span>
+                                  {isSelected ? <span className="ml-2 text-cyan-400">✓</span> : null}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                    {selectedAnalysisPackages.length > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void triggerPartialAnalysisScan();
+                        }}
+                        disabled={!canStartPartialAnalysisScan}
+                        className="w-full rounded-md border border-cyan-400/40 bg-cyan-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Run Analysis on {selectedAnalysisPackages.length} Package{selectedAnalysisPackages.length === 1 ? "" : "s"}
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Status</p>
+                      <p className="mt-1 text-sm font-medium text-slate-100">{latestScanSummary.status ?? "No completed scans yet"}</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Processed</p>
+                      <p className="mt-1 text-sm font-medium text-slate-100">
+                        {latestScanSummary.processed ?? "-"} / {latestScanSummary.total ?? "-"}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Completed</p>
+                      <p className="mt-1 text-sm font-medium text-slate-100">{formatTimestampForDisplay(latestScanSummary.completedAt)}</p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Static findings</p>
+                    <div className="mt-3 space-y-2">
+                      {scanResultRows.length > 0 ? (
+                        scanResultRows.map((row) => {
+                          const isErrorRow = row.errorMessage !== null || row.status === "failed";
+
+                          return (
+                            <div
+                              key={row.id}
+                              className={`rounded-lg border p-3 text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <p className="font-medium">
+                                  {row.packageName} <span className="text-slate-400">@</span> {row.version}
+                                </p>
+                                <span className="text-[11px] uppercase tracking-[0.14em] text-slate-400">{row.status}</span>
+                              </div>
+                              <p className="mt-1 text-xs text-slate-400">
+                                Malware score: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}
+                              </p>
+                              {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
+                            </div>
+                          );
+                        })
+                      ) : (
+                        <p className="text-sm text-slate-400">No static findings are available yet.</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Latest completed scan summary</p>
+                  {latestScanSummary.status === null ? (
+                    <p className="mt-2 text-sm text-slate-300">Run a scan to populate the static analysis summary.</p>
+                  ) : (
+                    <>
+                      <p className="mt-2 text-sm text-slate-200">Status: {latestScanSummary.status}</p>
+                      <p className="mt-1 text-sm text-slate-200">
+                        Processed: {latestScanSummary.processed ?? "-"} / {latestScanSummary.total ?? "-"}
+                      </p>
+                      <p className="mt-1 text-sm text-slate-200">Completed: {formatTimestampForDisplay(latestScanSummary.completedAt)}</p>
+                    </>
+                  )}
+
+                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">API</p>
+                    <p className="mt-2 text-sm text-slate-200">{scanJobId ? "/scan/{job_id}" : "Completed scan summaries appear here after a run."}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {activeSection === "dynamic-analysis" ? (
+            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Dynamic Analysis</p>
+                    <p className="mt-1 text-sm text-slate-300">Track the live scan job while packages are being processed.</p>
+                  </div>
+
+                  <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                    <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">
+                      Select packages for analysis
+                    </label>
+                    <input
+                      type="text"
+                      value={analysisPackageSearch}
+                      onChange={(event) => setAnalysisPackageSearch(event.target.value)}
+                      placeholder="Search packages..."
+                      className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60"
+                    />
+                    {selectedAnalysisPackages.length > 0 ? (
+                      <div className="flex flex-wrap gap-2 rounded-md bg-slate-950/40 p-2">
+                        {selectedAnalysisPackages.map((pkg) => (
+                          <div
+                            key={pkg}
+                            className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/50 bg-cyan-500/20 px-2.5 py-1 text-xs text-cyan-100"
+                          >
+                            <span className="truncate font-medium">{pkg}</span>
+                            <button
+                              type="button"
+                              onClick={() => toggleSelectedAnalysisPackage(pkg)}
+                              className="ml-0.5 flex h-4 w-4 items-center justify-center rounded-full hover:bg-cyan-400/30 transition"
+                              title="Remove package"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="max-h-40 overflow-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      {filteredPackagesForAnalysis.length === 0 ? (
+                        <p className="p-2 text-xs text-slate-400">No packages found.</p>
+                      ) : (
+                        <div className="space-y-1">
+                          {filteredPackagesForAnalysis.map((pkg) => {
+                            const isSelected = selectedAnalysisPackages.includes(pkg);
+                            return (
+                              <button
+                                key={pkg}
+                                type="button"
+                                onClick={() => toggleSelectedAnalysisPackage(pkg)}
+                                className={`w-full rounded-md border px-3 py-2 text-left text-xs transition ${
+                                  isSelected
+                                    ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100 font-medium"
+                                    : "border-slate-700 bg-slate-950/40 text-slate-300 hover:border-slate-600 hover:bg-slate-900/50"
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <span className="truncate">{pkg}</span>
+                                  {isSelected ? <span className="ml-2 text-cyan-400">✓</span> : null}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                    {selectedAnalysisPackages.length > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void triggerPartialAnalysisScan();
+                        }}
+                        disabled={!canStartPartialAnalysisScan}
+                        className="w-full rounded-md border border-cyan-400/40 bg-cyan-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Run Analysis on {selectedAnalysisPackages.length} Package{selectedAnalysisPackages.length === 1 ? "" : "s"}
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current status</p>
+                    <p className="mt-2 text-sm text-slate-200">{shouldShowScanRuntime ? scanDisplay.statusLabel : "Ready to start"}</p>
+                    {scanJobId ? <p className="mt-1 text-xs text-slate-400">Job ID: {scanJobId}</p> : null}
+                  </div>
+
+                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Progress</p>
+                    {shouldShowScanRuntime ? (
+                      <>
+                        <p className="mt-2 text-sm text-slate-200">{scanDisplay.primaryCountLabel}</p>
+                        <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                          <div
+                            className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : scanDisplay.phase === "pending" ? "animate-pulse bg-cyan-300/90" : "bg-cyan-400"}`}
+                            style={{ width: `${Math.max(0, Math.min(100, scanDisplay.progressPercent))}%` }}
+                          />
+                        </div>
+                        <p className="mt-2 text-xs text-slate-400">{scanDisplay.progressLabel}</p>
+                        <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-400">
+                          {scanDisplay.etaLabel ? <span>{scanDisplay.etaLabel}</span> : null}
+                          {scanDisplay.speedLabel ? <span>{scanDisplay.speedLabel}</span> : null}
+                          {runtimeElapsedLabel ? <span>{runtimeElapsedLabel}</span> : null}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="mt-2 text-sm text-slate-300">Start a scan to stream dynamic results here.</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current job package results</p>
+                      {scanJobId ? (
+                        <p className="mt-2 text-xs text-slate-400">
+                          Rows: {scanResultRows.length} · Failed rows: {liveFailedRowsCount}
+                        </p>
+                      ) : (
+                        <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows from /scan/{'{'}job_id{'}'}.</p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void triggerPackageScan();
+                      }}
+                      disabled={!canStartScan}
+                      className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {scanStartLabel}
+                    </button>
+                  </div>
+
+                  {scanJobId && scanResultRows.length === 0 ? (
+                    <p className="text-xs text-slate-400">Waiting for first package rows from the current job...</p>
+                  ) : null}
+
+                  {scanJobId && scanResultRows.length > 0 ? (
+                    <div className="max-h-[52vh] overflow-auto rounded-lg border border-slate-800">
+                      <table className="w-full text-left text-xs text-slate-200">
+                        <thead className="bg-slate-900/90 text-slate-400">
+                          <tr>
+                            <th className="px-3 py-2 font-medium">Package</th>
+                            <th className="px-3 py-2 font-medium">Version</th>
+                            <th className="px-3 py-2 font-medium">Status</th>
+                            <th className="px-3 py-2 font-medium">Score</th>
+                            <th className="px-3 py-2 font-medium">Error</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scanResultRows.map((row) => {
+                            const isErrorRow = row.errorMessage !== null || row.status === "failed";
+
+                            return (
+                              <tr key={row.id} className={isErrorRow ? "border-t border-rose-500/30 bg-rose-500/10" : "border-t border-slate-800"}>
+                                <td className="px-3 py-2">{row.packageName}</td>
+                                <td className="px-3 py-2">{row.version}</td>
+                                <td className="px-3 py-2 uppercase">{row.status}</td>
+                                <td className="px-3 py-2">{row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}</td>
+                                <td className="px-3 py-2 text-rose-200">{row.errorMessage ?? "-"}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-slate-300">No dynamic rows are available yet.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {activeSection === "details" ? (
-            <div className="flex h-full w-full items-center justify-center text-slate-300">Details content coming soon.</div>
+            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+                <div className="space-y-4">
+                  <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-teal-300">Package Details</p>
+                    <p className="mt-1 text-sm text-slate-300">Browse installed packages and view detailed metadata.</p>
+                  </div>
+                  {selectedDetailsPackage ? (
+                    <div className="space-y-3 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                      <div>
+                        <h3 className="text-lg font-semibold text-slate-100">{selectedDetailsPackage}</h3>
+                        <p className="mt-1 text-xs text-slate-400 uppercase tracking-[0.12em]">Package Metadata</p>
+                      </div>
+                      <div className="space-y-3">
+                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Package Name</p>
+                          <p className="mt-1.5 font-mono text-sm text-slate-100">{selectedDetailsPackage.split("@")[0]}</p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Version</p>
+                          <p className="mt-1.5 font-mono text-sm text-slate-100">{selectedDetailsPackage.split("@")[1] || "unknown"}</p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Status</p>
+                          <p className="mt-1.5 inline-flex items-center gap-2 text-sm">
+                            <span className="inline-block h-2 w-2 rounded-full bg-emerald-400" />
+                            <span className="text-slate-100">Installed</span>
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Registry Link</p>
+                          <p className="mt-1.5 break-all font-mono text-xs text-slate-400">npm.im/{selectedDetailsPackage.split("@")[0]}</p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4 text-center">
+                      <p className="text-sm text-slate-400">Select a package from the list to view details</p>
+                    </div>
+                  )}
+                </div>
+                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div>
+                    <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">Search Packages</label>
+                    <input
+                      type="text"
+                      value={detailsPackageSearch}
+                      onChange={(event) => setDetailsPackageSearch(event.target.value)}
+                      placeholder="Filter packages..."
+                      className="mt-2 w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-teal-400/60"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Installed Packages ({availablePackagesForAnalysis.length})</p>
+                    <div className="max-h-[60vh] space-y-1 overflow-auto rounded-lg border border-slate-800 bg-slate-950/40 p-2">
+                      {availablePackagesForAnalysis
+                        .filter((pkg) => pkg.toLowerCase().includes(detailsPackageSearch.toLowerCase()))
+                        .map((pkg) => (
+                          <button
+                            key={pkg}
+                            type="button"
+                            onClick={() => setSelectedDetailsPackage(pkg)}
+                            className={`w-full rounded-md border px-3 py-2 text-left text-xs transition ${
+                              selectedDetailsPackage === pkg
+                                ? "border-teal-400/60 bg-teal-500/20 text-teal-100 font-medium"
+                                : "border-slate-700 bg-slate-950/40 text-slate-300 hover:border-slate-600 hover:bg-slate-900/50"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="truncate font-mono text-xs">{pkg}</span>
+                              {selectedDetailsPackage === pkg ? <span className="ml-2 text-teal-400">▶</span> : null}
+                            </div>
+                          </button>
+                        ))}
+                      {availablePackagesForAnalysis.filter((pkg) => pkg.toLowerCase().includes(detailsPackageSearch.toLowerCase())).length === 0 ? (
+                        <p className="p-2 text-xs text-slate-400">No packages match your search.</p>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {activeSection === "sbom" ? (
+            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-violet-300">Software Bill of Materials</p>
+                  <p className="mt-1 text-sm text-slate-300">Complete inventory of all packages in this project.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div className="mb-4 flex items-center justify-between">
+                    <p className="text-xs uppercase tracking-[0.12em] text-slate-400">
+                      Total Packages: <span className="font-semibold text-violet-300">{availablePackagesForAnalysis.length}</span>
+                    </p>
+                  </div>
+                  <div className="space-y-1 max-h-[calc(100vh-300px)] overflow-auto">
+                    {availablePackagesForAnalysis.length === 0 ? (
+                      <p className="p-2 text-xs text-slate-400">No packages found in dependency tree.</p>
+                    ) : (
+                      availablePackagesForAnalysis.map((pkg) => {
+                        const [name, version] = pkg.split("@");
+                        return (
+                          <div
+                            key={pkg}
+                            className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-xs transition hover:border-slate-700 hover:bg-slate-900/60"
+                          >
+                            <div className="flex flex-1 items-center gap-3 min-w-0">
+                              <span className="inline-block h-2 w-2 rounded-full bg-violet-400 flex-shrink-0" />
+                              <div className="min-w-0 flex-1">
+                                <p className="font-medium text-slate-100 truncate">{name}</p>
+                              </div>
+                            </div>
+                            <span className="ml-2 font-mono text-slate-400 flex-shrink-0">{version}</span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {activeSection === "history" ? (
+            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-300">Scan History</p>
+                  <p className="mt-1 text-sm text-slate-300">View all scans performed on this repository.</p>
+                </div>
+                {scanResultRows.length === 0 ? (
+                  <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-6 text-center">
+                    <p className="text-sm text-slate-400">No scan history available. Start a scan in the Dependency Graph tab to begin.</p>
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                    <div className="space-y-2">
+                      {scanResultRows.map((row) => {
+                        const isErrorRow = row.errorMessage !== null || row.status === "failed";
+                        return (
+                          <div
+                            key={row.id}
+                            className={`rounded-lg border p-4 transition ${
+                              isErrorRow
+                                ? "border-rose-400/30 bg-rose-500/10"
+                                : row.status === "completed"
+                                  ? "border-emerald-400/30 bg-emerald-500/10"
+                                  : "border-slate-700 bg-slate-900/50"
+                            }`}
+                          >
+                            <div className="flex flex-col gap-3">
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <p className="font-semibold text-slate-100">
+                                    {row.packageName} <span className="text-slate-400">@</span> {row.version}
+                                  </p>
+                                  <p className={`text-xs uppercase tracking-[0.12em] font-medium ${
+                                    isErrorRow
+                                      ? "text-rose-300"
+                                      : row.status === "completed"
+                                        ? "text-emerald-300"
+                                        : "text-slate-400"
+                                  }`}>
+                                    {row.status}
+                                  </p>
+                                </div>
+                                {row.malwareScore !== null && (
+                                  <div className="text-right">
+                                    <p className="text-xs text-slate-400">Malware Score</p>
+                                    <p className={`text-lg font-semibold ${
+                                      row.malwareScore > 0.5
+                                        ? "text-rose-400"
+                                        : row.malwareScore > 0.2
+                                          ? "text-amber-400"
+                                          : "text-emerald-400"
+                                    }`}>
+                                      {(row.malwareScore * 100).toFixed(1)}%
+                                    </p>
+                                  </div>
+                                )}
+                              </div>
+                              {row.errorMessage && <p className="text-xs text-rose-200">{row.errorMessage}</p>}
+                              {row.scanTimestamp && (
+                                <p className="text-xs text-slate-500">Scanned: {formatTimestampForDisplay(row.scanTimestamp)}</p>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
           ) : null}
 
           {activeSection === "add" ? (
@@ -1736,236 +2384,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         </aside>
       </div>
 
-      {isScanModalOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm">
-          <div className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-[0_36px_80px_-30px_rgba(2,6,23,0.95)]">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Scan Status Details</p>
-                <p className="mt-1 text-sm text-slate-300">Track malware scan progress while continuing to navigate the graph.</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsScanModalOpen(false)}
-                className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.1em] text-slate-200 transition hover:border-slate-500"
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="mt-5 flex-1 overflow-y-auto pr-1">
-              {scanError ? (
-                <div className="mb-4 rounded-xl border border-rose-400/40 bg-rose-500/10 p-3 text-xs text-rose-100">
-                  {scanError}
-                </div>
-              ) : null}
-
-              <div className="grid gap-4 lg:grid-cols-[360px_minmax(0,1fr)]">
-                <div className="space-y-4">
-                  <div className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current status</p>
-                    <p className="mt-1 text-sm text-slate-200">{shouldShowScanRuntime ? scanDisplay.statusLabel : "Ready to start"}</p>
-                    {scanJobId ? <p className="mt-2 text-xs text-slate-400">Job ID: {scanJobId}</p> : null}
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void triggerPackageScan();
-                        }}
-                        disabled={!canStartScan}
-                        className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {scanStartLabel}
-                      </button>
-                      {canCancelScan ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void cancelScanJob();
-                          }}
-                          disabled={isCancellingScan}
-                          className="inline-flex items-center rounded-lg border border-rose-400/40 bg-rose-500/15 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                          {isCancellingScan ? "Cancelling..." : "Cancel Scan"}
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-
-                  <div className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Scan Scope</p>
-                    <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
-                      <button
-                        type="button"
-                        onClick={() => setScanScope("full")}
-                        className={`rounded-lg border px-3 py-2 text-left text-sm transition ${
-                          scanScope === "full"
-                            ? "border-cyan-300/60 bg-cyan-500/15 text-cyan-100"
-                            : "border-slate-700 bg-slate-900/60 text-slate-300 hover:border-slate-500"
-                        }`}
-                      >
-                        <span className="block font-semibold uppercase tracking-[0.12em]">Full scan</span>
-                        <span className="mt-1 block text-xs text-slate-400">Scan every unique package in the tree.</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setScanScope("partial")}
-                        className={`rounded-lg border px-3 py-2 text-left text-sm transition ${
-                          scanScope === "partial"
-                            ? "border-cyan-300/60 bg-cyan-500/15 text-cyan-100"
-                            : "border-slate-700 bg-slate-900/60 text-slate-300 hover:border-slate-500"
-                        }`}
-                      >
-                        <span className="block font-semibold uppercase tracking-[0.12em]">Partial scan</span>
-                        <span className="mt-1 block text-xs text-slate-400">Pick specific packages from the list or graph.</span>
-                      </button>
-                    </div>
-
-                    {isPartialScan ? (
-                      <div className="mt-4 space-y-3">
-                        <div className="flex items-center justify-between gap-3">
-                          <p className="text-xs text-slate-400">Selected {selectedScanPackages.length} of {availableScanPackages.length}</p>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedScanPackages([])}
-                            className="text-xs font-medium text-cyan-200 underline decoration-cyan-400/50 underline-offset-2"
-                          >
-                            Clear selection
-                          </button>
-                        </div>
-
-                        <div className="max-h-52 overflow-auto rounded-lg border border-slate-800 bg-slate-950/50 p-2">
-                          {availableScanPackages.length === 0 ? (
-                            <p className="p-2 text-xs text-slate-400">No packages available for the selected ecosystem.</p>
-                          ) : (
-                            <div className="grid gap-2">
-                              {availableScanPackages.map((packageLabel) => {
-                                const selected = selectedScanPackageSet.has(packageLabel);
-
-                                return (
-                                  <button
-                                    key={packageLabel}
-                                    type="button"
-                                    onClick={() => toggleSelectedScanPackage(packageLabel)}
-                                    className={`flex items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition ${
-                                      selected
-                                        ? "border-cyan-300/60 bg-cyan-500/15 text-cyan-100"
-                                        : "border-slate-800 bg-slate-900/40 text-slate-300 hover:border-slate-600"
-                                    }`}
-                                  >
-                                    <span className="truncate">{packageLabel}</span>
-                                    <span className="ml-3 text-[10px] uppercase tracking-[0.14em] text-slate-400">
-                                      {selected ? "Selected" : "Add"}
-                                    </span>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <div className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Progress</p>
-                    {shouldShowScanRuntime ? (
-                      <>
-                        <p className="mt-1 text-sm text-slate-200">{scanDisplay.primaryCountLabel}</p>
-                        {scanDetails ? (
-                          <p className="mt-1 text-xs text-slate-400">
-                            Scanned {(coerceNonNegativeNumber(scanDetails.scanned_packages) ?? 0)} / {(coerceNonNegativeNumber(scanDetails.total_unique_packages) ?? 0)}
-                          </p>
-                        ) : null}
-                        {scanDisplay.secondaryCountLabel ? <p className="mt-1 text-xs text-slate-400">{scanDisplay.secondaryCountLabel}</p> : null}
-                        <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                          <div
-                            className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : scanDisplay.phase === "pending" ? "animate-pulse bg-cyan-300/90" : "bg-cyan-400"}`}
-                            style={{ width: `${Math.max(0, Math.min(100, scanDisplay.progressPercent))}%` }}
-                          />
-                        </div>
-                        <p className="mt-2 text-xs text-slate-400">{scanDisplay.progressLabel}</p>
-                        <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-400">
-                          {scanDisplay.etaLabel ? <span>{scanDisplay.etaLabel}</span> : null}
-                          {scanDisplay.speedLabel ? <span>{scanDisplay.speedLabel}</span> : null}
-                          {runtimeElapsedLabel ? <span>{runtimeElapsedLabel}</span> : null}
-                        </div>
-                      </>
-                    ) : (
-                      <p className="mt-1 text-sm text-slate-300">Click Start scan packages to begin scanning.</p>
-                    )}
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  <div className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Latest Completed Scan Summary</p>
-                    {latestScanSummary.status === null ? (
-                      <p className="mt-2 text-xs text-slate-400">No completed scans yet.</p>
-                    ) : (
-                      <>
-                        <p className="mt-2 text-xs text-slate-300">Status: {latestScanSummary.status}</p>
-                        <p className="mt-1 text-xs text-slate-300">
-                          Processed: {latestScanSummary.processed ?? "-"} / {latestScanSummary.total ?? "-"}
-                        </p>
-                        <p className="mt-1 text-xs text-slate-300">Completed: {formatTimestampForDisplay(latestScanSummary.completedAt)}</p>
-                      </>
-                    )}
-                  </div>
-
-                  <div className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current Job Package Results (Live)</p>
-                    {scanJobId ? (
-                      <p className="mt-2 text-xs text-slate-400">
-                        Rows: {scanResultRows.length} · Failed rows: {liveFailedRowsCount}
-                      </p>
-                    ) : (
-                      <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows from /scan/{'{'}job_id{'}'}.</p>
-                    )}
-                    {scanJobId && scanResultRows.length === 0 ? (
-                      <p className="mt-2 text-xs text-slate-400">Waiting for first package rows from current job...</p>
-                    ) : null}
-                    {scanJobId && scanResultRows.length > 0 ? (
-                      <div className="mt-3 max-h-[36vh] overflow-auto rounded-lg border border-slate-800">
-                        <table className="w-full text-left text-xs text-slate-200">
-                          <thead className="bg-slate-900/90 text-slate-400">
-                            <tr>
-                              <th className="px-3 py-2 font-medium">Package</th>
-                              <th className="px-3 py-2 font-medium">Version</th>
-                              <th className="px-3 py-2 font-medium">Status</th>
-                              <th className="px-3 py-2 font-medium">Score</th>
-                              <th className="px-3 py-2 font-medium">Error</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {scanResultRows.map((row) => {
-                              const isErrorRow = row.errorMessage !== null || row.status === "failed";
-
-                              return (
-                                <tr key={row.id} className={isErrorRow ? "border-t border-rose-500/30 bg-rose-500/10" : "border-t border-slate-800"}>
-                                  <td className="px-3 py-2">{row.packageName}</td>
-                                  <td className="px-3 py-2">{row.version}</td>
-                                  <td className="px-3 py-2 uppercase">{row.status}</td>
-                                  <td className="px-3 py-2">{row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}</td>
-                                  <td className="px-3 py-2 text-rose-200">{row.errorMessage ?? "-"}</td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-xs text-slate-400">No live rows for current job yet.</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-            </div>
-          </div>
-        </div>
-      ) : null}
     </section>
   );
 }

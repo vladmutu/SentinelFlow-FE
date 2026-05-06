@@ -316,8 +316,8 @@ function layoutElements(nodes: Node<GraphNodeData>[], edges: Edge[], compactMode
   graph.setDefaultEdgeLabel(() => ({}));
   graph.setGraph({
     rankdir: "TB",
-    nodesep: compactMode ? 40 : 70,
-    ranksep: compactMode ? 120 : 180,
+    nodesep: compactMode ? 60 : 90,
+    ranksep: compactMode ? 160 : 260,
     marginx: compactMode ? 16 : 24,
     marginy: compactMode ? 16 : 24,
   });
@@ -376,6 +376,7 @@ export function DependencyTree({
   const [reactFlowInstance, setReactFlowInstance] = useState<Parameters<NonNullable<React.ComponentProps<typeof ReactFlow>["onInit"]>>[0] | null>(null);
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [isInteractive, setIsInteractive] = useState(!largeGraphMode);
 
   useEffect(() => {
     if (!cachedGraphIndex) {
@@ -390,6 +391,10 @@ export function DependencyTree({
   useEffect(() => {
     setExpandedNodeIds(defaultExpandedNodeIds);
   }, [defaultExpandedNodeIds]);
+
+  useEffect(() => {
+    setIsInteractive(!largeGraphMode);
+  }, [largeGraphMode]);
 
   const layoutCacheKey = useMemo(
     () => createCacheKey("dependency-graph-layout", ecosystem, treeSignature, scanSignature, largeGraphMode, buildExpandedSignature(expandedNodeIds)),
@@ -479,8 +484,9 @@ export function DependencyTree({
         panOnScroll={true}
         panOnDrag={true}
         zoomOnScroll={true}
-        nodesDraggable={!largeGraphMode}
-        elementsSelectable={!largeGraphMode}
+        nodesDraggable={isInteractive}
+        elementsSelectable={isInteractive}
+        nodesConnectable={isInteractive}
         zoomOnDoubleClick={true}
         onlyRenderVisibleElements={largeGraphMode}
         fitView={true}
@@ -526,6 +532,7 @@ export function DependencyTree({
         ) : null}
         <Controls
           showInteractive={true}
+          onInteractiveChange={(interactiveStatus) => setIsInteractive(interactiveStatus)}
           className="!border !border-teal-400/60 !bg-slate-900/95 !text-teal-200 !shadow-[0_0_24px_-12px_rgba(20,184,166,0.95)] [&_button]:!bg-slate-800/95 [&_button]:!text-teal-100 [&_button:hover]:!bg-teal-500/25 [&_button]:!border-b [&_button]:!border-teal-400/40"
         />
       </ReactFlow>

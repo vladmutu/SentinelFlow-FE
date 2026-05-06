@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +9,8 @@ function makeSearchResponse(overrides?: Partial<PackageSearchResponse>): Package
   return {
     ecosystem: "npm",
     query: "rea",
+    page: 1,
+    limit: 8,
     total: 2,
     results: [
       {
@@ -51,6 +53,27 @@ function makeSearchResponse(overrides?: Partial<PackageSearchResponse>): Package
     did_you_mean: null,
     ...overrides,
   };
+}
+
+function makeResult(index: number, version: string | null = `1.0.${index}`) {
+  return {
+    ecosystem: "npm" as const,
+    name: `package-${index}`,
+    version,
+    description: `Package ${index}`,
+    homepage: null,
+    registry_url: null,
+    score: 100 - index,
+    monthly_downloads: 1000 - index,
+    typosquat: {
+      is_suspected: false,
+      confidence: 0,
+      levenshtein_distance: null,
+      edit_distance: null,
+      normalized_conflict: null,
+      reasons: [],
+    },
+  } satisfies PackageSearchResponse["results"][number];
 }
 
 describe("AddDependencyPanel", () => {
@@ -159,6 +182,7 @@ describe("AddDependencyPanel", () => {
       { baseUrl: "http://localhost:8000" },
       "pypi",
       "scikit",
+      1,
       1000,
     );
 
@@ -173,6 +197,8 @@ describe("AddDependencyPanel", () => {
     const searchPackages = vi.fn().mockResolvedValue({
       ecosystem: "npm",
       query: "rpequests",
+      page: 1,
+      limit: 8,
       total: 0,
       results: [],
       did_you_mean: "requests",
@@ -197,10 +223,99 @@ describe("AddDependencyPanel", () => {
     expect(screen.getByLabelText("Search package")).toHaveValue("requests");
   });
 
+  it("loads more packages when the results sentinel intersects", async () => {
+    const initialResults = Array.from({ length: 8 }, (_, index) => makeResult(index + 1));
+    const extendedResults = Array.from({ length: 8 }, (_, index) => makeResult(index + 9));
+    const observerInstances: Array<{ trigger: (isIntersecting?: boolean) => void }> = [];
+
+    class MockIntersectionObserver {
+      readonly callback: IntersectionObserverCallback;
+
+      constructor(callback: IntersectionObserverCallback) {
+        this.callback = callback;
+        observerInstances.push(this);
+      }
+
+      observe = () => undefined;
+      disconnect = () => undefined;
+      unobserve = () => undefined;
+
+      trigger(isIntersecting = true) {
+        this.callback(
+          [
+            {
+              isIntersecting,
+              intersectionRatio: isIntersecting ? 1 : 0,
+              target: document.createElement("div"),
+              time: performance.now(),
+              boundingClientRect: {} as DOMRectReadOnly,
+              intersectionRect: {} as DOMRectReadOnly,
+              rootBounds: null,
+            } as IntersectionObserverEntry,
+          ],
+          this as unknown as IntersectionObserver,
+        );
+      }
+    }
+
+    vi.stubGlobal("IntersectionObserver", MockIntersectionObserver as unknown as typeof IntersectionObserver);
+
+    const searchPackages = vi.fn().mockImplementation(async (_context, _ecosystem, _query, page) => {
+      if (page === 1) {
+        return {
+          ecosystem: "npm",
+          query: "package",
+          page: 1,
+          limit: 8,
+          total: 16,
+          results: initialResults,
+          did_you_mean: null,
+        } satisfies PackageSearchResponse;
+      }
+
+      return {
+        ecosystem: "npm",
+        query: "package",
+        page: 2,
+        limit: 8,
+        total: 16,
+        results: extendedResults,
+        did_you_mean: null,
+      } satisfies PackageSearchResponse;
+    });
+    const fetchPackageVersions = vi.fn().mockResolvedValue({ name: "package-1", versions: ["1.0.1"] });
+    const createDependencyPr = vi.fn();
+
+    render(
+      <AddDependencyPanel
+        apiBaseUrl="http://localhost:8000"
+        initialEcosystem="npm"
+        resolveRepoCoordinates={async () => ({ owner: "octo", repoName: "repo", headers: {} })}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+      />,
+    );
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Search package"), "package");
+
+    expect(await screen.findByText("package-1")).toBeInTheDocument();
+    expect(screen.getByText(/999 \/ month/i)).toBeInTheDocument();
+
+    expect(observerInstances.length).toBeGreaterThan(0);
+    await act(async () => {
+      observerInstances[0].trigger(true);
+    });
+
+    await waitFor(() => expect(searchPackages).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("package-16")).toBeInTheDocument();
+  });
+
   it("renders packages even when the search response omits a version", async () => {
     const searchPackages = vi.fn().mockResolvedValue({
       ecosystem: "pypi",
       query: "scikit",
+      page: 1,
+      limit: 8,
       total: 1,
       results: [
         {
@@ -242,7 +357,7 @@ describe("AddDependencyPanel", () => {
 
     expect(await screen.findByText("scikit-learn")).toBeInTheDocument();
     expect(screen.getByText(/Version unavailable/i)).toBeInTheDocument();
-    expect(screen.getByText(/200,310,655 monthly downloads/i)).toBeInTheDocument();
+    expect(screen.getByText(/200,310,655 \/ month/i)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Select" }));
     expect(await screen.findByLabelText("Version")).toBeInTheDocument();
