@@ -1,11 +1,14 @@
 "use client";
 
-import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AddDependencyPanel } from "@/app/components/add-dependency-panel";
 import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanJobResponse, ScanHistoryItem, SbomDocument, ScanApiContext } from "@/app/lib/api/scan-api";
+import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
+import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 const DASHBOARD_CACHE_TTL_MS = 1000 * 60 * 20;
@@ -17,6 +20,13 @@ type RepoDetailsPageProps = {
   params: Promise<{ id: string }>;
 };
 
+type InternalScanJobResponse = Partial<ScanJobResponse> & {
+  status?: ScanJobResponse["status"];
+  scanned_packages?: number;
+  total_unique_packages?: number;
+  progress_percent?: number;
+};
+
 type UserPayload = {
   username?: unknown;
   login?: unknown;
@@ -24,29 +34,6 @@ type UserPayload = {
     username?: unknown;
     login?: unknown;
   };
-};
-
-type ScanTriggerResponse = {
-  job_id: string;
-  status: string;
-};
-
-type ScanJobResponse = {
-  status?: string;
-  processed_packages?: number | null;
-  progress?: number;
-  completed_packages?: number;
-  total_packages?: number;
-  total_dependency_nodes?: number | null;
-  total_unique_packages?: number | null;
-  scanned_packages?: number | null;
-  progress_percent?: number | null;
-  elapsed_seconds?: number | null;
-  packages_per_minute?: number | null;
-  estimated_seconds_remaining?: number | null;
-  started_at?: string | null;
-  completed_at?: string | null;
-  results?: unknown;
 };
 
 type ScanResultMapEntry = {
@@ -112,29 +99,7 @@ type CachedRepositoryItem = {
   full_name: string;
 };
 
-const SCAN_TERMINAL_DONE = new Set(["completed", "success", "succeeded", "done"]);
-const SCAN_TERMINAL_FAILED = new Set(["failed", "error"]);
-const SCAN_TERMINAL_CANCELLED = new Set(["cancelled"]);
 const ALL_ECOSYSTEMS: Ecosystem[] = ["npm", "pypi"];
-const SCAN_POLL_INTERVAL_MS = 1500;
-const SCAN_RETRY_MAX_DELAY_MS = 12000;
-
-const POLL_RETRY_SILENT_ATTEMPTS = 3;
-const POLL_ERROR_VISIBLE_RETRY_DELAY_MS = 5000;
-
-type ScanPhase = "pending" | "running" | "completed" | "cancelled" | "failed";
-
-type ScanDisplay = {
-  phase: ScanPhase;
-  progressPercent: number;
-  progressLabel: string;
-  primaryCountLabel: string;
-  secondaryCountLabel: string | null;
-  etaLabel: string | null;
-  speedLabel: string | null;
-  elapsedLabel: string | null;
-  statusLabel: string;
-};
 
 function coerceNonNegativeNumber(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -161,28 +126,13 @@ function formatDuration(totalSeconds: number): string {
   return `${seconds}s`;
 }
 
-function normalizeLegacyProgress(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return null;
-  }
-
-  if (value <= 1) {
-    return Math.max(0, Math.min(100, value * 100));
-  }
-
-  return Math.max(0, Math.min(100, value));
-}
-
-function normalizeStatusValue(status: unknown): string {
-  return typeof status === "string" && status.trim().length > 0 ? status.trim().toLowerCase() : "pending";
-}
-
-function isPollingStatus(status: string): boolean {
-  return status === "pending" || status === "queued" || status === "running" || status === "in_progress";
-}
 
 function coerceString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function buildResultDedupKey(row: ScanResultRow): string {
+  return `${row.packageName}|${row.version}|${row.scanTimestamp ?? "-"}|${row.status}|${row.errorMessage ?? "-"}`;
 }
 
 function normalizeResultMapFromRows(rows: ScanResultRow[]): Record<string, ScanResultMapEntry> {
@@ -296,25 +246,9 @@ function normalizeScanResultsPayload(payload: unknown): {
   };
 }
 
-function normalizeLatestCompletedScan(payload: unknown): LatestScanSummary {
-  if (!payload || typeof payload !== "object") {
-    return {
-      status: null,
-      processed: null,
-      total: null,
-      completedAt: null,
-    };
-  }
 
-  const record = payload as Record<string, unknown>;
 
-  return {
-    status: coerceString(record.status),
-    processed: coerceNonNegativeNumber(record.scanned_packages),
-    total: coerceNonNegativeNumber(record.total_unique_packages),
-    completedAt: coerceString(record.completed_at),
-  };
-}
+
 
 function formatTimestampForDisplay(value: string | null): string {
   if (!value) {
@@ -329,173 +263,11 @@ function formatTimestampForDisplay(value: string | null): string {
   return new Date(parsed).toLocaleString();
 }
 
-type PollErrorKind = "transient" | "auth" | "not-found" | "other";
 
-type PollErrorMeta = {
-  kind: PollErrorKind;
-  status: number | null;
-  message: string;
-};
 
-function resolvePollErrorMeta(error: unknown): PollErrorMeta {
-  const unknownMessage = error instanceof Error ? error.message : "Unexpected polling error";
-  const maybeStatus =
-    typeof error === "object" && error !== null && "status" in error && typeof (error as { status?: unknown }).status === "number"
-      ? ((error as { status: number }).status)
-      : null;
 
-  if (maybeStatus === 401) {
-    return { kind: "auth", status: maybeStatus, message: "Authentication expired. Redirecting to login." };
-  }
 
-  if (maybeStatus === 404) {
-    return { kind: "not-found", status: maybeStatus, message: "Scan job not found or expired." };
-  }
 
-  if (maybeStatus === 503 || unknownMessage.toLowerCase().includes("network")) {
-    return { kind: "transient", status: maybeStatus, message: "Temporary network issue while polling scan status." };
-  }
-
-  if (maybeStatus === null) {
-    return { kind: "transient", status: null, message: "Temporary polling error." };
-  }
-
-  return { kind: "other", status: maybeStatus, message: `Polling failed with status ${maybeStatus}.` };
-}
-
-function buildResultDedupKey(row: ScanResultRow): string {
-  return `${row.packageName}|${row.version}|${row.scanTimestamp ?? "-"}|${row.status}|${row.errorMessage ?? "-"}`;
-}
-
-function normalizeLiveElapsedSeconds(scanDetails: ScanJobResponse | null): number {
-  if (!scanDetails) {
-    return 0;
-  }
-
-  const directElapsed = coerceNonNegativeNumber(scanDetails.elapsed_seconds);
-  if (directElapsed !== null) {
-    return Math.floor(directElapsed);
-  }
-
-  const startedAtRaw = coerceString(scanDetails.started_at);
-  if (!startedAtRaw) {
-    return 0;
-  }
-
-  const startedAtMs = Date.parse(startedAtRaw);
-  if (!Number.isFinite(startedAtMs)) {
-    return 0;
-  }
-
-  return Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
-}
-
-function normalizeScanPhase(status: string | undefined, isScanRunning: boolean, hasError: boolean): ScanPhase {
-  if (hasError) {
-    return "failed";
-  }
-
-  const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
-
-  if (SCAN_TERMINAL_DONE.has(normalized)) {
-    return "completed";
-  }
-
-  if (SCAN_TERMINAL_CANCELLED.has(normalized)) {
-    return "cancelled";
-  }
-
-  if (SCAN_TERMINAL_FAILED.has(normalized)) {
-    return "failed";
-  }
-
-  if (normalized === "running" || normalized === "in_progress") {
-    return "running";
-  }
-
-  if (normalized === "pending" || normalized === "queued") {
-    return "pending";
-  }
-
-  if (isScanRunning) {
-    return "pending";
-  }
-
-  return "pending";
-}
-
-function computeScanProgress(payload: ScanJobResponse | null, phase: ScanPhase, fallbackProgress: number): number {
-  if (!payload) {
-    return fallbackProgress;
-  }
-
-  const explicitPercent = normalizeLegacyProgress(payload.progress_percent);
-  if (explicitPercent !== null) {
-    return explicitPercent;
-  }
-
-  const scannedPackages = coerceNonNegativeNumber(payload.scanned_packages) ?? 0;
-  const totalUniquePackages = coerceNonNegativeNumber(payload.total_unique_packages) ?? 0;
-
-  if (totalUniquePackages > 0) {
-    return Math.max(0, Math.min(100, (scannedPackages / totalUniquePackages) * 100));
-  }
-
-  return phase === "completed" ? 100 : 0;
-}
-
-function deriveScanDisplay(scanDetails: ScanJobResponse | null, fallbackProgress: number, isScanRunning: boolean, scanError: string | null): ScanDisplay {
-  const phase = normalizeScanPhase(scanDetails?.status, isScanRunning, scanError !== null);
-  const scannedPackages = coerceNonNegativeNumber(scanDetails?.scanned_packages);
-  const totalDependencyNodes = coerceNonNegativeNumber(scanDetails?.total_dependency_nodes);
-  const totalUniquePackages = coerceNonNegativeNumber(scanDetails?.total_unique_packages);
-  const progressPercent = computeScanProgress(scanDetails, phase, fallbackProgress);
-  const packagesPerMinute = coerceNonNegativeNumber(scanDetails?.packages_per_minute);
-  const elapsedSeconds = coerceNonNegativeNumber(scanDetails?.elapsed_seconds);
-  const estimatedSecondsRemaining = coerceNonNegativeNumber(scanDetails?.estimated_seconds_remaining);
-
-  let primaryCountLabel = "No scan data yet";
-
-  if (scannedPackages !== null && totalUniquePackages !== null) {
-    primaryCountLabel = `Scanned ${scannedPackages} / ${totalUniquePackages} packages`;
-  } else if (scannedPackages !== null) {
-    primaryCountLabel = `Scanned ${scannedPackages} packages`;
-  } else if (phase === "pending") {
-    primaryCountLabel = "Queued for scan";
-  } else if (phase === "running") {
-    primaryCountLabel = "Scanning packages";
-  }
-
-  const secondaryCountLabel = totalDependencyNodes !== null ? `${totalDependencyNodes} total dependency nodes in graph` : null;
-
-  const etaLabel =
-    phase === "completed"
-      ? "ETA 0s"
-      : phase === "cancelled"
-        ? "Cancelled"
-        : phase === "running" && estimatedSecondsRemaining === null
-          ? "Estimating..."
-          : estimatedSecondsRemaining !== null
-            ? `ETA ${formatDuration(estimatedSecondsRemaining)}`
-            : phase === "pending"
-              ? "Queued"
-              : null;
-
-  const speedLabel = packagesPerMinute !== null ? `${packagesPerMinute.toFixed(1)} packages/min` : null;
-  const elapsedLabel = elapsedSeconds !== null ? `Elapsed ${formatDuration(elapsedSeconds)}` : null;
-
-  return {
-    phase,
-    progressPercent,
-    progressLabel: `${Math.round(progressPercent)}% complete`,
-    primaryCountLabel,
-    secondaryCountLabel,
-    etaLabel,
-    speedLabel,
-    elapsedLabel,
-    statusLabel: phase.charAt(0).toUpperCase() + phase.slice(1),
-  };
-}
 
 function normalizeLanguageToEcosystem(language: string): Ecosystem {
   const normalized = language.trim().toLowerCase();
@@ -720,7 +492,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [scanJobId, setScanJobId] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState(0);
   const [scanStatus, setScanStatus] = useState("Waiting to start malware scan.");
-  const [scanDetails, setScanDetails] = useState<ScanJobResponse | null>(null);
+  const [scanDetails, setScanDetails] = useState<InternalScanJobResponse | null>(null);
   const [activeSection, setActiveSection] = useState("graph");
   const [graphScanView, setGraphScanView] = useState<"progress" | "results">("progress");
   const [isHydrated, setIsHydrated] = useState(false);
@@ -733,6 +505,26 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
   const [detailsPackageSearch, setDetailsPackageSearch] = useState("");
   const [selectedDetailsPackage, setSelectedDetailsPackage] = useState<string | null>(null);
+  // Scan history
+  const [scanHistoryJobs, setScanHistoryJobs] = useState<ScanHistoryItem[]>([]);
+  const [isScanHistoryLoading, setIsScanHistoryLoading] = useState(false);
+  const [scanHistoryTotal, setScanHistoryTotal] = useState(0);
+  const [selectedHistoryJobId, setSelectedHistoryJobId] = useState<string | null>(null);
+  const [selectedHistoryJob, setSelectedHistoryJob] = useState<ScanJobResponse | null>(null);
+  const [isHistoryJobLoading, setIsHistoryJobLoading] = useState(false);
+  // SBOM
+  const [sbomDocument, setSbomDocument] = useState<SbomDocument | null>(null);
+  const [isSbomLoading, setIsSbomLoading] = useState(false);
+  const [sbomError, setSbomError] = useState<string | null>(null);
+  const [isSbomCdxLoading, setIsSbomCdxLoading] = useState(false);
+  // Package details
+  const [packageDetailsData, setPackageDetailsData] = useState<PackageDetailsResponse | null>(null);
+  const [isPackageDetailsLoading, setIsPackageDetailsLoading] = useState(false);
+  const [packageDetailsVersions, setPackageDetailsVersions] = useState<string[]>([]);
+  const [packageDetailsLatestVersion, setPackageDetailsLatestVersion] = useState<string | null>(null);
+  const [packageDetailsScanEntry, setPackageDetailsScanEntry] = useState<{ advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null> } | null>(null);
+  // Scan mode
+  const [activeScanMode, setActiveScanMode] = useState<"full" | "static_only" | "static_dynamic" | "dynamic_only">("full");
   const isMountedRef = useRef(true);
   const scanPollTimerRef = useRef<number | null>(null);
   const elapsedTickerRef = useRef<number | null>(null);
@@ -741,7 +533,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const repoContextRef = useRef<RepoContext | null>(null);
   const repoContextPromiseRef = useRef<Promise<RepoContext> | null>(null);
   const scanDisplay = useMemo(
-    () => deriveScanDisplay(scanDetails, scanProgress, isScanRunning, scanError),
+    () => deriveScanDisplay(scanDetails as ScanJobResponse | null, scanProgress, isScanRunning, scanError),
     [scanDetails, scanProgress, isScanRunning, scanError],
   );
   const hasScanStarted = isScanRunning || hasScanned || scanJobId !== null || scanDetails !== null || scanError !== null;
@@ -849,6 +641,17 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     setScanScope("full");
     setSelectedScanPackages([]);
     setLiveElapsedSeconds(0);
+    setScanHistoryJobs([]);
+    setIsScanHistoryLoading(false);
+    setScanHistoryTotal(0);
+    setSelectedHistoryJobId(null);
+    setSelectedHistoryJob(null);
+    setSbomDocument(null);
+    setSbomError(null);
+    setPackageDetailsData(null);
+    setPackageDetailsVersions([]);
+    setPackageDetailsLatestVersion(null);
+    setPackageDetailsScanEntry(null);
     setRepositoryLanguage("");
     setRepositoryEcosystem(null);
     liveResultKeysRef.current = new Set();
@@ -874,7 +677,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       return;
     }
 
-    setLiveElapsedSeconds(normalizeLiveElapsedSeconds(scanDetails));
+    setLiveElapsedSeconds(scanDetails ? normalizeLiveElapsedSeconds(scanDetails as ScanJobResponse) : 0);
 
     if (elapsedTickerRef.current !== null) {
       window.clearInterval(elapsedTickerRef.current);
@@ -939,7 +742,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         const [candidateOwner, candidateRepo] = decodedId.includes("/")
           ? decodedId.split("/", 2)
           : [null, decodedId];
-        const tokenBucket = token ? hashString(token) : null;
         const dashboardCacheKey = token ? buildDashboardCacheKey(token) : null;
         const cachedDashboard = dashboardCacheKey ? getCachedValue<DashboardCacheSnapshot>(dashboardCacheKey) : null;
 
@@ -1168,66 +970,25 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setHasScanned(Object.keys(cachedScanResults).length > 0);
       }
 
-      const response = await fetch(
-        `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan/latest/results`,
-        {
-          method: "GET",
-          headers,
-          credentials: "include",
-          cache: "no-store",
-        },
-      );
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
 
-      if (!response.ok) {
-        if (cachedScanResults === null) {
-          setScanResultsMap({});
-        }
-        return;
-      }
-
-      const payload = (await response.json()) as unknown;
-      const normalized = normalizeScanResultsPayload(payload);
-      setScanResultsMap(normalized.map);
-      setHasScanned(normalized.rows.length > 0 || Object.keys(normalized.map).length > 0);
-
-      const latestScanResponse = await fetch(
-        `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan/latest`,
-        {
-          method: "GET",
-          headers,
-          credentials: "include",
-          cache: "no-store",
-        },
-      );
-
-      if (!latestScanResponse.ok) {
-        setLatestScanSummary({
-          status: null,
-          processed: null,
-          total: null,
-          completedAt: null,
-        });
-      } else {
-        const latestScanPayload = (await latestScanResponse.json()) as unknown;
-
-        if (latestScanPayload === null) {
-          setLatestScanSummary({
-            status: null,
-            processed: null,
-            total: null,
-            completedAt: null,
-          });
-        } else {
-          setLatestScanSummary(normalizeLatestCompletedScan(latestScanPayload));
-        }
-      }
+      const resultsMap = await getLatestScanResults(scanContext);
+      setScanResultsMap(resultsMap);
+      setHasScanned(Object.keys(resultsMap).length > 0);
 
       if (scanResultsCacheKey) {
-        setCachedValue(scanResultsCacheKey, normalized.map, {
+        setCachedValue(scanResultsCacheKey, resultsMap, {
           ttlMs: SCAN_RESULTS_CACHE_TTL_MS,
           scope: "both",
           maxPersistentSizeBytes: MAX_CACHE_BYTES,
         });
+      }
+
+      const latestJob = await getLatestScan(scanContext);
+      if (latestJob === null) {
+        setLatestScanSummary({ status: null, processed: null, total: null, completedAt: null });
+      } else {
+        setLatestScanSummary(normalizeLatestCompletedScan(latestJob));
       }
     } catch {
       if (cachedScanResults === null) {
@@ -1239,23 +1000,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const pollScanJob = useCallback(
     async (owner: string, repoName: string, jobId: string, headers: HeadersInit) => {
       try {
-        const response = await fetch(
-          `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan/${encodeURIComponent(jobId)}`,
-          {
-            method: "GET",
-            headers,
-            credentials: "include",
-            cache: "no-store",
-          },
-        );
-
-        if (!response.ok) {
-          const httpError = new Error(`Could not read scan status (${response.status}).`) as Error & { status: number };
-          httpError.status = response.status;
-          throw httpError;
-        }
-
-        const payload = (await response.json()) as ScanJobResponse;
+        const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+        const payload = await apiPollScanJob(scanContext, jobId);
         const statusValue = normalizeStatusValue(payload.status);
         const phase = normalizeScanPhase(statusValue, true, false);
 
@@ -1382,7 +1128,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const token = clientSessionStorage.readToken();
       const scanResultsCacheKey = token ? buildScanResultsCacheKey(token, owner, repoName) : null;
       const selectedPackagesPayload = isPartialScan ? selectedScanPackages : undefined;
-      const triggerBody: Record<string, unknown> = { ecosystem };
+      const triggerBody: Record<string, unknown> = { ecosystem, scan_mode: activeScanMode };
 
       if (selectedPackagesPayload && selectedPackagesPayload.length > 0) {
         triggerBody.selected_packages = selectedPackagesPayload;
@@ -1396,24 +1142,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         });
       }
 
-      const triggerResponse = await fetch(
-        `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...headers,
-          },
-          body: JSON.stringify(triggerBody),
-          credentials: "include",
-        },
-      );
-
-      if (!triggerResponse.ok) {
-        throw new Error(`Could not trigger package scan (${triggerResponse.status}).`);
-      }
-
-      const triggerPayload = (await triggerResponse.json()) as ScanTriggerResponse;
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const triggerPayload = await triggerScan(scanContext, {
+        ecosystem,
+        scan_mode: activeScanMode,
+        selected_packages: isPartialScan && selectedScanPackages.length > 0 ? selectedScanPackages : undefined,
+      });
 
       if (!triggerPayload.job_id) {
         throw new Error("Scan trigger did not return a job id.");
@@ -1442,7 +1176,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setIsScanRunning(false);
       }
     }
-  }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages]);
+  }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages, activeScanMode]);
 
   const triggerPartialAnalysisScan = useCallback(async () => {
     if (selectedAnalysisPackages.length === 0 || isScanRunning) {
@@ -1462,7 +1196,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
       const token = clientSessionStorage.readToken();
       const scanResultsCacheKey = token ? buildScanResultsCacheKey(token, owner, repoName) : null;
-      const triggerBody: Record<string, unknown> = { ecosystem, selected_packages: selectedAnalysisPackages };
 
       if (scanResultsCacheKey) {
         setCachedValue(scanResultsCacheKey, {}, {
@@ -1472,24 +1205,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         });
       }
 
-      const triggerResponse = await fetch(
-        `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...headers,
-          },
-          body: JSON.stringify(triggerBody),
-          credentials: "include",
-        },
-      );
-
-      if (!triggerResponse.ok) {
-        throw new Error(`Could not trigger package scan (${triggerResponse.status}).`);
-      }
-
-      const triggerPayload = (await triggerResponse.json()) as ScanTriggerResponse;
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const triggerPayload = await triggerScan(scanContext, {
+        ecosystem,
+        scan_mode: "dynamic_only",
+        selected_packages: selectedAnalysisPackages,
+      });
 
       if (!triggerPayload.job_id) {
         throw new Error("Scan trigger did not return a job id.");
@@ -1518,7 +1239,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setIsScanRunning(false);
       }
     }
-  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages, isScanRunning]);
+  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages, isScanRunning, activeScanMode]);
 
   const cancelScanJob = useCallback(async () => {
     if (!scanJobId || isCancellingScan) {
@@ -1530,22 +1251,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
-      const cancelUrl = `${API_BASE_URL}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/scan/${encodeURIComponent(scanJobId)}/cancel`;
-
-      const response = await fetch(cancelUrl, {
-        method: "POST",
-        headers,
-        credentials: "include",
-      });
-
-      if (!response.ok) {
-        const cancelError = new Error(`Cancel request failed (${response.status}).`) as Error & { status: number };
-        cancelError.status = response.status;
-        throw cancelError;
-      }
-
-      const payload = (await response.json()) as { status?: unknown };
-      const cancelledStatus = normalizeStatusValue(payload.status);
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const result = await apiCancelScan(scanContext, scanJobId);
+      const cancelledStatus = result.status;
 
       if (scanPollTimerRef.current !== null) {
         window.clearTimeout(scanPollTimerRef.current);
@@ -1583,10 +1291,143 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [isCancellingScan, resolveRepoCoordinates, scanJobId]);
 
+  const loadScanHistory = useCallback(async () => {
+    if (!API_BASE_URL) return;
+    setIsScanHistoryLoading(true);
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const result = await getScanHistory(scanContext, 1, 20);
+      if (isMountedRef.current) {
+        setScanHistoryJobs(result.jobs);
+        setScanHistoryTotal(result.total);
+      }
+    } catch { /* silent */ } finally {
+      if (isMountedRef.current) setIsScanHistoryLoading(false);
+    }
+  }, [resolveRepoCoordinates]);
+
+  const loadHistoryJobDetails = useCallback(async (jobId: string) => {
+    if (!API_BASE_URL) return;
+    setSelectedHistoryJobId(jobId);
+    setSelectedHistoryJob(null);
+    setIsHistoryJobLoading(true);
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const job = await apiPollScanJob(scanContext, jobId);
+      if (isMountedRef.current) setSelectedHistoryJob(job);
+    } catch { /* silent */ } finally {
+      if (isMountedRef.current) setIsHistoryJobLoading(false);
+    }
+  }, [resolveRepoCoordinates]);
+
+  const generateSbomHandler = useCallback(async () => {
+    if (!API_BASE_URL || !repositoryEcosystem) return;
+    setIsSbomLoading(true);
+    setSbomError(null);
+    setSbomDocument(null);
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const doc = await generateSbom(scanContext, repositoryEcosystem);
+      if (isMountedRef.current) setSbomDocument(doc);
+    } catch (err) {
+      if (isMountedRef.current) setSbomError(err instanceof Error ? err.message : "Failed to generate SBOM.");
+    } finally {
+      if (isMountedRef.current) setIsSbomLoading(false);
+    }
+  }, [resolveRepoCoordinates, repositoryEcosystem]);
+
+  const downloadSbomSentinelFlow = useCallback(() => {
+    if (!sbomDocument) return;
+    downloadSbom(sbomDocument as unknown as Record<string, unknown>, "sbom.sentinelflow.json");
+  }, [sbomDocument]);
+
+  const downloadSbomCycloneDx = useCallback(async () => {
+    if (!API_BASE_URL || isSbomCdxLoading || !repositoryEcosystem) return;
+    setIsSbomCdxLoading(true);
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const cdxDoc = await generateCycloneDxSbom(scanContext, repositoryEcosystem);
+      downloadSbom(cdxDoc, "sbom.cdx.json");
+    } catch { /* silent */ } finally {
+      if (isMountedRef.current) setIsSbomCdxLoading(false);
+    }
+  }, [resolveRepoCoordinates, isSbomCdxLoading, repositoryEcosystem]);
+
   useEffect(() => {
     setIsLoadingTree(true);
     void Promise.all([loadDependencyTree(), loadLatestScanResults()]);
   }, [decodedId, loadDependencyTree, loadLatestScanResults]);
+
+  useEffect(() => {
+    if (activeSection === "history") {
+      void loadScanHistory();
+    }
+    // Only re-run when the active section changes, not every loadScanHistory recreation
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection, decodedId]);
+
+  useEffect(() => {
+    if (!selectedDetailsPackage || !repositoryEcosystem || !API_BASE_URL) {
+      setPackageDetailsData(null);
+      setPackageDetailsVersions([]);
+      setPackageDetailsLatestVersion(null);
+      setPackageDetailsScanEntry(null);
+      return;
+    }
+
+    const lastAt = selectedDetailsPackage.lastIndexOf("@");
+    const pkgName = lastAt > 0 ? selectedDetailsPackage.slice(0, lastAt) : selectedDetailsPackage;
+
+    setIsPackageDetailsLoading(true);
+    setPackageDetailsData(null);
+    setPackageDetailsVersions([]);
+    setPackageDetailsLatestVersion(null);
+    setPackageDetailsScanEntry(null);
+
+    let cancelled = false;
+
+    const doFetch = async () => {
+      try {
+        const token = clientSessionStorage.readToken();
+        const authHeaders: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {};
+        const depContext = { baseUrl: API_BASE_URL!, authHeaders };
+
+        const pkgVersion = selectedDetailsPackage.lastIndexOf("@") > 0
+          ? selectedDetailsPackage.slice(selectedDetailsPackage.lastIndexOf("@") + 1)
+          : undefined;
+
+        const details = await fetchPackageDetails(depContext, repositoryEcosystem, pkgName, pkgVersion);
+
+        if (cancelled) return;
+        setPackageDetailsData(details);
+        setPackageDetailsVersions([]);
+        setPackageDetailsLatestVersion(details.latest_version ?? null);
+
+        // Fetch full scan entry for advisory_references + risk data
+        const repoCtx = await resolveRepoCoordinates();
+        if (cancelled) return;
+        const scanRes = await fetch(
+          `${API_BASE_URL}/api/repos/${encodeURIComponent(repoCtx.owner)}/${encodeURIComponent(repoCtx.repoName)}/scan/latest/results`,
+          { method: "GET", headers: repoCtx.headers, credentials: "include", cache: "no-store" },
+        );
+        if (scanRes.ok && !cancelled) {
+          const scanData = await scanRes.json() as Record<string, { advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null> }>;
+          const entry = scanData[selectedDetailsPackage];
+          if (entry && !cancelled) setPackageDetailsScanEntry(entry);
+        }
+      } catch { /* silent */ } finally {
+        if (!cancelled) setIsPackageDetailsLoading(false);
+      }
+    };
+
+    void doFetch();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDetailsPackage, repositoryEcosystem]);
 
   return (
     <section className="relative flex h-[100dvh] w-full overflow-hidden bg-black">
@@ -1699,7 +1540,24 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         </div>
                       ) : null}
 
-                      <div className="pt-1">
+                      <div className="pt-1 space-y-2">
+                        <div className="flex flex-wrap gap-1">
+                          {(["full", "static_only", "static_dynamic", "dynamic_only"] as const).map((mode) => (
+                            <button
+                              key={mode}
+                              type="button"
+                              disabled={isScanRunning}
+                              onClick={() => setActiveScanMode(mode)}
+                              className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
+                                activeScanMode === mode
+                                  ? "border-cyan-300/70 bg-cyan-500/20 text-cyan-50"
+                                  : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
+                              } disabled:cursor-not-allowed disabled:opacity-50`}
+                            >
+                              {mode === "full" ? "Full" : mode === "static_only" ? "Static" : mode === "static_dynamic" ? "S+D" : "Dynamic"}
+                            </button>
+                          ))}
+                        </div>
                         <div className="flex flex-wrap gap-2">
                           <button
                             type="button"
@@ -2115,31 +1973,127 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                   </div>
                   {selectedDetailsPackage ? (
                     <div className="space-y-3 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                      <div>
-                        <h3 className="text-lg font-semibold text-slate-100">{selectedDetailsPackage}</h3>
-                        <p className="mt-1 text-xs text-slate-400 uppercase tracking-[0.12em]">Package Metadata</p>
-                      </div>
-                      <div className="space-y-3">
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
-                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Package Name</p>
-                          <p className="mt-1.5 font-mono text-sm text-slate-100">{selectedDetailsPackage.split("@")[0]}</p>
+                      {isPackageDetailsLoading ? (
+                        <div className="space-y-3">
+                          <div className="h-6 w-48 animate-pulse rounded bg-slate-700/60" />
+                          <div className="h-4 w-full animate-pulse rounded bg-slate-800/80" />
+                          <div className="h-4 w-3/4 animate-pulse rounded bg-slate-800/80" />
                         </div>
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
-                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Version</p>
-                          <p className="mt-1.5 font-mono text-sm text-slate-100">{selectedDetailsPackage.split("@")[1] || "unknown"}</p>
-                        </div>
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
-                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Status</p>
-                          <p className="mt-1.5 inline-flex items-center gap-2 text-sm">
-                            <span className="inline-block h-2 w-2 rounded-full bg-emerald-400" />
-                            <span className="text-slate-100">Installed</span>
-                          </p>
-                        </div>
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
-                          <p className="text-xs uppercase tracking-[0.12em] text-slate-400">Registry Link</p>
-                          <p className="mt-1.5 break-all font-mono text-xs text-slate-400">npm.im/{selectedDetailsPackage.split("@")[0]}</p>
-                        </div>
-                      </div>
+                      ) : (
+                        <>
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <h3 className="text-lg font-semibold text-slate-100">
+                                {selectedDetailsPackage.slice(0, selectedDetailsPackage.lastIndexOf("@")) || selectedDetailsPackage}
+                              </h3>
+                              <p className="font-mono text-sm text-teal-300">
+                                v{selectedDetailsPackage.slice(selectedDetailsPackage.lastIndexOf("@") + 1) || "unknown"}
+                              </p>
+                            </div>
+                            {(() => {
+                              const entry = scanResultsMap[selectedDetailsPackage] as { malware_status?: string } | undefined;
+                              const status = packageDetailsScanEntry?.risk_overall_status ?? entry?.malware_status;
+                              if (!status) return null;
+                              const cls = status === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-100"
+                                : status === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-100"
+                                : status === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
+                                : "border-slate-400/50 bg-slate-500/15 text-slate-300";
+                              return (
+                                <span className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] ${cls}`}>
+                                  {status}
+                                </span>
+                              );
+                            })()}
+                          </div>
+
+                          {packageDetailsData?.description ? (
+                            <p className="text-sm text-slate-300">{packageDetailsData.description}</p>
+                          ) : null}
+
+                          <div className="grid grid-cols-2 gap-2 text-xs">
+                            {packageDetailsData?.monthly_downloads != null ? (
+                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2.5">
+                                <p className="uppercase tracking-[0.1em] text-slate-500">Monthly downloads</p>
+                                <p className="mt-1 font-medium text-slate-200">
+                                  {packageDetailsData.monthly_downloads >= 1_000_000
+                                    ? `${(packageDetailsData.monthly_downloads / 1_000_000).toFixed(1)}M`
+                                    : packageDetailsData.monthly_downloads >= 1_000
+                                      ? `${(packageDetailsData.monthly_downloads / 1_000).toFixed(0)}K`
+                                      : String(packageDetailsData.monthly_downloads)}
+                                </p>
+                              </div>
+                            ) : null}
+                            {packageDetailsScanEntry?.risk_overall_score != null ? (
+                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2.5">
+                                <p className="uppercase tracking-[0.1em] text-slate-500">Risk score</p>
+                                <div className="mt-1">
+                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700">
+                                    <div
+                                      className={`h-full rounded-full ${packageDetailsScanEntry.risk_overall_score > 0.5 ? "bg-rose-400" : packageDetailsScanEntry.risk_overall_score > 0.2 ? "bg-amber-400" : "bg-emerald-400"}`}
+                                      style={{ width: `${(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%` }}
+                                    />
+                                  </div>
+                                  <p className="mt-0.5 text-slate-300">{(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%</p>
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+
+                          {packageDetailsData?.homepage || packageDetailsData?.registry_url ? (
+                            <div className="flex flex-wrap gap-3 text-xs">
+                              {packageDetailsData.homepage ? (
+                                <a href={packageDetailsData.homepage} target="_blank" rel="noreferrer" className="text-teal-300 underline decoration-teal-400/50 underline-offset-2">
+                                  Homepage ↗
+                                </a>
+                              ) : null}
+                              {packageDetailsData.registry_url ? (
+                                <a href={packageDetailsData.registry_url} target="_blank" rel="noreferrer" className="text-teal-300 underline decoration-teal-400/50 underline-offset-2">
+                                  Registry ↗
+                                </a>
+                              ) : null}
+                            </div>
+                          ) : null}
+
+                          {packageDetailsLatestVersion ? (
+                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2.5 text-xs">
+                              <p className="uppercase tracking-[0.1em] text-slate-500">Latest version</p>
+                              <p className="mt-1 font-mono text-teal-200">{packageDetailsLatestVersion}</p>
+                              {packageDetailsVersions.length > 1 ? (
+                                <p className="mt-0.5 text-slate-500">{packageDetailsVersions.length} versions available</p>
+                              ) : null}
+                            </div>
+                          ) : null}
+
+                          {packageDetailsScanEntry?.advisory_references && packageDetailsScanEntry.advisory_references.length > 0 ? (
+                            <div className="rounded-lg border border-amber-400/25 bg-amber-500/10 p-3">
+                              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-amber-200">
+                                {packageDetailsScanEntry.advisory_references.length} CVE / Advisory Reference{packageDetailsScanEntry.advisory_references.length !== 1 ? "s" : ""}
+                              </p>
+                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                {packageDetailsScanEntry.advisory_references.map((ref) => (
+                                  <span key={ref} className="inline-flex rounded border border-amber-400/30 bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-100">{ref}</span>
+                                ))}
+                              </div>
+                            </div>
+                          ) : packageDetailsScanEntry ? (
+                            <p className="text-xs text-slate-500">No CVE advisories found for this package.</p>
+                          ) : null}
+
+                          {packageDetailsScanEntry?.static_features ? (
+                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs">
+                              <p className="mb-2 font-semibold uppercase tracking-[0.12em] text-slate-400">Static Features</p>
+                              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+                                {Object.entries(packageDetailsScanEntry.static_features).map(([key, val]) => (
+                                  <div key={key} className="rounded border border-slate-800 bg-slate-950/40 px-2 py-1">
+                                    <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">{key.replace(/_/g, " ")}</p>
+                                    <p className="mt-0.5 font-mono text-slate-300">{val != null ? (typeof val === "number" && val < 1 && val > 0 ? `${(val * 100).toFixed(0)}%` : String(val)) : "-"}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+                        </>
+                      )}
                     </div>
                   ) : (
                     <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4 text-center">
@@ -2193,40 +2147,113 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           {activeSection === "sbom" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
               <div className="space-y-4">
-                <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-violet-300">Software Bill of Materials</p>
-                  <p className="mt-1 text-sm text-slate-300">Complete inventory of all packages in this project.</p>
-                </div>
-                <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <div className="mb-4 flex items-center justify-between">
-                    <p className="text-xs uppercase tracking-[0.12em] text-slate-400">
-                      Total Packages: <span className="font-semibold text-violet-300">{availablePackagesForAnalysis.length}</span>
+                <div className="flex flex-wrap items-start justify-between gap-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-violet-300">Software Bill of Materials</p>
+                    <p className="mt-1 text-sm text-slate-300">
+                      {sbomDocument
+                        ? `${sbomDocument.metadata.component_count} component${sbomDocument.metadata.component_count !== 1 ? "s" : ""} · generated ${new Date(sbomDocument.metadata.timestamp).toLocaleString()}`
+                        : "Generate a complete inventory of all packages in this project."}
                     </p>
                   </div>
-                  <div className="space-y-1 max-h-[calc(100vh-300px)] overflow-auto">
-                    {availablePackagesForAnalysis.length === 0 ? (
-                      <p className="p-2 text-xs text-slate-400">No packages found in dependency tree.</p>
-                    ) : (
-                      availablePackagesForAnalysis.map((pkg) => {
-                        const [name, version] = pkg.split("@");
-                        return (
-                          <div
-                            key={pkg}
-                            className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-xs transition hover:border-slate-700 hover:bg-slate-900/60"
-                          >
-                            <div className="flex flex-1 items-center gap-3 min-w-0">
-                              <span className="inline-block h-2 w-2 rounded-full bg-violet-400 flex-shrink-0" />
-                              <div className="min-w-0 flex-1">
-                                <p className="font-medium text-slate-100 truncate">{name}</p>
-                              </div>
-                            </div>
-                            <span className="ml-2 font-mono text-slate-400 flex-shrink-0">{version}</span>
-                          </div>
-                        );
-                      })
-                    )}
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => { void generateSbomHandler(); }}
+                      disabled={isSbomLoading}
+                      className="rounded-lg border border-violet-400/40 bg-violet-500/15 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-violet-100 transition hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isSbomLoading ? "Generating..." : sbomDocument ? "Regenerate SBOM" : "Generate SBOM"}
+                    </button>
+                    {sbomDocument ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={downloadSbomSentinelFlow}
+                          className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-slate-200 transition hover:bg-slate-700"
+                        >
+                          Download JSON
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { void downloadSbomCycloneDx(); }}
+                          disabled={isSbomCdxLoading}
+                          className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-slate-200 transition hover:bg-slate-700 disabled:opacity-50"
+                        >
+                          {isSbomCdxLoading ? "Exporting..." : "Download CycloneDX 1.5"}
+                        </button>
+                      </>
+                    ) : null}
                   </div>
                 </div>
+
+                {sbomError ? (
+                  <div className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-100">{sbomError}</div>
+                ) : null}
+
+                {sbomDocument ? (
+                  <div className="space-y-3 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                    <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+                      <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+                        <p className="uppercase tracking-[0.1em] text-slate-500">Tool</p>
+                        <p className="mt-1 font-medium text-slate-200">{sbomDocument.metadata.tool.name} {sbomDocument.metadata.tool.version}</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+                        <p className="uppercase tracking-[0.1em] text-slate-500">Ecosystem</p>
+                        <p className="mt-1 font-medium uppercase text-slate-200">{sbomDocument.metadata.ecosystem}</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+                        <p className="uppercase tracking-[0.1em] text-slate-500">Components</p>
+                        <p className="mt-1 font-medium text-violet-300">{sbomDocument.metadata.component_count}</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+                        <p className="uppercase tracking-[0.1em] text-slate-500">Schema</p>
+                        <p className="mt-1 font-mono text-xs text-slate-300">{sbomDocument.schema_version}</p>
+                      </div>
+                    </div>
+                    <div className="overflow-hidden rounded-xl border border-slate-800">
+                      <div className="max-h-[55vh] overflow-auto">
+                        <table className="w-full text-left text-xs text-slate-200">
+                          <thead className="sticky top-0 border-b border-slate-800 bg-slate-900/95 text-slate-400">
+                            <tr>
+                              <th className="px-4 py-2.5 font-medium">Package</th>
+                              <th className="px-4 py-2.5 font-medium">Version</th>
+                              <th className="px-4 py-2.5 font-medium">PURL</th>
+                              <th className="px-4 py-2.5 font-medium">License</th>
+                              <th className="px-4 py-2.5 font-medium">Risk</th>
+                              <th className="px-4 py-2.5 font-medium">Direct</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {sbomDocument.components.map((component, idx) => {
+                              const riskClass = component.risk_status === "malicious"
+                                ? "text-rose-300"
+                                : component.risk_status === "suspicious"
+                                  ? "text-amber-300"
+                                  : "text-emerald-400";
+                              return (
+                                <tr key={`${component.purl}-${idx}`} className="border-t border-slate-800/60 hover:bg-slate-900/30">
+                                  <td className="px-4 py-2 font-medium text-slate-100">{component.name}</td>
+                                  <td className="px-4 py-2 font-mono text-slate-400">{component.version}</td>
+                                  <td className="max-w-[180px] truncate px-4 py-2 font-mono text-[10px] text-slate-500" title={component.purl}>{component.purl}</td>
+                                  <td className="px-4 py-2 text-slate-300">{component.licenses.map((l) => l.id).join(", ") || "-"}</td>
+                                  <td className={`px-4 py-2 font-semibold uppercase ${riskClass}`}>
+                                    {component.risk_status} <span className="font-normal text-slate-500">({(component.risk_score * 100).toFixed(0)}%)</span>
+                                  </td>
+                                  <td className="px-4 py-2 text-slate-400">{component.is_direct ? "✓" : "—"}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                ) : !isSbomLoading ? (
+                  <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-950/40 p-8 text-center">
+                    <p className="text-sm text-slate-400">Click <span className="text-violet-300">Generate SBOM</span> to create a full package inventory with risk scores and license data.</p>
+                  </div>
+                ) : null}
               </div>
             </div>
           ) : null}
@@ -2234,69 +2261,150 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           {activeSection === "history" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
               <div className="space-y-4">
-                <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-300">Scan History</p>
-                  <p className="mt-1 text-sm text-slate-300">View all scans performed on this repository.</p>
+                <div className="flex items-center justify-between rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-300">Scan History</p>
+                    <p className="mt-1 text-sm text-slate-300">
+                      {scanHistoryTotal > 0 ? `${scanHistoryTotal} scan job${scanHistoryTotal !== 1 ? "s" : ""} found.` : "View all scans performed on this repository."}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { void loadScanHistory(); }}
+                    disabled={isScanHistoryLoading}
+                    className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-slate-300 transition hover:border-slate-500 disabled:opacity-50"
+                  >
+                    {isScanHistoryLoading ? "Loading..." : "Refresh"}
+                  </button>
                 </div>
-                {scanResultRows.length === 0 ? (
+
+                {isScanHistoryLoading && scanHistoryJobs.length === 0 ? (
+                  <div className="space-y-2">
+                    {[0, 1, 2].map((i) => (
+                      <div key={i} className="h-14 animate-pulse rounded-xl border border-slate-800 bg-slate-900/60" />
+                    ))}
+                  </div>
+                ) : scanHistoryJobs.length === 0 ? (
                   <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-6 text-center">
-                    <p className="text-sm text-slate-400">No scan history available. Start a scan in the Dependency Graph tab to begin.</p>
+                    <p className="text-sm text-slate-400">No scan history yet. Start a scan from the Dependency Graph tab.</p>
                   </div>
                 ) : (
-                  <div className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                    <div className="space-y-2">
-                      {scanResultRows.map((row) => {
-                        const isErrorRow = row.errorMessage !== null || row.status === "failed";
-                        return (
-                          <div
-                            key={row.id}
-                            className={`rounded-lg border p-4 transition ${
-                              isErrorRow
-                                ? "border-rose-400/30 bg-rose-500/10"
-                                : row.status === "completed"
-                                  ? "border-emerald-400/30 bg-emerald-500/10"
-                                  : "border-slate-700 bg-slate-900/50"
-                            }`}
-                          >
-                            <div className="flex flex-col gap-3">
-                              <div className="flex items-center justify-between">
-                                <div>
-                                  <p className="font-semibold text-slate-100">
-                                    {row.packageName} <span className="text-slate-400">@</span> {row.version}
-                                  </p>
-                                  <p className={`text-xs uppercase tracking-[0.12em] font-medium ${
-                                    isErrorRow
-                                      ? "text-rose-300"
-                                      : row.status === "completed"
-                                        ? "text-emerald-300"
-                                        : "text-slate-400"
-                                  }`}>
-                                    {row.status}
-                                  </p>
-                                </div>
-                                {row.malwareScore !== null && (
-                                  <div className="text-right">
-                                    <p className="text-xs text-slate-400">Malware Score</p>
-                                    <p className={`text-lg font-semibold ${
-                                      row.malwareScore > 0.5
-                                        ? "text-rose-400"
-                                        : row.malwareScore > 0.2
-                                          ? "text-amber-400"
-                                          : "text-emerald-400"
-                                    }`}>
-                                      {(row.malwareScore * 100).toFixed(1)}%
-                                    </p>
-                                  </div>
-                                )}
-                              </div>
-                              {row.errorMessage && <p className="text-xs text-rose-200">{row.errorMessage}</p>}
-                              {row.scanTimestamp && (
-                                <p className="text-xs text-slate-500">Scanned: {formatTimestampForDisplay(row.scanTimestamp)}</p>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
+                  <div className="overflow-hidden rounded-2xl border border-slate-700 bg-slate-950/70">
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs text-slate-200">
+                        <thead className="border-b border-slate-800 bg-slate-900/80 text-slate-400">
+                          <tr>
+                            <th className="px-4 py-3 font-medium">Date</th>
+                            <th className="px-4 py-3 font-medium">Ecosystem</th>
+                            <th className="px-4 py-3 font-medium">Mode</th>
+                            <th className="px-4 py-3 font-medium">Status</th>
+                            <th className="px-4 py-3 font-medium">Packages</th>
+                            <th className="px-4 py-3 font-medium">Duration</th>
+                            <th className="px-4 py-3 font-medium" />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scanHistoryJobs.map((job) => {
+                            const duration = job.started_at && job.completed_at
+                              ? formatDuration((new Date(job.completed_at).getTime() - new Date(job.started_at).getTime()) / 1000)
+                              : "-";
+                            const modeBadgeClass = job.scan_mode === "full"
+                              ? "border-blue-400/50 bg-blue-500/15 text-blue-100"
+                              : job.scan_mode === "static_only"
+                                ? "border-purple-400/50 bg-purple-500/15 text-purple-100"
+                                : job.scan_mode === "static_dynamic"
+                                  ? "border-teal-400/50 bg-teal-500/15 text-teal-100"
+                                  : "border-orange-400/50 bg-orange-500/15 text-orange-100";
+                            const statusBadgeClass = job.status === "completed"
+                              ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
+                              : job.status === "running" || job.status === "pending"
+                                ? "border-cyan-400/50 bg-cyan-500/15 text-cyan-100"
+                                : job.status === "failed"
+                                  ? "border-rose-400/50 bg-rose-500/15 text-rose-100"
+                                  : "border-slate-500/50 bg-slate-500/15 text-slate-300";
+                            const isExpanded = selectedHistoryJobId === job.id;
+
+                            return (
+                              <React.Fragment key={job.id}>
+                                <tr className="border-t border-slate-800 transition hover:bg-slate-900/40">
+                                  <td className="px-4 py-3 text-slate-300">{formatTimestampForDisplay(job.created_at)}</td>
+                                  <td className="px-4 py-3 uppercase text-slate-400">{job.ecosystem}</td>
+                                  <td className="px-4 py-3">
+                                    <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${modeBadgeClass}`}>
+                                      {job.scan_mode === "full" ? "Full" : job.scan_mode === "static_only" ? "Static" : job.scan_mode === "static_dynamic" ? "S+D" : "Dynamic"}
+                                    </span>
+                                  </td>
+                                  <td className="px-4 py-3">
+                                    <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${job.status === "running" ? "animate-pulse" : ""} ${statusBadgeClass} ${job.status === "cancelled" ? "line-through" : ""}`}>
+                                      {job.status}
+                                    </span>
+                                  </td>
+                                  <td className="px-4 py-3 text-slate-300">{job.total_packages}</td>
+                                  <td className="px-4 py-3 text-slate-400">{duration}</td>
+                                  <td className="px-4 py-3">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        if (isExpanded) {
+                                          setSelectedHistoryJobId(null);
+                                          setSelectedHistoryJob(null);
+                                        } else {
+                                          void loadHistoryJobDetails(job.id);
+                                        }
+                                      }}
+                                      className="rounded-md border border-indigo-400/40 bg-indigo-500/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-indigo-100 transition hover:bg-indigo-500/20"
+                                    >
+                                      {isExpanded ? "Close" : "Details"}
+                                    </button>
+                                  </td>
+                                </tr>
+                                {isExpanded ? (
+                                  <tr key={`${job.id}-details`} className="border-t border-indigo-500/20 bg-indigo-950/10">
+                                    <td colSpan={7} className="px-4 py-4">
+                                      {isHistoryJobLoading ? (
+                                        <p className="text-xs text-slate-400">Loading job details...</p>
+                                      ) : selectedHistoryJob ? (
+                                        <div className="space-y-3">
+                                          <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+                                            <div><p className="text-slate-500 uppercase tracking-[0.1em]">Scanned</p><p className="mt-1 text-slate-200">{selectedHistoryJob.scanned_packages} / {selectedHistoryJob.total_unique_packages}</p></div>
+                                            <div><p className="text-slate-500 uppercase tracking-[0.1em]">Started</p><p className="mt-1 text-slate-200">{formatTimestampForDisplay(selectedHistoryJob.started_at)}</p></div>
+                                            <div><p className="text-slate-500 uppercase tracking-[0.1em]">Completed</p><p className="mt-1 text-slate-200">{formatTimestampForDisplay(selectedHistoryJob.completed_at)}</p></div>
+                                            {selectedHistoryJob.error_message ? <div><p className="text-slate-500 uppercase tracking-[0.1em]">Error</p><p className="mt-1 text-rose-200">{selectedHistoryJob.error_message}</p></div> : null}
+                                          </div>
+                                          {selectedHistoryJob.results && selectedHistoryJob.results.length > 0 ? (
+                                            <div className="max-h-48 overflow-auto rounded-lg border border-slate-800">
+                                              <table className="w-full text-left text-[11px] text-slate-300">
+                                                <thead className="bg-slate-900/80 text-slate-500">
+                                                  <tr>
+                                                    <th className="px-3 py-2">Package</th>
+                                                    <th className="px-3 py-2">Status</th>
+                                                    <th className="px-3 py-2">Score</th>
+                                                    <th className="px-3 py-2">CVEs</th>
+                                                  </tr>
+                                                </thead>
+                                                <tbody>
+                                                  {selectedHistoryJob.results.slice(0, 100).map((result) => (
+                                                    <tr key={result.id} className="border-t border-slate-800/60">
+                                                      <td className="px-3 py-1.5">{result.package_name}@{result.package_version}</td>
+                                                      <td className="px-3 py-1.5 uppercase">{result.malware_status}</td>
+                                                      <td className="px-3 py-1.5">{(result.risk_overall_score * 100).toFixed(0)}%</td>
+                                                      <td className="px-3 py-1.5">{result.advisory_references.length > 0 ? result.advisory_references.length : "-"}</td>
+                                                    </tr>
+                                                  ))}
+                                                </tbody>
+                                              </table>
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                      ) : null}
+                                    </td>
+                                  </tr>
+                                ) : null}
+                              </React.Fragment>
+                            );
+                          })}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
                 )}

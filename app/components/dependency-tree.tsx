@@ -499,37 +499,35 @@ export function DependencyTree({
         proOptions={{ hideAttribution: true }}
       >
         <Background color="rgba(51, 65, 85, 0.45)" gap={26} size={1.2} variant={BackgroundVariant.Dots} />
-        {!largeGraphMode ? (
-          <MiniMap
-            pannable
-            zoomable
-            nodeColor={(node) => {
-              const nodeData = (node.data as { malwareStatus?: unknown } | undefined) ?? {};
-              const status = typeof nodeData.malwareStatus === "string" ? nodeData.malwareStatus.toLowerCase() : "unknown";
+        <MiniMap
+          pannable
+          zoomable
+          nodeColor={(node) => {
+            const nodeData = (node.data as { malwareStatus?: unknown } | undefined) ?? {};
+            const status = typeof nodeData.malwareStatus === "string" ? nodeData.malwareStatus.toLowerCase() : "unknown";
 
-              if (status === "malicious") {
-                return "#fb7185";
-              }
+            if (status === "malicious") {
+              return "#fb7185";
+            }
 
-              if (status === "suspicious") {
-                return "#f59e0b";
-              }
+            if (status === "suspicious") {
+              return "#f59e0b";
+            }
 
-              if (status === "clean" || status === "benign") {
-                return "#34d399";
-              }
+            if (status === "clean" || status === "benign") {
+              return "#34d399";
+            }
 
-              return "#22d3ee";
-            }}
-            className="!border !border-slate-700/90 !bg-slate-900/90"
-            bgColor="#020617"
-            maskColor="rgba(2, 6, 23, 0.55)"
-            maskStrokeColor="#0f172a"
-            nodeStrokeColor="#0f172a"
-            nodeStrokeWidth={2}
-            nodeBorderRadius={8}
-          />
-        ) : null}
+            return "#22d3ee";
+          }}
+          className="!border !border-slate-700/90 !bg-slate-900/90"
+          bgColor="#020617"
+          maskColor="rgba(2, 6, 23, 0.55)"
+          maskStrokeColor="#0f172a"
+          nodeStrokeColor="#0f172a"
+          nodeStrokeWidth={2}
+          nodeBorderRadius={8}
+        />
         <Controls
           showInteractive={true}
           onInteractiveChange={(interactiveStatus) => setIsInteractive(interactiveStatus)}

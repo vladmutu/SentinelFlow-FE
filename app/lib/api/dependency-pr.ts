@@ -18,6 +18,18 @@ export interface PackageSearchResult {
   registry_url: string | null;
   score: number | null;
   monthly_downloads: number | null;
+  query_distance?: number | null;
+  keywords?: string[] | null;
+  latest_version?: string | null;
+  package_age_days?: number | null;
+  maintainer_count?: number | null;
+  has_repository?: boolean | null;
+  direct_dependencies_count?: number | null;
+  stars?: number | null;
+  forks?: number | null;
+  contributors_count?: number | null;
+  dependents_count?: number | null;
+  source_rank?: number | null;
   typosquat: TyposquatInfo;
 }
 
@@ -32,13 +44,46 @@ export interface PackageSearchResponse {
 }
 
 export interface PackageVersionsResponse {
+  ecosystem: Ecosystem;
+  package_name: string;
+  latest_version: string | null;
   name: string;
   versions: string[];
+}
+
+export interface PackageDetailsResponse {
+  name: string;
+  version: string;
+  ecosystem: Ecosystem;
+  description: string;
+  license: string | null;
+  homepage: string | null;
+  registry_url: string | null;
+  keywords: string[] | null;
+  latest_version: string | null;
+  package_age_days: number | null;
+  monthly_downloads: number | null;
+  maintainer_count: number | null;
+  has_repository: boolean | null;
+  direct_dependencies_count: number | null;
+  stars: number | null;
+  forks: number | null;
+  contributors_count: number | null;
+  dependents_count: number | null;
+  source_rank: number | null;
 }
 
 export interface DependencyDraft {
   name: string;
   version: string;
+}
+
+export interface TyposquatWarning {
+  package_name: string;
+  risk_level: string;
+  reasons: string[];
+  similar_to: string | null;
+  monthly_downloads: number | null;
 }
 
 export interface CreateDependencyPrRequest {
@@ -48,7 +93,7 @@ export interface CreateDependencyPrRequest {
   branch_name?: string;
   pr_title?: string;
   pr_body?: string;
-  updated_package_lock_json?: string;
+  updated_package_lock_json?: string | null;
   generate_lockfile_server_side?: boolean;
 }
 
@@ -58,6 +103,8 @@ export interface CreateDependencyPrResponse {
   branch_name?: string;
   status?: string;
   message?: string;
+  typosquat_warnings?: TyposquatWarning[];
+  scan_job_id?: string | null;
 }
 
 export interface DependencyApiContext {
@@ -96,6 +143,39 @@ function normalizeTyposquat(payload: unknown): TyposquatInfo {
     normalized_conflict: typeof record.normalized_conflict === "string" ? record.normalized_conflict : null,
     reasons,
   };
+}
+
+function levenshteinDistance(source: string, target: string): number {
+  if (source.length === 0) return target.length;
+  if (target.length === 0) return source.length;
+
+  const sourceLength = source.length;
+  const targetLength = target.length;
+  const matrix: number[][] = [];
+
+  for (let i = 0; i <= targetLength; i++) {
+    matrix[i] = [i];
+  }
+
+  for (let j = 0; j <= sourceLength; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= targetLength; i++) {
+    for (let j = 1; j <= sourceLength; j++) {
+      if (target.charAt(i - 1) === source.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1,
+        );
+      }
+    }
+  }
+
+  return matrix[targetLength][sourceLength];
 }
 
 function compareSearchResultRelevance(query: string, left: PackageSearchResult, right: PackageSearchResult): number {
@@ -145,39 +225,51 @@ function compareSearchResultRelevance(query: string, left: PackageSearchResult, 
   return leftDistanceFromQuery - rightDistanceFromQuery;
 }
 
+function normalizeSearchResult(item: unknown, ecosystem: Ecosystem): PackageSearchResult | null {
+  if (!item || typeof item !== "object") return null;
+
+  const entry = item as Record<string, unknown>;
+  const name = typeof entry.name === "string" ? entry.name.trim() : "";
+  const version = typeof entry.version === "string" && entry.version.trim().length > 0 ? entry.version.trim() : null;
+
+  if (!name) return null;
+
+  return {
+    ecosystem,
+    name,
+    version,
+    description: typeof entry.description === "string" ? entry.description : "",
+    homepage: typeof entry.homepage === "string" ? entry.homepage : null,
+    registry_url: typeof entry.registry_url === "string" ? entry.registry_url : null,
+    score: typeof entry.score === "number" && Number.isFinite(entry.score) ? entry.score : null,
+    monthly_downloads:
+      typeof entry.monthly_downloads === "number" && Number.isFinite(entry.monthly_downloads)
+        ? entry.monthly_downloads
+        : null,
+    query_distance: typeof entry.query_distance === "number" ? entry.query_distance : null,
+    keywords: Array.isArray(entry.keywords)
+      ? entry.keywords.filter((k): k is string => typeof k === "string")
+      : null,
+    latest_version: typeof entry.latest_version === "string" ? entry.latest_version : null,
+    package_age_days: typeof entry.package_age_days === "number" ? entry.package_age_days : null,
+    maintainer_count: typeof entry.maintainer_count === "number" ? entry.maintainer_count : null,
+    has_repository: typeof entry.has_repository === "boolean" ? entry.has_repository : null,
+    direct_dependencies_count: typeof entry.direct_dependencies_count === "number" ? entry.direct_dependencies_count : null,
+    stars: typeof entry.stars === "number" ? entry.stars : null,
+    forks: typeof entry.forks === "number" ? entry.forks : null,
+    contributors_count: typeof entry.contributors_count === "number" ? entry.contributors_count : null,
+    dependents_count: typeof entry.dependents_count === "number" ? entry.dependents_count : null,
+    source_rank: typeof entry.source_rank === "number" ? entry.source_rank : null,
+    typosquat: normalizeTyposquat(entry.typosquat),
+  };
+}
+
 function normalizeSearchResponse(ecosystem: Ecosystem, query: string, page: number, limit: number, payload: unknown): PackageSearchResponse {
   const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
   const rawResults = Array.isArray(record.results) ? record.results : [];
 
   const results = rawResults
-    .map((item) => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
-      const entry = item as Record<string, unknown>;
-      const name = typeof entry.name === "string" ? entry.name.trim() : "";
-      const version = typeof entry.version === "string" && entry.version.trim().length > 0 ? entry.version.trim() : null;
-
-      if (!name) {
-        return null;
-      }
-
-      return {
-        ecosystem,
-        name,
-        version,
-        description: typeof entry.description === "string" ? entry.description : "",
-        homepage: typeof entry.homepage === "string" ? entry.homepage : null,
-        registry_url: typeof entry.registry_url === "string" ? entry.registry_url : null,
-        score: typeof entry.score === "number" && Number.isFinite(entry.score) ? entry.score : null,
-        monthly_downloads:
-          typeof entry.monthly_downloads === "number" && Number.isFinite(entry.monthly_downloads)
-            ? entry.monthly_downloads
-            : null,
-        typosquat: normalizeTyposquat(entry.typosquat),
-      } satisfies PackageSearchResult;
-    })
+    .map((item) => normalizeSearchResult(item, ecosystem))
     .filter((item): item is PackageSearchResult => item !== null);
 
   const sortedResults = [...results].sort((left, right) => compareSearchResultRelevance(query, left, right));
@@ -289,12 +381,10 @@ export async function fetchPackageVersions(
   context: DependencyApiContext,
   ecosystem: Ecosystem,
   packageName: string,
-  limit = 20,
   options?: { signal?: AbortSignal },
 ): Promise<PackageVersionsResponse> {
-  const sanitizedLimit = Math.max(1, limit);
   const trimmedName = packageName.trim();
-  const url = `${context.baseUrl}/api/repos/packages/versions?ecosystem=${encodeURIComponent(ecosystem)}&name=${encodeURIComponent(trimmedName)}&limit=${sanitizedLimit}`;
+  const url = `${context.baseUrl}/api/repos/packages/versions?ecosystem=${encodeURIComponent(ecosystem)}&name=${encodeURIComponent(trimmedName)}`;
 
   const response = await fetch(url, {
     method: "GET",
@@ -317,9 +407,75 @@ export async function fetchPackageVersions(
     ? record.versions.filter((version): version is string => typeof version === "string" && version.trim().length > 0)
     : [];
 
+  const packageNameFromRecord = typeof record.package_name === "string" ? record.package_name : trimmedName;
+  const nameFromRecord = typeof record.name === "string" ? record.name : packageNameFromRecord;
+
   return {
-    name: typeof record.name === "string" ? record.name : trimmedName,
+    ecosystem: (record.ecosystem === "npm" || record.ecosystem === "pypi") ? record.ecosystem : ecosystem,
+    package_name: packageNameFromRecord,
+    latest_version: typeof record.latest_version === "string" ? record.latest_version : (versions[0] ?? null),
+    name: nameFromRecord,
     versions,
+  };
+}
+
+export async function fetchPackageDetails(
+  context: DependencyApiContext,
+  ecosystem: Ecosystem,
+  packageName: string,
+  version?: string,
+  options?: { signal?: AbortSignal },
+): Promise<PackageDetailsResponse> {
+  const params = new URLSearchParams({
+    ecosystem,
+    name: packageName.trim(),
+  });
+  if (version) {
+    params.set("version", version.trim());
+  }
+
+  const url = `${context.baseUrl}/api/repos/packages/details?${params.toString()}`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      ...context.authHeaders,
+    },
+    credentials: "include",
+    cache: "no-store",
+    signal: options?.signal,
+  });
+
+  const payload = await parseJsonSafe(response);
+
+  if (!response.ok) {
+    throw new DependencyApiError(response.status, toErrorMessage(payload, `Package details fetch failed (${response.status}).`));
+  }
+
+  const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+
+  return {
+    name: typeof record.name === "string" ? record.name : packageName,
+    version: typeof record.version === "string" ? record.version : (version ?? ""),
+    ecosystem: (record.ecosystem === "npm" || record.ecosystem === "pypi") ? record.ecosystem : ecosystem,
+    description: typeof record.description === "string" ? record.description : "",
+    license: typeof record.license === "string" ? record.license : null,
+    homepage: typeof record.homepage === "string" ? record.homepage : null,
+    registry_url: typeof record.registry_url === "string" ? record.registry_url : null,
+    keywords: Array.isArray(record.keywords)
+      ? record.keywords.filter((k): k is string => typeof k === "string")
+      : null,
+    latest_version: typeof record.latest_version === "string" ? record.latest_version : null,
+    package_age_days: typeof record.package_age_days === "number" ? record.package_age_days : null,
+    monthly_downloads: typeof record.monthly_downloads === "number" ? record.monthly_downloads : null,
+    maintainer_count: typeof record.maintainer_count === "number" ? record.maintainer_count : null,
+    has_repository: typeof record.has_repository === "boolean" ? record.has_repository : null,
+    direct_dependencies_count: typeof record.direct_dependencies_count === "number" ? record.direct_dependencies_count : null,
+    stars: typeof record.stars === "number" ? record.stars : null,
+    forks: typeof record.forks === "number" ? record.forks : null,
+    contributors_count: typeof record.contributors_count === "number" ? record.contributors_count : null,
+    dependents_count: typeof record.dependents_count === "number" ? record.dependents_count : null,
+    source_rank: typeof record.source_rank === "number" ? record.source_rank : null,
   };
 }
 
@@ -349,11 +505,27 @@ export async function createDependencyPr(
 
   const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
 
+  const typosquatWarnings: TyposquatWarning[] = Array.isArray(record.typosquat_warnings)
+    ? record.typosquat_warnings
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+        .map((item) => ({
+          package_name: typeof item.package_name === "string" ? item.package_name : "",
+          risk_level: typeof item.risk_level === "string" ? item.risk_level : "warning",
+          reasons: Array.isArray(item.reasons)
+            ? item.reasons.filter((r): r is string => typeof r === "string")
+            : [],
+          similar_to: typeof item.similar_to === "string" ? item.similar_to : null,
+          monthly_downloads: typeof item.monthly_downloads === "number" ? item.monthly_downloads : null,
+        }))
+    : [];
+
   return {
     pr_url: typeof record.pr_url === "string" ? record.pr_url : undefined,
     pr_number: typeof record.pr_number === "number" ? record.pr_number : undefined,
     branch_name: typeof record.branch_name === "string" ? record.branch_name : undefined,
     status: typeof record.status === "string" ? record.status : undefined,
     message: typeof record.message === "string" ? record.message : undefined,
+    typosquat_warnings: typosquatWarnings.length > 0 ? typosquatWarnings : undefined,
+    scan_job_id: typeof record.scan_job_id === "string" ? record.scan_job_id : null,
   };
 }

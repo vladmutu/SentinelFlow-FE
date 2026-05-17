@@ -15,6 +15,7 @@ import {
   type PackageSearchResult,
   searchPackages as searchPackagesApi,
 } from "@/app/lib/api/dependency-pr";
+import { checkDependencyCompatibility, type CompatibilityCheckResponse } from "@/app/lib/api/scan-api";
 
 type RepoCoordinates = {
   owner: string;
@@ -243,13 +244,14 @@ export function AddDependencyPanel({
   const [selection, setSelection] = useState<SelectionEntry[]>([]);
   const [versionLookupByPackage, setVersionLookupByPackage] = useState<Record<string, { loading: boolean; error: string | null; versions: string[] }>>({});
   const [pendingSuspicious, setPendingSuspicious] = useState<string | null>(null);
-  const [allowBackendLockfileGeneration, setAllowBackendLockfileGeneration] = useState(true);
   const [branchName, setBranchName] = useState("");
   const [prTitle, setPrTitle] = useState("");
   const [prBody, setPrBody] = useState("");
   const [submitLoading, setSubmitLoading] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitSuccess, setSubmitSuccess] = useState<CreateDependencyPrResponse | null>(null);
+  const [compatibilityResult, setCompatibilityResult] = useState<CompatibilityCheckResponse | null>(null);
+  const [isCheckingCompat, setIsCheckingCompat] = useState(false);
 
   const searchDebounceRef = useRef<number | null>(null);
   const searchAbortControllerRef = useRef<AbortController | null>(null);
@@ -478,7 +480,6 @@ export function AddDependencyPanel({
           },
           ecosystem,
           packageName,
-          20,
           { signal: controller.signal },
         );
 
@@ -581,6 +582,28 @@ export function AddDependencyPanel({
     setSelection((current) => current.map((entry) => (entry.name === name ? { ...entry, version } : entry)));
   }, []);
 
+  const runCompatibilityCheck = useCallback(async () => {
+    if (isCheckingCompat || selection.length === 0) return;
+    const safeBaseUrl = apiBaseUrl?.trim();
+    if (!safeBaseUrl) return;
+    setIsCheckingCompat(true);
+    setCompatibilityResult(null);
+    try {
+      const repo = await resolveRepoCoordinates();
+      const dependencies = selection.map((entry) => ({
+        name: entry.name,
+        version: normalizeVersionForEcosystem(ecosystem, entry.version),
+      }));
+      const result = await checkDependencyCompatibility(
+        { baseUrl: safeBaseUrl, authHeaders: repo.headers, owner: repo.owner, repoName: repo.repoName },
+        { ecosystem, dependencies },
+      );
+      setCompatibilityResult(result);
+    } catch { /* silent */ } finally {
+      setIsCheckingCompat(false);
+    }
+  }, [apiBaseUrl, ecosystem, isCheckingCompat, resolveRepoCoordinates, selection]);
+
   const submitSelection = useCallback(async () => {
     if (submitLoading || selection.length === 0) {
       return;
@@ -611,7 +634,10 @@ export function AddDependencyPanel({
       };
 
       if (ecosystem === "npm") {
-        payload.generate_lockfile_server_side = allowBackendLockfileGeneration;
+        // Note: Backend requires either updated_package_lock_json OR generate_lockfile_server_side=true.
+        // Since we don't support lock file uploads yet, we default to true.
+        // The allowBackendLockfileGeneration flag is kept for future use when file upload is implemented.
+        payload.generate_lockfile_server_side = true;
       }
 
       if (branchName.trim().length > 0) {
@@ -645,7 +671,6 @@ export function AddDependencyPanel({
       setSubmitLoading(false);
     }
   }, [
-    allowBackendLockfileGeneration,
     apiBaseUrl,
     apiClient,
     branchName,
@@ -656,6 +681,10 @@ export function AddDependencyPanel({
     selection,
     submitLoading,
   ]);
+
+  useEffect(() => {
+    setCompatibilityResult(null);
+  }, [selection]);
 
   const handleSuggestionSearch = useCallback((suggestion: string) => {
     setQuery(suggestion);
@@ -951,17 +980,18 @@ export function AddDependencyPanel({
           </div>
 
           {ecosystem === "npm" ? (
-            <label className="mt-4 flex items-center gap-2 text-xs text-slate-300">
+            <label className="mt-4 flex items-center gap-2 text-xs text-slate-400">
               <input
                 type="checkbox"
-                checked={allowBackendLockfileGeneration}
-                onChange={(event) => setAllowBackendLockfileGeneration(event.target.checked)}
+                checked={true}
+                onChange={() => {}}
+                disabled={true}
               />
               <span
-                title="When enabled, the backend generates and commits package-lock.json for you. Disable this if you prefer to manage lockfile updates manually in your local environment."
+                title="Lock file generation is always enabled. Custom lock file uploads will be supported in a future release."
                 className="cursor-help"
               >
-                Let backend generate lockfile server-side
+                Backend generates lockfile (always enabled)
               </span>
             </label>
           ) : null}
@@ -1002,6 +1032,68 @@ export function AddDependencyPanel({
               ) : null}
               {submitSuccess.status ? <p className="mt-1">Status: {submitSuccess.status}</p> : null}
               {submitSuccess.message ? <p className="mt-1">{submitSuccess.message}</p> : null}
+              {submitSuccess.scan_job_id ? (
+                <p className="mt-2 font-mono text-emerald-200/80">Security scan enqueued (job: {submitSuccess.scan_job_id})</p>
+              ) : null}
+              {submitSuccess.typosquat_warnings && submitSuccess.typosquat_warnings.length > 0 ? (
+                <div className="mt-3 rounded-md border border-amber-300/35 bg-amber-500/10 px-3 py-2">
+                  <p className="font-semibold uppercase tracking-[0.12em] text-amber-200">Typosquat warnings</p>
+                  <ul className="mt-2 space-y-2">
+                    {submitSuccess.typosquat_warnings.map((warning) => (
+                      <li key={warning.package_name} className="text-amber-100/90">
+                        <span className="font-medium">{warning.package_name}</span>
+                        <span
+                          className={`ml-2 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${
+                            warning.risk_level === "high"
+                              ? "border border-rose-300/45 bg-rose-500/20 text-rose-100"
+                              : "border border-amber-300/45 bg-amber-500/20 text-amber-100"
+                          }`}
+                        >
+                          {warning.risk_level}
+                        </span>
+                        {warning.reasons[0] ? (
+                          <p className="mt-0.5 text-[11px] text-amber-100/75">{warning.reasons[0]}</p>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {selection.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => { void runCompatibilityCheck(); }}
+              disabled={isCheckingCompat || submitLoading}
+              className="mt-4 w-full rounded-lg border border-amber-400/40 bg-amber-500/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isCheckingCompat ? "Checking..." : "Check Compatibility"}
+            </button>
+          ) : null}
+
+          {compatibilityResult ? (
+            <div className={`mt-3 rounded-lg border px-3 py-3 text-xs ${compatibilityResult.compatible ? "border-emerald-400/30 bg-emerald-500/10" : "border-amber-400/30 bg-amber-500/10"}`}>
+              <p className={`font-semibold uppercase tracking-[0.12em] ${compatibilityResult.compatible ? "text-emerald-200" : "text-amber-200"}`}>
+                {compatibilityResult.compatible ? "All dependencies compatible" : "Compatibility warning"}
+              </p>
+              <div className="mt-2 space-y-2">
+                {compatibilityResult.checks.map((check) => (
+                  <div key={check.name} className={`rounded border p-2 ${check.compatible ? "border-emerald-500/20 bg-emerald-500/5" : "border-amber-500/25 bg-amber-500/10"}`}>
+                    <p className="font-medium text-slate-100">{check.name} <span className="font-normal text-slate-400">@ {check.requested_version}</span></p>
+                    {check.existing_constraint ? (
+                      <p className="mt-0.5 text-slate-400">Existing: <span className="font-mono text-slate-300">{check.existing_constraint}</span></p>
+                    ) : null}
+                    {!check.compatible && check.reason ? (
+                      <p className="mt-1 text-amber-100">{check.reason}</p>
+                    ) : null}
+                    {!check.compatible && check.suggestion ? (
+                      <p className="mt-0.5 text-amber-200/80">Suggestion: {check.suggestion}</p>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
             </div>
           ) : null}
 
@@ -1011,7 +1103,7 @@ export function AddDependencyPanel({
               void submitSelection();
             }}
             disabled={submitLoading || selection.length === 0}
-            className="mt-5 inline-flex w-full items-center justify-center rounded-lg border border-cyan-400/55 bg-cyan-500/15 px-4 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-cyan-100 transition hover:bg-cyan-500/30 disabled:cursor-not-allowed disabled:opacity-55"
+            className="mt-4 inline-flex w-full items-center justify-center rounded-lg border border-cyan-400/55 bg-cyan-500/15 px-4 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-cyan-100 transition hover:bg-cyan-500/30 disabled:cursor-not-allowed disabled:opacity-55"
           >
             {submitLoading ? "Creating PR..." : "Create Dependency PR"}
           </button>
