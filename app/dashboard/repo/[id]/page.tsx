@@ -6,7 +6,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanJobResponse, ScanHistoryItem, SbomDocument, ScanApiContext } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanJobResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -41,6 +41,7 @@ type ScanResultMapEntry = {
   malware_score?: number | null;
   scan_timestamp?: string | null;
   scanner_version?: string | null;
+  static_features?: Record<string, number> | null;
 };
 
 type ScanResultRow = {
@@ -50,6 +51,9 @@ type ScanResultRow = {
   status: string;
   malwareStatus: string;
   malwareScore: number | null;
+  riskStatus: string | null;
+  riskScore: number | null;
+  advisoryRefs: string[];
   errorMessage: string | null;
   scanTimestamp: string | null;
 };
@@ -163,6 +167,11 @@ function normalizeResultRow(input: unknown, index: number): ScanResultRow {
     normalizeStatusValue(record.status ?? record.task_status ?? record.scan_status ?? record.malware_status);
   const malwareStatus = normalizeStatusValue(record.malware_status ?? record.status);
   const malwareScore = coerceNonNegativeNumber(record.malware_score);
+  const riskStatus = coerceString(record.risk_overall_status);
+  const riskScore = coerceNonNegativeNumber(record.risk_overall_score);
+  const advisoryRefs = Array.isArray(record.advisory_references)
+    ? (record.advisory_references as unknown[]).filter((r): r is string => typeof r === "string")
+    : [];
   const errorMessage =
     coerceString(record.error_message) ?? coerceString(record.error) ?? coerceString(record.failure_reason);
   const scanTimestamp = coerceString(record.scan_timestamp);
@@ -174,6 +183,9 @@ function normalizeResultRow(input: unknown, index: number): ScanResultRow {
     status,
     malwareStatus,
     malwareScore,
+    riskStatus,
+    riskScore,
+    advisoryRefs,
     errorMessage,
     scanTimestamp,
   };
@@ -225,6 +237,11 @@ function normalizeScanResultsPayload(payload: unknown): {
           status: malwareStatus,
           malwareStatus,
           malwareScore,
+          riskStatus: coerceString(entryRecord.risk_overall_status),
+          riskScore: coerceNonNegativeNumber(entryRecord.risk_overall_score),
+          advisoryRefs: Array.isArray(entryRecord.advisory_references)
+            ? (entryRecord.advisory_references as unknown[]).filter((r): r is string => typeof r === "string")
+            : [],
           errorMessage: null,
           scanTimestamp: coerceString(entryRecord.scan_timestamp),
         });
@@ -470,6 +487,24 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
+function FeatureGrid({ features }: { features: Record<string, number> | null }) {
+  if (!features) return null;
+  const entries = Object.entries(features).filter(([, v]) => v !== null && v !== undefined);
+  if (entries.length === 0) return <p className="mt-2 text-sm text-slate-500">No features available.</p>;
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-2">
+      {entries.map(([key, val]) => (
+        <div key={key} className="rounded-lg border border-slate-700/60 bg-slate-900/60 px-3 py-2.5">
+          <p className="text-[10px] uppercase tracking-[0.1em] text-slate-500">{key.replace(/_/g, " ")}</p>
+          <p className="mt-1 font-mono text-sm font-medium text-slate-200">
+            {Number.isInteger(val) ? val : val.toFixed(4)}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const resolvedParams = use(params);
   const decodedId = useMemo(() => decodeURIComponent(resolvedParams.id), [resolvedParams.id]);
@@ -512,6 +547,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedHistoryJobId, setSelectedHistoryJobId] = useState<string | null>(null);
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<ScanJobResponse | null>(null);
   const [isHistoryJobLoading, setIsHistoryJobLoading] = useState(false);
+  const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
+  const [graphDetailNode, setGraphDetailNode] = useState<{ label: string; features: Record<string, number> | null } | null>(null);
   // SBOM
   const [sbomDocument, setSbomDocument] = useState<SbomDocument | null>(null);
   const [isSbomLoading, setIsSbomLoading] = useState(false);
@@ -522,9 +559,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [isPackageDetailsLoading, setIsPackageDetailsLoading] = useState(false);
   const [packageDetailsVersions, setPackageDetailsVersions] = useState<string[]>([]);
   const [packageDetailsLatestVersion, setPackageDetailsLatestVersion] = useState<string | null>(null);
-  const [packageDetailsScanEntry, setPackageDetailsScanEntry] = useState<{ advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null> } | null>(null);
+  const [packageDetailsScanEntry, setPackageDetailsScanEntry] = useState<{ advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null>; dynamic_findings?: DynamicFinding | null; analyzed_by?: string[]; risk_assessment?: Record<string, unknown> } | null>(null);
   // Scan mode
-  const [activeScanMode, setActiveScanMode] = useState<"full" | "static_only" | "static_dynamic" | "dynamic_only">("full");
+  const [activeScanMode, setActiveScanMode] = useState<"full" | "static_only" | "lightweight" | "dynamic_only">("full");
   const isMountedRef = useRef(true);
   const scanPollTimerRef = useRef<number | null>(null);
   const elapsedTickerRef = useRef<number | null>(null);
@@ -1029,12 +1066,14 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           setHasScanned(true);
           await loadLatestScanResults();
           setScanStatus("Latest malware scan results loaded.");
+          if (isMountedRef.current) { void loadScanHistory(); }
           return;
         }
 
         if (SCAN_TERMINAL_CANCELLED.has(statusValue)) {
           setIsScanRunning(false);
           setScanStatus("Scan cancelled by user.");
+          if (isMountedRef.current) { void loadScanHistory(); }
           return;
         }
 
@@ -1042,6 +1081,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           setIsScanRunning(false);
           setScanError(`Package scan failed with status: ${statusValue}`);
           await loadLatestScanResults();
+          if (isMountedRef.current) { void loadScanHistory(); }
           return;
         }
 
@@ -1109,6 +1149,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         }, retryDelay);
       }
     },
+    // loadScanHistory is declared after pollScanJob — omitted from deps intentionally
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [appendLiveResultRows, loadLatestScanResults],
   );
 
@@ -1208,7 +1250,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
       const triggerPayload = await triggerScan(scanContext, {
         ecosystem,
-        scan_mode: "dynamic_only",
+        scan_mode: "static_only",
         selected_packages: selectedAnalysisPackages,
       });
 
@@ -1280,7 +1322,20 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           : null;
 
       if (status === 400) {
-        setScanError("Cannot stop: job already completed.");
+        const detail = cancelError instanceof Error ? (cancelError as { detail?: string }).detail ?? cancelError.message : "";
+        const lower = detail.toLowerCase();
+        if (lower.includes("failed")) {
+          setScanError("Scan already failed.");
+          setIsScanRunning(false);
+        } else if (lower.includes("cancelled")) {
+          setScanStatus("Scan was already cancelled.");
+          setScanError(null);
+          setIsScanRunning(false);
+        } else {
+          // completed — silently stop local running state
+          setIsScanRunning(false);
+          setScanError(null);
+        }
       } else if (status === 404) {
         setScanError("Scan job not found.");
       } else {
@@ -1411,11 +1466,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         const repoCtx = await resolveRepoCoordinates();
         if (cancelled) return;
         const scanRes = await fetch(
-          `${API_BASE_URL}/api/repos/${encodeURIComponent(repoCtx.owner)}/${encodeURIComponent(repoCtx.repoName)}/scan/latest/results`,
+          `${API_BASE_URL}/api/${encodeURIComponent(repoCtx.owner)}/${encodeURIComponent(repoCtx.repoName)}/scan/latest/results`,
           { method: "GET", headers: repoCtx.headers, credentials: "include", cache: "no-store" },
         );
         if (scanRes.ok && !cancelled) {
-          const scanData = await scanRes.json() as Record<string, { advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null> }>;
+          const scanData = await scanRes.json() as Record<string, { advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null>; dynamic_findings?: DynamicFinding | null; analyzed_by?: string[]; risk_assessment?: Record<string, unknown> }>;
           const entry = scanData[selectedDetailsPackage];
           if (entry && !cancelled) setPackageDetailsScanEntry(entry);
         }
@@ -1542,7 +1597,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
                       <div className="pt-1 space-y-2">
                         <div className="flex flex-wrap gap-1">
-                          {(["full", "static_only", "static_dynamic", "dynamic_only"] as const).map((mode) => (
+                          {(["full", "static_only", "lightweight", "dynamic_only"] as const).map((mode) => (
                             <button
                               key={mode}
                               type="button"
@@ -1554,7 +1609,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
                               } disabled:cursor-not-allowed disabled:opacity-50`}
                             >
-                              {mode === "full" ? "Full" : mode === "static_only" ? "Static" : mode === "static_dynamic" ? "S+D" : "Dynamic"}
+                              {mode === "full" ? "Full" : mode === "static_only" ? "Static" : mode === "lightweight" ? "Lightweight" : "Dynamic"}
                             </button>
                           ))}
                         </div>
@@ -1613,8 +1668,30 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     selectedPackageLabels={selectedScanPackages}
                     selectionEnabled={isPartialScan}
                     onPackageToggleSelect={toggleSelectedScanPackage}
+                    onNodeFeatureDetail={(label, features) => setGraphDetailNode({ label, features })}
                   />
                 </div>
+
+                {graphDetailNode ? (
+                  <div className="absolute bottom-4 right-4 top-4 z-20 flex w-[22rem] flex-col overflow-hidden rounded-2xl border border-slate-600 bg-slate-950/98 shadow-2xl backdrop-blur-sm">
+                    <div className="flex shrink-0 items-start justify-between gap-3 border-b border-slate-700/60 px-5 py-4">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-indigo-400">Package Analysis</p>
+                        <p className="mt-1.5 break-all text-base font-bold text-slate-100 leading-snug">{graphDetailNode.label}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setGraphDetailNode(null)}
+                        className="mt-0.5 shrink-0 rounded-lg px-2 py-1 text-sm text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div className="flex-1 overflow-y-auto px-5 py-4">
+                      <FeatureGrid features={graphDetailNode.features} />
+                    </div>
+                  </div>
+                ) : null}
 
                 {isLoadingTree ? (
                   <div className="absolute inset-0 flex items-center justify-center p-8">
@@ -1736,6 +1813,14 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       {scanResultRows.length > 0 ? (
                         scanResultRows.map((row) => {
                           const isErrorRow = row.errorMessage !== null || row.status === "failed";
+                          const riskBadgeClass =
+                            row.riskStatus === "malicious"
+                              ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                              : row.riskStatus === "suspicious"
+                                ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                                : row.riskStatus === "clean"
+                                  ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                                  : "border-slate-600 bg-slate-800/60 text-slate-400";
 
                           return (
                             <div
@@ -1746,11 +1831,49 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                 <p className="font-medium">
                                   {row.packageName} <span className="text-slate-400">@</span> {row.version}
                                 </p>
-                                <span className="text-[11px] uppercase tracking-[0.14em] text-slate-400">{row.status}</span>
+                                <div className="flex items-center gap-2">
+                                  {row.riskStatus ? (
+                                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${riskBadgeClass}`}>
+                                      {row.riskStatus}
+                                    </span>
+                                  ) : null}
+                                  <span className="text-[11px] uppercase tracking-[0.14em] text-slate-400">{row.status}</span>
+                                </div>
                               </div>
-                              <p className="mt-1 text-xs text-slate-400">
-                                Malware score: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}
-                              </p>
+                              <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
+                                <span>Malware score: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}</span>
+                                {row.riskScore !== null ? (
+                                  <span>Risk score: {(row.riskScore * 100).toFixed(1)}%</span>
+                                ) : null}
+                              </div>
+                              {row.advisoryRefs.length > 0 ? (
+                                <div className="mt-2 flex flex-wrap gap-1.5">
+                                  {row.advisoryRefs.map((ref) => {
+                                    const isCve = ref.toUpperCase().startsWith("CVE-");
+                                    const isGhsa = ref.toUpperCase().startsWith("GHSA-");
+                                    const href = isCve
+                                      ? `https://nvd.nist.gov/vuln/detail/${ref}`
+                                      : isGhsa
+                                        ? `https://github.com/advisories/${ref}`
+                                        : null;
+                                    return href ? (
+                                      <a
+                                        key={ref}
+                                        href={href}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
+                                      >
+                                        {ref}
+                                      </a>
+                                    ) : (
+                                      <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">
+                                        {ref}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              ) : null}
                               {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
                             </div>
                           );
@@ -1972,21 +2095,21 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     <p className="mt-1 text-sm text-slate-300">Browse installed packages and view detailed metadata.</p>
                   </div>
                   {selectedDetailsPackage ? (
-                    <div className="space-y-3 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                    <div className="space-y-5 rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
                       {isPackageDetailsLoading ? (
                         <div className="space-y-3">
-                          <div className="h-6 w-48 animate-pulse rounded bg-slate-700/60" />
-                          <div className="h-4 w-full animate-pulse rounded bg-slate-800/80" />
-                          <div className="h-4 w-3/4 animate-pulse rounded bg-slate-800/80" />
+                          <div className="h-7 w-56 animate-pulse rounded bg-slate-700/60" />
+                          <div className="h-5 w-full animate-pulse rounded bg-slate-800/80" />
+                          <div className="h-5 w-3/4 animate-pulse rounded bg-slate-800/80" />
                         </div>
                       ) : (
                         <>
                           <div className="flex flex-wrap items-start justify-between gap-3">
                             <div>
-                              <h3 className="text-lg font-semibold text-slate-100">
+                              <h3 className="text-2xl font-bold text-slate-100">
                                 {selectedDetailsPackage.slice(0, selectedDetailsPackage.lastIndexOf("@")) || selectedDetailsPackage}
                               </h3>
-                              <p className="font-mono text-sm text-teal-300">
+                              <p className="mt-0.5 font-mono text-base text-teal-300">
                                 v{selectedDetailsPackage.slice(selectedDetailsPackage.lastIndexOf("@") + 1) || "unknown"}
                               </p>
                             </div>
@@ -1999,7 +2122,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                 : status === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
                                 : "border-slate-400/50 bg-slate-500/15 text-slate-300";
                               return (
-                                <span className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] ${cls}`}>
+                                <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] ${cls}`}>
                                   {status}
                                 </span>
                               );
@@ -2007,14 +2130,14 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           </div>
 
                           {packageDetailsData?.description ? (
-                            <p className="text-sm text-slate-300">{packageDetailsData.description}</p>
+                            <p className="text-sm leading-relaxed text-slate-300">{packageDetailsData.description}</p>
                           ) : null}
 
-                          <div className="grid grid-cols-2 gap-2 text-xs">
+                          <div className="grid grid-cols-2 gap-3">
                             {packageDetailsData?.monthly_downloads != null ? (
-                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2.5">
-                                <p className="uppercase tracking-[0.1em] text-slate-500">Monthly downloads</p>
-                                <p className="mt-1 font-medium text-slate-200">
+                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+                                <p className="text-xs uppercase tracking-[0.1em] text-slate-400">Monthly downloads</p>
+                                <p className="mt-1.5 text-lg font-semibold text-slate-100">
                                   {packageDetailsData.monthly_downloads >= 1_000_000
                                     ? `${(packageDetailsData.monthly_downloads / 1_000_000).toFixed(1)}M`
                                     : packageDetailsData.monthly_downloads >= 1_000
@@ -2024,30 +2147,30 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               </div>
                             ) : null}
                             {packageDetailsScanEntry?.risk_overall_score != null ? (
-                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2.5">
-                                <p className="uppercase tracking-[0.1em] text-slate-500">Risk score</p>
-                                <div className="mt-1">
-                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700">
+                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+                                <p className="text-xs uppercase tracking-[0.1em] text-slate-400">Risk score</p>
+                                <div className="mt-2">
+                                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-700">
                                     <div
                                       className={`h-full rounded-full ${packageDetailsScanEntry.risk_overall_score > 0.5 ? "bg-rose-400" : packageDetailsScanEntry.risk_overall_score > 0.2 ? "bg-amber-400" : "bg-emerald-400"}`}
                                       style={{ width: `${(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%` }}
                                     />
                                   </div>
-                                  <p className="mt-0.5 text-slate-300">{(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%</p>
+                                  <p className="mt-1.5 text-base font-semibold text-slate-200">{(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%</p>
                                 </div>
                               </div>
                             ) : null}
                           </div>
 
                           {packageDetailsData?.homepage || packageDetailsData?.registry_url ? (
-                            <div className="flex flex-wrap gap-3 text-xs">
+                            <div className="flex flex-wrap gap-4">
                               {packageDetailsData.homepage ? (
-                                <a href={packageDetailsData.homepage} target="_blank" rel="noreferrer" className="text-teal-300 underline decoration-teal-400/50 underline-offset-2">
+                                <a href={packageDetailsData.homepage} target="_blank" rel="noreferrer" className="text-sm text-teal-300 underline decoration-teal-400/50 underline-offset-2 hover:text-teal-200">
                                   Homepage ↗
                                 </a>
                               ) : null}
                               {packageDetailsData.registry_url ? (
-                                <a href={packageDetailsData.registry_url} target="_blank" rel="noreferrer" className="text-teal-300 underline decoration-teal-400/50 underline-offset-2">
+                                <a href={packageDetailsData.registry_url} target="_blank" rel="noreferrer" className="text-sm text-teal-300 underline decoration-teal-400/50 underline-offset-2 hover:text-teal-200">
                                   Registry ↗
                                 </a>
                               ) : null}
@@ -2055,41 +2178,210 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           ) : null}
 
                           {packageDetailsLatestVersion ? (
-                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2.5 text-xs">
-                              <p className="uppercase tracking-[0.1em] text-slate-500">Latest version</p>
-                              <p className="mt-1 font-mono text-teal-200">{packageDetailsLatestVersion}</p>
+                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+                              <p className="text-xs uppercase tracking-[0.1em] text-slate-400">Latest version</p>
+                              <p className="mt-1.5 font-mono text-base text-teal-200">{packageDetailsLatestVersion}</p>
                               {packageDetailsVersions.length > 1 ? (
-                                <p className="mt-0.5 text-slate-500">{packageDetailsVersions.length} versions available</p>
+                                <p className="mt-1 text-sm text-slate-500">{packageDetailsVersions.length} versions available</p>
                               ) : null}
                             </div>
                           ) : null}
 
-                          {packageDetailsScanEntry?.advisory_references && packageDetailsScanEntry.advisory_references.length > 0 ? (
-                            <div className="rounded-lg border border-amber-400/25 bg-amber-500/10 p-3">
-                              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-amber-200">
-                                {packageDetailsScanEntry.advisory_references.length} CVE / Advisory Reference{packageDetailsScanEntry.advisory_references.length !== 1 ? "s" : ""}
-                              </p>
-                              <div className="mt-2 flex flex-wrap gap-1.5">
-                                {packageDetailsScanEntry.advisory_references.map((ref) => (
-                                  <span key={ref} className="inline-flex rounded border border-amber-400/30 bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-100">{ref}</span>
-                                ))}
-                              </div>
-                            </div>
-                          ) : packageDetailsScanEntry ? (
-                            <p className="text-xs text-slate-500">No CVE advisories found for this package.</p>
-                          ) : null}
+                          {(() => {
+                            const ra = packageDetailsScanEntry?.risk_assessment as Record<string, unknown> | undefined;
+                            const raMetadata = ra?.metadata as Record<string, unknown> | undefined;
+                            const repMeta = raMetadata?.reputation as Record<string, unknown> | undefined;
+                            const vulnSignals = (ra?.vulnerability_signals as Array<Record<string, unknown>> | undefined) ?? [];
+                            const hasReputation = repMeta && Object.keys(repMeta).length > 0 && (repMeta.rank != null || repMeta.stars != null || repMeta.trust_score != null);
+                            const hasVulnDetails = vulnSignals.length > 0;
 
-                          {packageDetailsScanEntry?.static_features ? (
-                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs">
-                              <p className="mb-2 font-semibold uppercase tracking-[0.12em] text-slate-400">Static Features</p>
-                              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+                            const advisoryIds = packageDetailsScanEntry?.advisory_references ?? [];
+                            return (
+                              <>
+                                {/* CVE / Advisory References */}
+                                {advisoryIds.length > 0 ? (
+                                  <div className="rounded-lg border border-amber-400/25 bg-amber-500/10 p-4">
+                                    <p className="text-sm font-semibold uppercase tracking-[0.12em] text-amber-200">
+                                      {advisoryIds.length} CVE / Advisory Reference{advisoryIds.length !== 1 ? "s" : ""}
+                                    </p>
+                                    <div className="mt-3 space-y-2.5">
+                                      {hasVulnDetails ? vulnSignals.map((sig, idx) => {
+                                        const sigMeta = sig.metadata as Record<string, unknown> | undefined;
+                                        const advId = (sigMeta?.advisory_id ?? advisoryIds[idx] ?? "") as string;
+                                        const cvss = sigMeta?.cvss_score ?? sig.value;
+                                        const desc = sigMeta?.summary ?? sigMeta?.details ?? null;
+                                        const refs = (sigMeta?.references as string[] | undefined) ?? [];
+                                        return (
+                                          <div key={advId || idx} className="rounded-lg border border-amber-400/20 bg-amber-500/10 p-3">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                              <span className="font-mono text-sm text-amber-100">{advId}</span>
+                                              {cvss != null ? (
+                                                <span className={`inline-flex rounded border px-2 py-0.5 text-xs font-semibold ${Number(cvss) >= 7 ? "border-rose-400/40 bg-rose-500/15 text-rose-200" : Number(cvss) >= 4 ? "border-amber-400/40 bg-amber-500/15 text-amber-200" : "border-slate-600 bg-slate-800 text-slate-400"}`}>
+                                                  CVSS {Number(cvss).toFixed(1)}
+                                                </span>
+                                              ) : null}
+                                            </div>
+                                            {desc ? <p className="mt-1.5 text-sm text-slate-300">{String(desc).slice(0, 200)}{String(desc).length > 200 ? "…" : ""}</p> : null}
+                                            {refs.length > 0 ? (
+                                              <div className="mt-2 flex flex-wrap gap-2">
+                                                {refs.slice(0, 3).map((ref, i) => (
+                                                  <a key={i} href={ref} target="_blank" rel="noreferrer" className="text-xs text-teal-300 underline decoration-teal-400/50 underline-offset-2">{new URL(ref).hostname} ↗</a>
+                                                ))}
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        );
+                                      }) : (
+                                        <div className="flex flex-wrap gap-2">
+                                          {advisoryIds.map((ref) => (
+                                            <span key={ref} className="inline-flex rounded border border-amber-400/30 bg-amber-500/15 px-2 py-1 font-mono text-xs text-amber-100">{ref}</span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                ) : packageDetailsScanEntry ? (
+                                  <p className="text-sm text-slate-500">No CVE advisories found for this package.</p>
+                                ) : null}
+
+                                {/* Libraries.io / Reputation */}
+                                {hasReputation ? (
+                                  <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-4">
+                                    <p className="mb-3 text-sm font-semibold uppercase tracking-[0.12em] text-slate-400">Package Reputation (Libraries.io)</p>
+                                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                                      {([
+                                        ["SourceRank", repMeta!.rank, null],
+                                        ["Stars", repMeta!.stars, null],
+                                        ["Dependents", repMeta!.dependents_count, null],
+                                        ["Forks", repMeta!.forks, null],
+                                        ["Contributors", repMeta!.contributions_count, null],
+                                        ["Trust Score", repMeta!.trust_score, "%"],
+                                      ] as [string, unknown, string | null][]).filter(([, v]) => v != null).map(([label, val, unit]) => (
+                                        <div key={label} className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                          <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">{label}</p>
+                                          <p className="mt-1 font-mono text-sm text-slate-200">
+                                            {unit === "%" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}
+                                          </p>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ) : null}
+                              </>
+                            );
+                          })()}
+
+                          {packageDetailsScanEntry?.static_features && Object.keys(packageDetailsScanEntry.static_features).length > 0 ? (
+                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+                              <p className="mb-3 text-sm font-semibold uppercase tracking-[0.12em] text-slate-400">Static Features</p>
+                              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                                 {Object.entries(packageDetailsScanEntry.static_features).map(([key, val]) => (
-                                  <div key={key} className="rounded border border-slate-800 bg-slate-950/40 px-2 py-1">
-                                    <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">{key.replace(/_/g, " ")}</p>
-                                    <p className="mt-0.5 font-mono text-slate-300">{val != null ? (typeof val === "number" && val < 1 && val > 0 ? `${(val * 100).toFixed(0)}%` : String(val)) : "-"}</p>
+                                  <div key={key} className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                    <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">
+                                      {({"max_entropy": "Max Entropy", "avg_entropy": "Avg Entropy", "eval_count": "eval() Calls", "exec_count": "exec() Calls", "base64_count": "Base64 Strings", "network_imports": "Network Imports", "obfuscation_index": "Obfuscation Score"} as Record<string, string>)[key] ?? key.replace(/_/g, " ")}
+                                    </p>
+                                    <p className="mt-1 font-mono text-sm text-slate-200">{val != null ? (typeof val === "number" && val < 1 && val > 0 ? `${(val * 100).toFixed(0)}%` : String(val)) : "-"}</p>
                                   </div>
                                 ))}
                               </div>
+                            </div>
+                          ) : null}
+
+                          {packageDetailsScanEntry?.dynamic_findings && packageDetailsScanEntry.analyzed_by?.includes("dynamic") ? (
+                            <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+                              <p className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-400">Dynamic Analysis</p>
+
+                              <div className="flex flex-wrap gap-2">
+                                {packageDetailsScanEntry.dynamic_findings.status ? (
+                                  <span className={`inline-flex rounded border px-2.5 py-1 text-xs font-semibold uppercase tracking-[0.08em] ${packageDetailsScanEntry.dynamic_findings.status === "completed" ? "border-emerald-400/30 bg-emerald-500/15 text-emerald-200" : packageDetailsScanEntry.dynamic_findings.status === "partial" ? "border-amber-400/30 bg-amber-500/15 text-amber-200" : "border-rose-400/30 bg-rose-500/15 text-rose-200"}`}>
+                                    {packageDetailsScanEntry.dynamic_findings.status}
+                                  </span>
+                                ) : null}
+                                {packageDetailsScanEntry.dynamic_findings.coverage ? (
+                                  <span className={`inline-flex rounded border px-2.5 py-1 text-xs font-semibold uppercase tracking-[0.08em] ${packageDetailsScanEntry.dynamic_findings.coverage === "full" ? "border-teal-400/30 bg-teal-500/15 text-teal-200" : "border-slate-600 bg-slate-800 text-slate-400"}`}>
+                                    Coverage: {packageDetailsScanEntry.dynamic_findings.coverage}
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              {packageDetailsScanEntry.dynamic_findings.vm_evasion_observed ? (
+                                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2.5 text-sm text-rose-200">
+                                  ⚠ VM Evasion Detected — package actively attempted to detect the sandbox environment
+                                </div>
+                              ) : null}
+
+                              {packageDetailsScanEntry.dynamic_findings.ioc_detail ? (() => {
+                                const ioc = packageDetailsScanEntry.dynamic_findings!.ioc_detail!;
+                                const verdictColor = ioc.verdict === "malicious" ? "border-rose-400/30 bg-rose-500/15 text-rose-200" : ioc.verdict === "suspicious" ? "border-amber-400/30 bg-amber-500/15 text-amber-200" : "border-emerald-400/30 bg-emerald-500/15 text-emerald-200";
+                                const iocGroups: [string, string[] | undefined][] = [["Network", ioc.network_iocs], ["Process", ioc.process_iocs], ["File", ioc.file_iocs], ["DNS", ioc.dns_iocs], ["Crypto", ioc.crypto_iocs]];
+                                return (
+                                  <div className="space-y-3">
+                                    <div className="flex items-center gap-2.5">
+                                      <p className="text-xs uppercase tracking-[0.08em] text-slate-400">IOC Verdict</p>
+                                      {ioc.verdict ? <span className={`inline-flex rounded border px-2.5 py-0.5 text-xs font-semibold uppercase tracking-[0.08em] ${verdictColor}`}>{ioc.verdict}</span> : null}
+                                    </div>
+                                    {iocGroups.filter(([, items]) => items && items.length > 0).map(([label, items]) => (
+                                      <div key={label}>
+                                        <p className="mb-1.5 text-xs uppercase tracking-[0.08em] text-slate-400">{label} IOCs</p>
+                                        <div className="flex flex-wrap gap-1.5">
+                                          {items!.map((item, idx) => <span key={idx} className="inline-flex rounded border border-slate-700 bg-slate-950/60 px-2 py-0.5 font-mono text-xs text-slate-300">{item}</span>)}
+                                        </div>
+                                      </div>
+                                    ))}
+                                    {ioc.flagged_lines && ioc.flagged_lines.length > 0 ? (
+                                      <div>
+                                        <p className="mb-1.5 text-xs uppercase tracking-[0.08em] text-slate-400">Flagged Syscalls</p>
+                                        <div className="space-y-1 overflow-x-auto rounded-lg border border-slate-800 bg-slate-950/60 p-3 font-mono text-xs text-slate-400">
+                                          {ioc.flagged_lines.slice(0, 5).map((line, idx) => <div key={idx} className="truncate">{line}</div>)}
+                                          {ioc.flagged_lines.length > 5 ? <p className="text-slate-500">+{ioc.flagged_lines.length - 5} more lines</p> : null}
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                );
+                              })() : null}
+
+                              {packageDetailsScanEntry.dynamic_findings.syscall_trace ? (
+                                <div>
+                                  <p className="mb-1.5 text-xs uppercase tracking-[0.08em] text-slate-400">Syscall Trace</p>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-mono text-sm text-slate-300">{packageDetailsScanEntry.dynamic_findings.syscall_trace.suspicious_count ?? 0} suspicious calls</span>
+                                    {packageDetailsScanEntry.dynamic_findings.syscall_trace.categories?.map((cat) => (
+                                      <span key={cat} className="inline-flex rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 font-mono text-xs text-slate-400">{cat}</span>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {packageDetailsScanEntry.dynamic_findings.network_activity ? (
+                                <div>
+                                  <p className="mb-1.5 text-xs uppercase tracking-[0.08em] text-slate-400">Network Activity</p>
+                                  <p className="mb-1.5 font-mono text-sm text-slate-300">{packageDetailsScanEntry.dynamic_findings.network_activity.outbound_connections ?? 0} outbound connection{(packageDetailsScanEntry.dynamic_findings.network_activity.outbound_connections ?? 0) !== 1 ? "s" : ""}</p>
+                                  {packageDetailsScanEntry.dynamic_findings.network_activity.destinations && packageDetailsScanEntry.dynamic_findings.network_activity.destinations.length > 0 ? (
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {packageDetailsScanEntry.dynamic_findings.network_activity.destinations.map((dest, idx) => <span key={idx} className="inline-flex rounded border border-slate-700 bg-slate-950/60 px-2 py-0.5 font-mono text-xs text-slate-300">{dest}</span>)}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              ) : null}
+
+                              {packageDetailsScanEntry.dynamic_findings.filesystem_changes ? (
+                                <div>
+                                  <p className="mb-1.5 text-xs uppercase tracking-[0.08em] text-slate-400">Filesystem Changes</p>
+                                  <p className="mb-1.5 font-mono text-sm text-slate-300">{packageDetailsScanEntry.dynamic_findings.filesystem_changes.sensitive_path_writes ?? 0} sensitive path write{(packageDetailsScanEntry.dynamic_findings.filesystem_changes.sensitive_path_writes ?? 0) !== 1 ? "s" : ""}</p>
+                                  {packageDetailsScanEntry.dynamic_findings.filesystem_changes.paths && packageDetailsScanEntry.dynamic_findings.filesystem_changes.paths.length > 0 ? (
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {packageDetailsScanEntry.dynamic_findings.filesystem_changes.paths.map((path, idx) => <span key={idx} className="inline-flex rounded border border-slate-700 bg-slate-950/60 px-2 py-0.5 font-mono text-xs text-slate-300">{path}</span>)}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              ) : null}
+
+                              {packageDetailsScanEntry.dynamic_findings.sandbox_timed_out ? (
+                                <div className="rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2.5 text-sm text-amber-200">
+                                  Sandbox timed out — coverage may be incomplete
+                                </div>
+                              ) : null}
                             </div>
                           ) : null}
                         </>
@@ -2152,7 +2444,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-violet-300">Software Bill of Materials</p>
                     <p className="mt-1 text-sm text-slate-300">
                       {sbomDocument
-                        ? `${sbomDocument.metadata.component_count} component${sbomDocument.metadata.component_count !== 1 ? "s" : ""} · generated ${new Date(sbomDocument.metadata.timestamp).toLocaleString()}`
+                        ? `${sbomDocument.components.length} component${sbomDocument.components.length !== 1 ? "s" : ""} · generated ${new Date(sbomDocument.metadata.timestamp).toLocaleString()}`
                         : "Generate a complete inventory of all packages in this project."}
                     </p>
                   </div>
@@ -2204,7 +2496,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       </div>
                       <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
                         <p className="uppercase tracking-[0.1em] text-slate-500">Components</p>
-                        <p className="mt-1 font-medium text-violet-300">{sbomDocument.metadata.component_count}</p>
+                        <p className="mt-1 font-medium text-violet-300">{sbomDocument.components.length}</p>
                       </div>
                       <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
                         <p className="uppercase tracking-[0.1em] text-slate-500">Schema</p>
@@ -2238,7 +2530,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   <td className="max-w-[180px] truncate px-4 py-2 font-mono text-[10px] text-slate-500" title={component.purl}>{component.purl}</td>
                                   <td className="px-4 py-2 text-slate-300">{component.licenses.map((l) => l.id).join(", ") || "-"}</td>
                                   <td className={`px-4 py-2 font-semibold uppercase ${riskClass}`}>
-                                    {component.risk_status} <span className="font-normal text-slate-500">({(component.risk_score * 100).toFixed(0)}%)</span>
+                                    {component.risk_status ?? "—"} <span className="font-normal text-slate-500">({((component.risk_score ?? 0) * 100).toFixed(0)}%)</span>
                                   </td>
                                   <td className="px-4 py-2 text-slate-400">{component.is_direct ? "✓" : "—"}</td>
                                 </tr>
@@ -2312,7 +2604,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               ? "border-blue-400/50 bg-blue-500/15 text-blue-100"
                               : job.scan_mode === "static_only"
                                 ? "border-purple-400/50 bg-purple-500/15 text-purple-100"
-                                : job.scan_mode === "static_dynamic"
+                                : job.scan_mode === "lightweight"
                                   ? "border-teal-400/50 bg-teal-500/15 text-teal-100"
                                   : "border-orange-400/50 bg-orange-500/15 text-orange-100";
                             const statusBadgeClass = job.status === "completed"
@@ -2331,7 +2623,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   <td className="px-4 py-3 uppercase text-slate-400">{job.ecosystem}</td>
                                   <td className="px-4 py-3">
                                     <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${modeBadgeClass}`}>
-                                      {job.scan_mode === "full" ? "Full" : job.scan_mode === "static_only" ? "Static" : job.scan_mode === "static_dynamic" ? "S+D" : "Dynamic"}
+                                      {job.scan_mode === "full" ? "Full" : job.scan_mode === "static_only" ? "Static" : job.scan_mode === "lightweight" ? "Lightweight" : "Dynamic"}
                                     </span>
                                   </td>
                                   <td className="px-4 py-3">
@@ -2372,24 +2664,45 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                             {selectedHistoryJob.error_message ? <div><p className="text-slate-500 uppercase tracking-[0.1em]">Error</p><p className="mt-1 text-rose-200">{selectedHistoryJob.error_message}</p></div> : null}
                                           </div>
                                           {selectedHistoryJob.results && selectedHistoryJob.results.length > 0 ? (
-                                            <div className="max-h-48 overflow-auto rounded-lg border border-slate-800">
+                                            <div className="max-h-96 overflow-auto rounded-lg border border-slate-800">
                                               <table className="w-full text-left text-[11px] text-slate-300">
-                                                <thead className="bg-slate-900/80 text-slate-500">
+                                                <thead className="bg-slate-900/80 text-slate-500 sticky top-0">
                                                   <tr>
                                                     <th className="px-3 py-2">Package</th>
                                                     <th className="px-3 py-2">Status</th>
                                                     <th className="px-3 py-2">Score</th>
                                                     <th className="px-3 py-2">CVEs</th>
+                                                    <th className="px-3 py-2">Features</th>
                                                   </tr>
                                                 </thead>
                                                 <tbody>
                                                   {selectedHistoryJob.results.slice(0, 100).map((result) => (
-                                                    <tr key={result.id} className="border-t border-slate-800/60">
-                                                      <td className="px-3 py-1.5">{result.package_name}@{result.package_version}</td>
-                                                      <td className="px-3 py-1.5 uppercase">{result.malware_status}</td>
-                                                      <td className="px-3 py-1.5">{(result.risk_overall_score * 100).toFixed(0)}%</td>
-                                                      <td className="px-3 py-1.5">{result.advisory_references.length > 0 ? result.advisory_references.length : "-"}</td>
-                                                    </tr>
+                                                    <React.Fragment key={result.id}>
+                                                      <tr className="border-t border-slate-800/60">
+                                                        <td className="px-3 py-1.5">{result.package_name}@{result.package_version}</td>
+                                                        <td className="px-3 py-1.5 uppercase">{result.malware_status}</td>
+                                                        <td className="px-3 py-1.5">{(result.risk_overall_score * 100).toFixed(0)}%</td>
+                                                        <td className="px-3 py-1.5">{result.advisory_references.length > 0 ? result.advisory_references.length : "-"}</td>
+                                                        <td className="px-3 py-1.5">
+                                                          {result.static_features && Object.keys(result.static_features).length > 0 ? (
+                                                            <button
+                                                              type="button"
+                                                              onClick={() => setExpandedResultId(expandedResultId === result.id ? null : result.id)}
+                                                              className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
+                                                            >
+                                                              {expandedResultId === result.id ? "hide" : "view"}
+                                                            </button>
+                                                          ) : <span className="text-slate-600">—</span>}
+                                                        </td>
+                                                      </tr>
+                                                      {expandedResultId === result.id && result.static_features ? (
+                                                        <tr key={`${result.id}-features`} className="bg-slate-900/40">
+                                                          <td colSpan={5} className="px-3 pb-3 pt-1">
+                                                            <FeatureGrid features={result.static_features} />
+                                                          </td>
+                                                        </tr>
+                                                      ) : null}
+                                                    </React.Fragment>
                                                   ))}
                                                 </tbody>
                                               </table>

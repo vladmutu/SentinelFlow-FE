@@ -77,10 +77,10 @@ export function buildStaticFeaturesDisplay(features: StaticFeatures | null | und
     return null;
   }
 
-  const entropy = features.entropy ?? 0;
-  const obfuscationScore = features.obfuscation_score ?? 0;
-  const networkCalls = features.network_calls ?? 0;
-  const execCalls = features.exec_calls ?? 0;
+  const entropy = features.max_entropy ?? 0;
+  const obfuscationScore = features.obfuscation_index ?? 0;
+  const networkCalls = features.network_imports ?? 0;
+  const execCalls = features.exec_count ?? 0;
 
   return {
     entropy: {
@@ -97,12 +97,12 @@ export function buildStaticFeaturesDisplay(features: StaticFeatures | null | und
     networkCalls: {
       value: networkCalls,
       risk: networkCalls > 0 ? "warning" : "safe",
-      tooltip: "Network call ratio detected during static analysis",
+      tooltip: "Network imports detected during static analysis",
     },
     execCalls: {
       value: execCalls,
       risk: execCalls > 0 ? "warning" : "safe",
-      tooltip: "Exec/shell call ratio detected during static analysis",
+      tooltip: "exec() calls detected during static analysis",
     },
   };
 }
@@ -112,14 +112,15 @@ export function buildDynamicFindingsDisplay(findings: DynamicFinding | null | un
     return null;
   }
 
-  const networkConnections = findings.network_connections ?? [];
-  const fileWrites = findings.file_writes ?? [];
-  const execCalls = findings.exec_calls ?? [];
+  const networkConnections = findings.network_activity?.destinations ?? [];
+  const fileWrites = findings.filesystem_changes?.paths ?? [];
+  const execCalls = findings.ioc_detail?.process_iocs ?? [];
 
   const hasSuspiciousActivity =
     networkConnections.length > 0 ||
     fileWrites.length > 0 ||
-    execCalls.length > 0;
+    execCalls.length > 0 ||
+    findings.vm_evasion_observed === true;
 
   return {
     networkConnections,
@@ -286,8 +287,8 @@ export function formatScanModeDisplay(mode: ScanMode): string {
       return "Full";
     case "static_only":
       return "Static";
-    case "static_dynamic":
-      return "Static+Dynamic";
+    case "lightweight":
+      return "Lightweight";
     case "dynamic_only":
       return "Dynamic";
     default:
@@ -301,7 +302,7 @@ export function getScanModeColor(mode: ScanMode): string {
       return "blue";
     case "static_only":
       return "purple";
-    case "static_dynamic":
+    case "lightweight":
       return "teal";
     case "dynamic_only":
       return "orange";

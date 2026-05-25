@@ -5,7 +5,7 @@ export interface TyposquatInfo {
   confidence: number;
   levenshtein_distance: number | null;
   edit_distance: number | null;
-  normalized_conflict: string | null;
+  normalized_conflict: boolean;
   reasons: string[];
 }
 
@@ -140,7 +140,7 @@ function normalizeTyposquat(payload: unknown): TyposquatInfo {
       typeof record.edit_distance === "number" && Number.isFinite(record.edit_distance)
         ? record.edit_distance
         : null,
-    normalized_conflict: typeof record.normalized_conflict === "string" ? record.normalized_conflict : null,
+    normalized_conflict: record.normalized_conflict === true,
     reasons,
   };
 }

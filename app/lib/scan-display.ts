@@ -86,8 +86,8 @@ export function getScanModeLabel(mode: ScanMode): string {
       return "Full Scan";
     case "static_only":
       return "Static Only";
-    case "static_dynamic":
-      return "Static + Dynamic";
+    case "lightweight":
+      return "Lightweight (CVE + Reputation)";
     case "dynamic_only":
       return "Dynamic Only";
     default:
@@ -272,7 +272,10 @@ export function deriveScanDisplay(
   }
 
   // Running or pending
-  const primaryCountLabel = `${scanDetails.scanned_packages} / ${scanDetails.total_unique_packages} packages scanned`;
+  const primaryCountLabel =
+    isRunning && (scanDetails.total_unique_packages ?? 0) === 0
+      ? "Resolving dependencies…"
+      : `${scanDetails.scanned_packages ?? 0} / ${scanDetails.total_unique_packages ?? 0} packages scanned`;
   const secondaryCountLabel = scanDetails.total_dependency_nodes
     ? `${scanDetails.total_dependency_nodes} total dependency nodes`
     : null;

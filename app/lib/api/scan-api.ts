@@ -4,11 +4,11 @@ import { Ecosystem } from "@/app/types/dashboard";
 // TYPES - Scan Management
 // ============================================================================
 
-export type ScanMode = "full" | "static_only" | "static_dynamic" | "dynamic_only";
+export type ScanMode = "full" | "static_only" | "lightweight" | "dynamic_only";
 export type ScanStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type MalwareStatus = "clean" | "malicious" | "suspicious" | "error" | "unknown";
 export type RiskStatus = "clean" | "suspicious" | "malicious";
-export type AnalysisStatus = "completed" | "pending" | "failed" | "skipped";
+export type AnalysisStatus = string;
 export type AnalysisCoverage = "full" | "partial" | "none";
 
 export interface ScanTriggerRequest {
@@ -22,17 +22,29 @@ export interface ScanTriggerResponse {
   status: ScanStatus;
 }
 
-export interface StaticFeatures {
-  entropy?: number;
-  obfuscation_score?: number;
-  network_calls?: number;
-  exec_calls?: number;
-}
+export type StaticFeatures = Record<string, number>;
 
 export interface DynamicFinding {
-  network_connections?: string[];
-  file_writes?: string[];
-  exec_calls?: string[];
+  status?: string;
+  coverage?: string;
+  sandbox_provider?: string;
+  sandbox_job_id?: string;
+  sandbox_timed_out?: boolean;
+  vm_evasion_observed?: boolean;
+  syscall_trace?: { suspicious_count?: number; categories?: string[] } | null;
+  network_activity?: { outbound_connections?: number; destinations?: string[] } | null;
+  filesystem_changes?: { sensitive_path_writes?: number; paths?: string[] } | null;
+  ioc_detail?: {
+    verdict?: string;
+    dynamic_hit?: boolean;
+    network_iocs?: string[];
+    process_iocs?: string[];
+    file_iocs?: string[];
+    dns_iocs?: string[];
+    crypto_iocs?: string[];
+    raw_line_count?: number;
+    flagged_lines?: string[];
+  } | null;
 }
 
 export interface ScanResultResponse {
@@ -169,26 +181,35 @@ export interface SbomLicense {
   url?: string | null;
 }
 
+export interface SbomVulnerability {
+  id: string;
+  source: string | null;
+  severity: number | null;
+  description: string | null;
+}
+
 export interface SbomComponent {
   name: string;
   version: string;
   ecosystem: Ecosystem;
   purl: string;
   licenses: SbomLicense[];
-  vulnerabilities: Array<{ id: string; severity: string }>;
-  risk_status: RiskStatus;
-  risk_score: number;
+  vulnerabilities: SbomVulnerability[];
+  risk_status: string | null;
+  risk_score: number | null;
   is_direct: boolean;
   sha256?: string | null;
 }
 
+export interface SbomToolInfo {
+  vendor: string;
+  name: string;
+  version: string;
+}
+
 export interface SbomMetadata {
   timestamp: string;
-  tool: {
-    vendor: string;
-    name: string;
-    version: string;
-  };
+  tool: SbomToolInfo;
   repository_owner: string;
   repository_name: string;
   ecosystem: Ecosystem;
@@ -264,24 +285,34 @@ function normalizeScanResult(payload: unknown): ScanResultResponse {
     ? (record.dynamic_findings as Record<string, unknown>)
     : null;
 
-  const normalizedStaticFeatures: StaticFeatures | null = staticFeatures ? {
-    entropy: typeof staticFeatures.entropy === "number" ? staticFeatures.entropy : undefined,
-    obfuscation_score: typeof staticFeatures.obfuscation_score === "number" ? staticFeatures.obfuscation_score : undefined,
-    network_calls: typeof staticFeatures.network_calls === "number" ? staticFeatures.network_calls : undefined,
-    exec_calls: typeof staticFeatures.exec_calls === "number" ? staticFeatures.exec_calls : undefined,
-  } : null;
+  const normalizedStaticFeatures: StaticFeatures | null = staticFeatures
+    ? (Object.fromEntries(
+        Object.entries(staticFeatures).filter(([, v]) => typeof v === "number")
+      ) as StaticFeatures)
+    : null;
 
-  const normalizedDynamicFindings: DynamicFinding | null = dynamicFindings ? {
-    network_connections: Array.isArray(dynamicFindings.network_connections)
-      ? dynamicFindings.network_connections.filter((x): x is string => typeof x === "string")
-      : undefined,
-    file_writes: Array.isArray(dynamicFindings.file_writes)
-      ? dynamicFindings.file_writes.filter((x): x is string => typeof x === "string")
-      : undefined,
-    exec_calls: Array.isArray(dynamicFindings.exec_calls)
-      ? dynamicFindings.exec_calls.filter((x): x is string => typeof x === "string")
-      : undefined,
-  } : null;
+  const normalizedDynamicFindings: DynamicFinding | null = dynamicFindings
+    ? {
+        status: typeof dynamicFindings.status === "string" ? dynamicFindings.status : undefined,
+        coverage: typeof dynamicFindings.coverage === "string" ? dynamicFindings.coverage : undefined,
+        sandbox_provider: typeof dynamicFindings.sandbox_provider === "string" ? dynamicFindings.sandbox_provider : undefined,
+        sandbox_job_id: typeof dynamicFindings.sandbox_job_id === "string" ? dynamicFindings.sandbox_job_id : undefined,
+        sandbox_timed_out: typeof dynamicFindings.sandbox_timed_out === "boolean" ? dynamicFindings.sandbox_timed_out : undefined,
+        vm_evasion_observed: typeof dynamicFindings.vm_evasion_observed === "boolean" ? dynamicFindings.vm_evasion_observed : undefined,
+        syscall_trace: dynamicFindings.syscall_trace && typeof dynamicFindings.syscall_trace === "object"
+          ? dynamicFindings.syscall_trace as DynamicFinding["syscall_trace"]
+          : null,
+        network_activity: dynamicFindings.network_activity && typeof dynamicFindings.network_activity === "object"
+          ? dynamicFindings.network_activity as DynamicFinding["network_activity"]
+          : null,
+        filesystem_changes: dynamicFindings.filesystem_changes && typeof dynamicFindings.filesystem_changes === "object"
+          ? dynamicFindings.filesystem_changes as DynamicFinding["filesystem_changes"]
+          : null,
+        ioc_detail: dynamicFindings.ioc_detail && typeof dynamicFindings.ioc_detail === "object"
+          ? dynamicFindings.ioc_detail as DynamicFinding["ioc_detail"]
+          : null,
+      }
+    : null;
 
   return {
     id: typeof record.id === "string" ? record.id : "",
@@ -307,9 +338,9 @@ function normalizeScanResult(payload: unknown): ScanResultResponse {
     advisory_references: advisoryRefs,
     static_features: normalizedStaticFeatures,
     dynamic_findings: normalizedDynamicFindings,
-    analysis_status: (["completed", "pending", "failed", "skipped"].includes(String(record.analysis_status))
+    analysis_status: (typeof record.analysis_status === "string" && record.analysis_status.length > 0
       ? record.analysis_status
-      : "pending") as AnalysisStatus,
+      : "unknown") as AnalysisStatus,
     analysis_coverage: (["full", "partial", "none"].includes(String(record.analysis_coverage))
       ? record.analysis_coverage
       : null) as AnalysisCoverage | null,
@@ -327,7 +358,7 @@ function normalizeScanJob(payload: unknown): ScanJobResponse {
     owner: typeof record.owner === "string" ? record.owner : "",
     repo_name: typeof record.repo_name === "string" ? record.repo_name : "",
     ecosystem: (record.ecosystem === "npm" || record.ecosystem === "pypi") ? record.ecosystem : "npm",
-    scan_mode: (["full", "static_only", "static_dynamic", "dynamic_only"].includes(String(record.scan_mode))
+    scan_mode: (["full", "static_only", "lightweight", "dynamic_only"].includes(String(record.scan_mode))
       ? record.scan_mode
       : "full") as ScanMode,
     status: (["pending", "running", "completed", "failed", "cancelled"].includes(String(record.status))
@@ -634,7 +665,7 @@ export async function getScanHistory(
       return {
         id: typeof entry.id === "string" ? entry.id : "",
         ecosystem: (entry.ecosystem === "npm" || entry.ecosystem === "pypi") ? entry.ecosystem : "npm",
-        scan_mode: (["full", "static_only", "static_dynamic", "dynamic_only"].includes(String(entry.scan_mode))
+        scan_mode: (["full", "static_only", "lightweight", "dynamic_only"].includes(String(entry.scan_mode))
           ? entry.scan_mode
           : "full") as ScanMode,
         status: (["pending", "running", "completed", "failed", "cancelled"].includes(String(entry.status))

@@ -28,11 +28,13 @@ interface DependencyTreeProps {
   selectedPackageLabels?: string[];
   selectionEnabled?: boolean;
   onPackageToggleSelect?: (packageLabel: string) => void;
+  onNodeFeatureDetail?: (label: string, features: Record<string, number> | null) => void;
 }
 
 type ScanResultMapEntry = {
   malware_status?: string;
   malware_score?: number | null;
+  static_features?: Record<string, number> | null;
 };
 
 type GraphNodeData = {
@@ -44,6 +46,7 @@ type GraphNodeData = {
   expanded: boolean;
   hiddenChildrenCount: number;
   selected: boolean;
+  staticFeatures: Record<string, number> | null;
 };
 
 type GraphNodeRecord = {
@@ -284,6 +287,7 @@ function materializeVisibleGraph(
         expanded: compactMode ? expanded : true,
         hiddenChildrenCount: compactMode && !expanded ? record.childrenIds.length : 0,
         selected: false,
+        staticFeatures: match?.static_features ?? null,
       },
     });
 
@@ -356,6 +360,7 @@ export function DependencyTree({
   selectedPackageLabels = [],
   selectionEnabled = false,
   onPackageToggleSelect,
+  onNodeFeatureDetail,
 }: DependencyTreeProps) {
   const selectedLabelSet = useMemo(() => new Set(selectedPackageLabels), [selectedPackageLabels]);
   const filtered = useMemo(() => nodes.filter((node) => node.ecosystem === ecosystem), [nodes, ecosystem]);
@@ -452,6 +457,10 @@ export function DependencyTree({
         onPackageToggleSelect(nodeData.label);
       }
 
+      if (onNodeFeatureDetail && typeof nodeData.label === "string") {
+        onNodeFeatureDetail(nodeData.label, nodeData.staticFeatures ?? null);
+      }
+
       if (!largeGraphMode || nodeData.hasChildren !== true) {
         return;
       }
@@ -468,7 +477,7 @@ export function DependencyTree({
         return next;
       });
     },
-    [largeGraphMode, onPackageToggleSelect, selectionEnabled],
+    [largeGraphMode, onNodeFeatureDetail, onPackageToggleSelect, selectionEnabled],
   );
 
   return (
