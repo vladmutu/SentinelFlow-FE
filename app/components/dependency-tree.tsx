@@ -34,6 +34,8 @@ interface DependencyTreeProps {
 type ScanResultMapEntry = {
   malware_status?: string;
   malware_score?: number | null;
+  risk_overall_status?: string | null;
+  risk_overall_score?: number | null;
   static_features?: Record<string, number> | null;
 };
 
@@ -101,7 +103,7 @@ function buildScanSignature(scanResultsMap: Record<string, ScanResultMapEntry>):
     .sort()
     .map((key) => {
       const entry = scanResultsMap[key] ?? {};
-      return `${key}:${entry.malware_status ?? "unknown"}:${entry.malware_score ?? "null"}`;
+      return `${key}:${entry.risk_overall_status ?? entry.malware_status ?? "unknown"}:${entry.risk_overall_score ?? entry.malware_score ?? "null"}`;
     });
 
   return hashString(parts.join("|"));
@@ -144,35 +146,43 @@ function CustomNodeView({ data }: NodeProps) {
   const appearance =
     malwareStatus === "malicious"
       ? {
+          borderWidthClass: "border-2",
           borderClass: "border-rose-300/65",
           glow: "shadow-[0_0_36px_-10px_rgba(251,113,133,0.92)]",
           badgeClass: "border border-rose-300/50 bg-rose-500/20 text-rose-100",
+          backgroundClass: "bg-gradient-to-br from-slate-900/95 to-slate-800/90",
           label: "Malicious",
         }
       : malwareStatus === "suspicious"
         ? {
+            borderWidthClass: "border-2",
             borderClass: "border-amber-300/65",
             glow: "shadow-[0_0_36px_-10px_rgba(251,191,36,0.82)]",
             badgeClass: "border border-amber-300/50 bg-amber-500/20 text-amber-100",
+            backgroundClass: "bg-gradient-to-br from-slate-900/95 to-slate-800/90",
             label: "Suspicious",
           }
         : malwareStatus === "clean" || malwareStatus === "benign"
           ? {
-              borderClass: "border-emerald-300/55",
-              glow: "shadow-[0_0_32px_-10px_rgba(52,211,153,0.82)]",
-              badgeClass: "border border-emerald-300/40 bg-emerald-500/15 text-emerald-100",
+              borderWidthClass: "border-2",
+              borderClass: "border-emerald-200/90",
+              glow: "shadow-[0_0_30px_-10px_rgba(52,211,153,0.90)]",
+              badgeClass: "border border-emerald-200/50 bg-emerald-500/18 text-emerald-100",
+              backgroundClass: "bg-gradient-to-br from-emerald-950/95 via-slate-900/95 to-slate-800/90",
               label: "Clean",
             }
           : {
-              borderClass: "border-cyan-300/45",
-              glow: "shadow-[0_0_34px_-10px_rgba(45,212,191,0.95)]",
-              badgeClass: "border border-slate-400/35 bg-slate-500/15 text-slate-100",
+              borderWidthClass: "border-2 border-dashed",
+              borderClass: "border-slate-500/80",
+              glow: "shadow-[0_0_20px_-12px_rgba(148,163,184,0.55)]",
+              badgeClass: "border border-slate-500/55 bg-slate-600/20 text-slate-200",
+              backgroundClass: "bg-gradient-to-br from-slate-950/96 to-slate-900/92",
               label: "Not Scanned",
             };
 
   const containerClassName = compact
-    ? `relative min-w-[280px] rounded-xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-4 py-4 ${appearance.borderClass} ${selected ? "ring-2 ring-cyan-300/80 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]" : ""}`
-    : `relative min-w-[400px] rounded-2xl border bg-gradient-to-br from-slate-900/95 to-slate-800/90 px-6 py-5 ${appearance.borderClass} ${appearance.glow} ${selected ? "ring-2 ring-cyan-300/80 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]" : ""}`;
+    ? `relative min-w-[280px] rounded-xl border ${appearance.backgroundClass} px-4 py-4 ${appearance.borderWidthClass} ${appearance.borderClass} ${selected ? "ring-2 ring-cyan-300/80 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]" : ""}`
+    : `relative min-w-[400px] rounded-2xl border ${appearance.backgroundClass} px-6 py-5 ${appearance.borderWidthClass} ${appearance.borderClass} ${appearance.glow} ${selected ? "ring-2 ring-cyan-300/80 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]" : ""}`;
 
   return (
     <div className={containerClassName}>
@@ -273,6 +283,8 @@ function materializeVisibleGraph(
     const match = scanResultsMap[record.label];
     const hasChildren = record.childrenIds.length > 0;
     const expanded = !compactMode || expandedNodeIds.has(nodeId);
+    const effectiveStatus = match?.risk_overall_status ?? match?.malware_status ?? "unknown";
+    const effectiveScore = match?.risk_overall_score ?? match?.malware_score ?? null;
 
     nodes.push({
       id: nodeId,
@@ -280,8 +292,8 @@ function materializeVisibleGraph(
       position: { x: 0, y: 0 },
       data: {
         label: `${packageName}@${version}`,
-        malwareStatus: match?.malware_status ?? "unknown",
-        malwareScore: match?.malware_score ?? null,
+        malwareStatus: effectiveStatus,
+        malwareScore: effectiveScore,
         compact: compactMode,
         hasChildren,
         expanded: compactMode ? expanded : true,

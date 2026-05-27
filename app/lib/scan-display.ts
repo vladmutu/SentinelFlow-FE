@@ -86,6 +86,8 @@ export function getScanModeLabel(mode: ScanMode): string {
       return "Full Scan";
     case "static_only":
       return "Static Only";
+    case "static_classifier":
+      return "Static Analysis";
     case "lightweight":
       return "Lightweight (CVE + Reputation)";
     case "dynamic_only":
@@ -103,7 +105,7 @@ export function getMalwareStatusDisplay(status: MalwareStatus): {
   switch (status) {
     case "clean":
       return {
-        label: "Clean",
+        label: "Benign",
         color: "emerald",
         icon: "✅",
       };
@@ -144,7 +146,7 @@ export function getRiskStatusDisplay(status: RiskStatus): {
   switch (status) {
     case "clean":
       return {
-        label: "Clean",
+        label: "Benign",
         color: "emerald",
         bgColor: "emerald-500/15",
         borderColor: "emerald-400/50",
@@ -226,7 +228,7 @@ export function deriveScanDisplay(
   const phase = scanDetails.status as "pending" | "running" | "completed" | "failed" | "cancelled";
   const progressPercent = Math.max(0, Math.min(100, scanDetails.progress_percent || 0));
   const progressLabel = `${Math.round(progressPercent)}%`;
-  const elapsedLabel = formatDuration(scanDetails.elapsed_seconds);
+  const elapsedLabel = formatDuration(scanDetails.elapsed_seconds ?? 0);
 
   if (scanDetails.status === "completed") {
     const completedLabel = `${scanDetails.scanned_packages} / ${scanDetails.total_unique_packages} packages scanned`;
@@ -272,10 +274,17 @@ export function deriveScanDisplay(
   }
 
   // Running or pending
+  const resultsAlreadyArrived = (scanDetails.results?.length ?? 0) > 0;
+  const effectiveScanned = Math.max(
+    scanDetails.scanned_packages ?? 0,
+    scanDetails.results?.length ?? 0,
+  );
   const primaryCountLabel =
     isRunning && (scanDetails.total_unique_packages ?? 0) === 0
-      ? "Resolving dependencies…"
-      : `${scanDetails.scanned_packages ?? 0} / ${scanDetails.total_unique_packages ?? 0} packages scanned`;
+      ? resultsAlreadyArrived
+        ? `${effectiveScanned} packages scanned…`
+        : "Resolving dependencies…"
+      : `${effectiveScanned} / ${scanDetails.total_unique_packages ?? 0} packages scanned`;
   const secondaryCountLabel = scanDetails.total_dependency_nodes
     ? `${scanDetails.total_dependency_nodes} total dependency nodes`
     : null;

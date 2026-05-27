@@ -4,7 +4,7 @@ import { Ecosystem } from "@/app/types/dashboard";
 // TYPES - Scan Management
 // ============================================================================
 
-export type ScanMode = "full" | "static_only" | "lightweight" | "dynamic_only";
+export type ScanMode = "full" | "static_only" | "static_classifier" | "lightweight" | "lightweight_cve" | "lightweight_librariesio" | "dynamic_only";
 export type ScanStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type MalwareStatus = "clean" | "malicious" | "suspicious" | "error" | "unknown";
 export type RiskStatus = "clean" | "suspicious" | "malicious";
@@ -47,6 +47,21 @@ export interface DynamicFinding {
   } | null;
 }
 
+export interface VulnerabilityDetail {
+  advisory_id: string;
+  source: string;
+  value?: number | null;
+  details?: string | null;
+  aliases?: string[];
+  references?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export type LookupStatus = {
+  cve?: "ok" | "error" | "skipped";
+  librariesio?: "found" | "not_found" | "error" | "skipped";
+};
+
 export interface ScanResultResponse {
   id: string;
   package_name: string;
@@ -70,6 +85,9 @@ export interface ScanResultResponse {
   advisory_references: string[];
   static_features?: StaticFeatures | null;
   dynamic_findings?: DynamicFinding | null;
+  vulnerability_details?: VulnerabilityDetail[] | null;
+  reputation_metadata?: Record<string, unknown> | null;
+  lookup_status?: LookupStatus | null;
 }
 
 export interface ScanJobResponse {
@@ -314,6 +332,18 @@ function normalizeScanResult(payload: unknown): ScanResultResponse {
       }
     : null;
 
+  const vulnerabilityDetails = Array.isArray(record.vulnerability_details)
+    ? (record.vulnerability_details as VulnerabilityDetail[])
+    : null;
+
+  const reputationMetadata = record.reputation_metadata && typeof record.reputation_metadata === "object"
+    ? (record.reputation_metadata as Record<string, unknown>)
+    : null;
+
+  const lookupStatus = record.lookup_status && typeof record.lookup_status === "object"
+    ? (record.lookup_status as LookupStatus)
+    : null;
+
   return {
     id: typeof record.id === "string" ? record.id : "",
     package_name: typeof record.package_name === "string" ? record.package_name : "",
@@ -338,6 +368,9 @@ function normalizeScanResult(payload: unknown): ScanResultResponse {
     advisory_references: advisoryRefs,
     static_features: normalizedStaticFeatures,
     dynamic_findings: normalizedDynamicFindings,
+    vulnerability_details: vulnerabilityDetails,
+    reputation_metadata: reputationMetadata,
+    lookup_status: lookupStatus,
     analysis_status: (typeof record.analysis_status === "string" && record.analysis_status.length > 0
       ? record.analysis_status
       : "unknown") as AnalysisStatus,
@@ -358,7 +391,7 @@ function normalizeScanJob(payload: unknown): ScanJobResponse {
     owner: typeof record.owner === "string" ? record.owner : "",
     repo_name: typeof record.repo_name === "string" ? record.repo_name : "",
     ecosystem: (record.ecosystem === "npm" || record.ecosystem === "pypi") ? record.ecosystem : "npm",
-    scan_mode: (["full", "static_only", "lightweight", "dynamic_only"].includes(String(record.scan_mode))
+    scan_mode: (["full", "static_only", "static_classifier", "lightweight", "lightweight_cve", "lightweight_librariesio", "dynamic_only"].includes(String(record.scan_mode))
       ? record.scan_mode
       : "full") as ScanMode,
     status: (["pending", "running", "completed", "failed", "cancelled"].includes(String(record.status))
@@ -665,7 +698,7 @@ export async function getScanHistory(
       return {
         id: typeof entry.id === "string" ? entry.id : "",
         ecosystem: (entry.ecosystem === "npm" || entry.ecosystem === "pypi") ? entry.ecosystem : "npm",
-        scan_mode: (["full", "static_only", "lightweight", "dynamic_only"].includes(String(entry.scan_mode))
+        scan_mode: (["full", "static_only", "static_classifier", "lightweight", "lightweight_cve", "lightweight_librariesio", "dynamic_only"].includes(String(entry.scan_mode))
           ? entry.scan_mode
           : "full") as ScanMode,
         status: (["pending", "running", "completed", "failed", "cancelled"].includes(String(entry.status))

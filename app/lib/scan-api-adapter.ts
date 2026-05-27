@@ -208,6 +208,8 @@ export function getScanModeColor(scanMode: string): string {
       return "blue";
     case "static_only":
       return "purple";
+    case "static_classifier":
+      return "purple";
     case "static_dynamic":
       return "teal";
     case "dynamic_only":
@@ -226,6 +228,8 @@ export function formatScanModeLabel(scanMode: string): string {
       return "Full Scan";
     case "static_only":
       return "Static Analysis Only";
+    case "static_classifier":
+      return "Static Analysis";
     case "static_dynamic":
       return "Static + Dynamic";
     case "dynamic_only":

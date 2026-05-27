@@ -6,7 +6,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanJobResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanApiError, ScanJobResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -39,9 +39,14 @@ type UserPayload = {
 type ScanResultMapEntry = {
   malware_status?: string;
   malware_score?: number | null;
+  risk_overall_status?: string | null;
+  risk_overall_score?: number | null;
   scan_timestamp?: string | null;
   scanner_version?: string | null;
   static_features?: Record<string, number> | null;
+  vulnerability_details?: VulnerabilityDetail[] | null;
+  reputation_metadata?: Record<string, unknown> | null;
+  lookup_status?: LookupStatus | null;
 };
 
 type ScanResultRow = {
@@ -135,6 +140,26 @@ function coerceString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function formatVerdict(status: string | null | undefined): string {
+  switch ((status ?? "").toLowerCase()) {
+    case "clean":      return "Benign";
+    case "benign":     return "Benign";
+    case "suspicious": return "Suspicious";
+    case "malicious":  return "Malicious";
+    case "error":      return "Error";
+    default:           return "—";
+  }
+}
+
+function verdictBadgeClass(status: string | null | undefined): string {
+  switch ((status ?? "").toLowerCase()) {
+    case "malicious":          return "border-rose-400/50 bg-rose-500/15 text-rose-200";
+    case "suspicious":         return "border-amber-400/50 bg-amber-500/15 text-amber-200";
+    case "clean": case "benign": return "border-emerald-400/50 bg-emerald-500/15 text-emerald-200";
+    default:                   return "border-slate-600 bg-slate-800/60 text-slate-400";
+  }
+}
+
 function buildResultDedupKey(row: ScanResultRow): string {
   return `${row.packageName}|${row.version}|${row.scanTimestamp ?? "-"}|${row.status}|${row.errorMessage ?? "-"}`;
 }
@@ -145,6 +170,8 @@ function normalizeResultMapFromRows(rows: ScanResultRow[]): Record<string, ScanR
     accumulator[key] = {
       malware_status: row.malwareStatus,
       malware_score: row.malwareScore,
+      risk_overall_status: row.riskStatus ?? row.malwareStatus,
+      risk_overall_score: row.riskScore ?? row.malwareScore,
     };
     return accumulator;
   }, {});
@@ -222,6 +249,8 @@ function normalizeScanResultsPayload(payload: unknown): {
         legacyMap[key] = {
           malware_status: malwareStatus,
           malware_score: malwareScore,
+          risk_overall_status: coerceString(entryRecord.risk_overall_status),
+          risk_overall_score: coerceNonNegativeNumber(entryRecord.risk_overall_score),
           scan_timestamp: coerceString(entryRecord.scan_timestamp),
           scanner_version: coerceString(entryRecord.scanner_version),
         };
@@ -487,6 +516,25 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
+function lookupStatusChipClass(status: string): string {
+  if (status === "ok" || status === "found") return "border-emerald-400/40 bg-emerald-500/10 text-emerald-200";
+  if (status === "error") return "border-rose-400/40 bg-rose-500/10 text-rose-200";
+  if (status === "not_found") return "border-amber-400/40 bg-amber-500/10 text-amber-200";
+  return "border-slate-600 bg-slate-800/60 text-slate-400";
+}
+
+function lookupStatusLabel(source: string, status: string): string {
+  if (source === "cve") {
+    if (status === "ok") return "CVE: ok";
+    if (status === "error") return "CVE: error";
+    return "CVE: skipped";
+  }
+  if (status === "found") return "Libraries.io: found";
+  if (status === "not_found") return "Libraries.io: not indexed";
+  if (status === "error") return "Libraries.io: error";
+  return "Libraries.io: skipped";
+}
+
 function FeatureGrid({ features }: { features: Record<string, number> | null }) {
   if (!features) return null;
   const entries = Object.entries(features).filter(([, v]) => v !== null && v !== undefined);
@@ -548,7 +596,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<ScanJobResponse | null>(null);
   const [isHistoryJobLoading, setIsHistoryJobLoading] = useState(false);
   const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
-  const [graphDetailNode, setGraphDetailNode] = useState<{ label: string; features: Record<string, number> | null } | null>(null);
+  const [expandedStaticResultId, setExpandedStaticResultId] = useState<string | null>(null);
+  const [expandedDynamicRowId, setExpandedDynamicRowId] = useState<string | null>(null);
+  const [graphDetailNode, setGraphDetailNode] = useState<{ label: string; features: Record<string, number> | null; scanEntry: ScanResultMapEntry | null } | null>(null);
+  // Lightweight scan tab
+  const [lightweightScope, setLightweightScope] = useState<"partial" | "full">("partial");
+  const [lightweightSelectedPackages, setLightweightSelectedPackages] = useState<string[]>([]);
+  const [lightweightPackageSearch, setLightweightPackageSearch] = useState("");
+  const [lightweightSources, setLightweightSources] = useState({ cve: true, librariesio: true });
+  const [lightweightJob, setLightweightJob] = useState<ScanJobResponse | null>(null);
+  const [isLightweightRunning, setIsLightweightRunning] = useState(false);
+  const [lightweightError, setLightweightError] = useState<string | null>(null);
+  const [lightweightExpandedId, setLightweightExpandedId] = useState<string | null>(null);
+  const lightweightPollTimerRef = useRef<number | null>(null);
   // SBOM
   const [sbomDocument, setSbomDocument] = useState<SbomDocument | null>(null);
   const [isSbomLoading, setIsSbomLoading] = useState(false);
@@ -559,9 +619,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [isPackageDetailsLoading, setIsPackageDetailsLoading] = useState(false);
   const [packageDetailsVersions, setPackageDetailsVersions] = useState<string[]>([]);
   const [packageDetailsLatestVersion, setPackageDetailsLatestVersion] = useState<string | null>(null);
-  const [packageDetailsScanEntry, setPackageDetailsScanEntry] = useState<{ advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null>; dynamic_findings?: DynamicFinding | null; analyzed_by?: string[]; risk_assessment?: Record<string, unknown> } | null>(null);
+  const [packageDetailsScanEntry, setPackageDetailsScanEntry] = useState<{ advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null>; dynamic_findings?: DynamicFinding | null; analyzed_by?: string[]; risk_assessment?: Record<string, unknown>; vulnerability_details?: VulnerabilityDetail[] | null; reputation_metadata?: Record<string, unknown> | null; lookup_status?: LookupStatus | null } | null>(null);
   // Scan mode
-  const [activeScanMode, setActiveScanMode] = useState<"full" | "static_only" | "lightweight" | "dynamic_only">("full");
+  const [activeScanMode, setActiveScanMode] = useState<ScanMode>("full");
   const isMountedRef = useRef(true);
   const scanPollTimerRef = useRef<number | null>(null);
   const elapsedTickerRef = useRef<number | null>(null);
@@ -635,6 +695,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const sections = [
     { key: "graph", label: "Dependency Graph" },
     { key: "static-analysis", label: "Static Analysis" },
+    { key: "lightweight", label: "Lightweight Scan" },
     { key: "dynamic-analysis", label: "Dynamic Analysis" },
     { key: "details", label: "Package Details" },
     { key: "sbom", label: "SBOM" },
@@ -652,6 +713,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       }
       if (elapsedTickerRef.current !== null) {
         window.clearInterval(elapsedTickerRef.current);
+      }
+      if (lightweightPollTimerRef.current !== null) {
+        window.clearTimeout(lightweightPollTimerRef.current);
       }
     };
   }, []);
@@ -706,7 +770,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   }, [decodedId]);
 
   useEffect(() => {
-    if (!isScanRunning || !scanDetails?.started_at) {
+    if (!isScanRunning) {
       if (elapsedTickerRef.current !== null) {
         window.clearInterval(elapsedTickerRef.current);
         elapsedTickerRef.current = null;
@@ -714,7 +778,10 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       return;
     }
 
-    setLiveElapsedSeconds(scanDetails ? normalizeLiveElapsedSeconds(scanDetails as ScanJobResponse) : 0);
+    // Sync to server-reported elapsed time whenever started_at is available.
+    if (scanDetails?.started_at) {
+      setLiveElapsedSeconds(normalizeLiveElapsedSeconds(scanDetails as ScanJobResponse));
+    }
 
     if (elapsedTickerRef.current !== null) {
       window.clearInterval(elapsedTickerRef.current);
@@ -730,7 +797,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         elapsedTickerRef.current = null;
       }
     };
-  }, [isScanRunning, scanDetails?.started_at, scanDetails?.elapsed_seconds]);
+  }, [isScanRunning, scanDetails?.started_at]);
 
   const appendLiveResultRows = useCallback((incomingRows: ScanResultRow[]) => {
     if (incomingRows.length === 0) {
@@ -1050,7 +1117,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setScanDetails(payload);
         setScanStatus(statusValue);
         setScanProgress(computeScanProgress(payload, phase, 0));
-        setLiveElapsedSeconds(normalizeLiveElapsedSeconds(payload));
+        if (payload.started_at) {
+          setLiveElapsedSeconds(normalizeLiveElapsedSeconds(payload));
+        }
 
         if (Array.isArray(payload.results)) {
           const liveResults = normalizeScanResultsPayload({ results: payload.results });
@@ -1154,12 +1223,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     [appendLiveResultRows, loadLatestScanResults],
   );
 
-  const triggerPackageScan = useCallback(async () => {
+  const triggerPackageScan = useCallback(async (overrideScanMode?: ScanMode) => {
     setScanError(null);
     setIsScanRunning(true);
     setScanStatus("pending");
     setScanProgress(0);
     setLiveElapsedSeconds(0);
+    // Clear any previous job details immediately so the timer doesn't inherit
+    // the previous job's `started_at` while we resolve repository coordinates.
+    setScanDetails(null);
     setScanResultRows([]);
     setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
@@ -1170,7 +1242,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const token = clientSessionStorage.readToken();
       const scanResultsCacheKey = token ? buildScanResultsCacheKey(token, owner, repoName) : null;
       const selectedPackagesPayload = isPartialScan ? selectedScanPackages : undefined;
-      const triggerBody: Record<string, unknown> = { ecosystem, scan_mode: activeScanMode };
+      const scanMode: ScanMode = overrideScanMode ?? activeScanMode;
+      const triggerBody: Record<string, unknown> = { ecosystem, scan_mode: scanMode };
 
       if (selectedPackagesPayload && selectedPackagesPayload.length > 0) {
         triggerBody.selected_packages = selectedPackagesPayload;
@@ -1187,7 +1260,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
       const triggerPayload = await triggerScan(scanContext, {
         ecosystem,
-        scan_mode: activeScanMode,
+        scan_mode: scanMode,
         selected_packages: isPartialScan && selectedScanPackages.length > 0 ? selectedScanPackages : undefined,
       });
 
@@ -1209,7 +1282,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       }, SCAN_POLL_INTERVAL_MS);
 
     } catch (scanError) {
-      const message = scanError instanceof Error ? scanError.message : "Unexpected error while running package scan.";
+      const is409 = scanError instanceof ScanApiError && scanError.status === 409;
+      const message = is409
+        ? "A scan is already in progress for this repository. Please wait or cancel it first."
+        : scanError instanceof Error
+          ? scanError.message
+          : "Unexpected error while running package scan.";
       setScanError(message);
       setScanStatus("failed");
       setHasScanned(false);
@@ -1220,7 +1298,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages, activeScanMode]);
 
-  const triggerPartialAnalysisScan = useCallback(async () => {
+  const triggerPartialAnalysisScan = useCallback(async (scanMode: ScanMode = "static_classifier") => {
     if (selectedAnalysisPackages.length === 0 || isScanRunning) {
       return;
     }
@@ -1229,6 +1307,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     setScanStatus("pending");
     setScanProgress(0);
     setLiveElapsedSeconds(0);
+    // Clear previous scan details immediately to avoid showing stale elapsed time
+    // from a prior job before the new job's metadata is available.
+    setScanDetails(null);
     setScanResultRows([]);
     setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
@@ -1250,7 +1331,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
       const triggerPayload = await triggerScan(scanContext, {
         ecosystem,
-        scan_mode: "static_only",
+        scan_mode: scanMode,
         selected_packages: selectedAnalysisPackages,
       });
 
@@ -1272,7 +1353,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       }, SCAN_POLL_INTERVAL_MS);
 
     } catch (scanError) {
-      const message = scanError instanceof Error ? scanError.message : "Unexpected error while running package scan.";
+      const is409 = scanError instanceof ScanApiError && scanError.status === 409;
+      const message = is409
+        ? "A scan is already in progress for this repository. Please wait or cancel it first."
+        : scanError instanceof Error
+          ? scanError.message
+          : "Unexpected error while running package scan.";
       setScanError(message);
       setScanStatus("failed");
       setHasScanned(false);
@@ -1281,7 +1367,64 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setIsScanRunning(false);
       }
     }
-  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages, isScanRunning, activeScanMode]);
+  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages, isScanRunning]);
+
+  const triggerLightweightScan = useCallback(async () => {
+    setLightweightError(null);
+    setLightweightJob(null);
+    setIsLightweightRunning(true);
+    if (lightweightPollTimerRef.current !== null) {
+      window.clearTimeout(lightweightPollTimerRef.current);
+    }
+
+    try {
+      const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
+      const scanCtx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+
+      const lwScanMode: ScanMode =
+        lightweightSources.cve && lightweightSources.librariesio
+          ? "lightweight"
+          : lightweightSources.cve
+            ? "lightweight_cve"
+            : "lightweight_librariesio";
+
+      const triggerPayload = await triggerScan(scanCtx, {
+        ecosystem,
+        scan_mode: lwScanMode,
+        selected_packages:
+          lightweightScope === "partial" && lightweightSelectedPackages.length > 0
+            ? lightweightSelectedPackages
+            : undefined,
+      });
+
+      if (!triggerPayload.job_id) {
+        throw new Error("Scan trigger did not return a job id.");
+      }
+
+      const poll = async () => {
+        try {
+          const job = await apiPollScanJob(scanCtx, triggerPayload.job_id);
+          if (!isMountedRef.current) return;
+          setLightweightJob(job);
+          if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+            setIsLightweightRunning(false);
+            // loadScanHistory is declared after triggerLightweightScan — safe to call directly
+            void loadScanHistory();
+          } else {
+            lightweightPollTimerRef.current = window.setTimeout(() => { void poll(); }, 2000);
+          }
+        } catch (err) {
+          if (!isMountedRef.current) return;
+          setLightweightError(err instanceof Error ? err.message : "Polling failed.");
+          setIsLightweightRunning(false);
+        }
+      };
+      void poll();
+    } catch (err) {
+      setLightweightError(err instanceof Error ? err.message : "Failed to start lightweight scan.");
+      setIsLightweightRunning(false);
+    }
+  }, [lightweightScope, lightweightSelectedPackages, lightweightSources, resolveRepoCoordinates]);
 
   const cancelScanJob = useCallback(async () => {
     if (!scanJobId || isCancellingScan) {
@@ -1425,6 +1568,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSection, decodedId]);
 
+  // When history refreshes and the currently-selected job transitions from running→done, re-fetch its details.
+  useEffect(() => {
+    if (!selectedHistoryJobId || !selectedHistoryJob) return;
+    const updatedJob = scanHistoryJobs.find((j) => j.id === selectedHistoryJobId);
+    if (!updatedJob) return;
+    const wasInProgress = selectedHistoryJob.status === "running" || selectedHistoryJob.status === "pending";
+    const isNowDone = updatedJob.status === "completed" || updatedJob.status === "failed" || updatedJob.status === "cancelled";
+    if (wasInProgress && isNowDone) {
+      void loadHistoryJobDetails(selectedHistoryJobId);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scanHistoryJobs]);
+
   useEffect(() => {
     if (!selectedDetailsPackage || !repositoryEcosystem || !API_BASE_URL) {
       setPackageDetailsData(null);
@@ -1540,19 +1696,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Malware Package Scan</p>
                       <p className="mt-1 text-sm text-slate-400">Progress stays in the graph. Results appear here after completion.</p>
                     </div>
-                    {canShowGraphScanResults ? (
-                      <button
-                        type="button"
-                        onClick={() => setGraphScanView((current) => (current === "progress" ? "results" : "progress"))}
-                        className={`rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
-                          graphScanView === "results"
-                            ? "border-cyan-300/70 bg-cyan-500/20 text-cyan-50"
-                            : "border-gray-700 bg-gray-900 text-slate-300 hover:border-gray-500"
-                        }`}
-                      >
-                        {graphScanView === "results" ? "Show Progress" : "View Results"}
-                      </button>
-                    ) : null}
+                    {/* Removed "View Results" toggle button per UI update request */}
                   </div>
 
                   {graphScanView === "progress" ? (
@@ -1579,10 +1723,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       {shouldShowScanRuntime ? (
                         <div>
                           <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                            <div
-                              className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : scanDisplay.phase === "pending" ? "animate-pulse bg-cyan-300/90" : "bg-cyan-400"}`}
-                              style={{ width: `${Math.max(0, Math.min(100, scanDisplay.progressPercent))}%` }}
-                            />
+                            {scanDisplay.phase === "pending" ? (
+                              <div className="h-full w-full animate-pulse rounded-full bg-cyan-300/40" />
+                            ) : scanDisplay.phase === "running" && scanDisplay.progressPercent === 0 ? (
+                              <div className="h-full w-1/5 animate-pulse rounded-full bg-cyan-300/60" />
+                            ) : (
+                              <div
+                                className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : "bg-cyan-400"}`}
+                                style={{ width: `${Math.max(2, Math.min(100, scanDisplay.progressPercent))}%` }}
+                              />
+                            )}
                           </div>
                           <p className="mt-1 text-[11px] uppercase tracking-[0.12em] text-slate-500">{scanDisplay.progressLabel}</p>
                           <p className="mt-1 text-xs text-slate-400">{scanDisplay.primaryCountLabel}</p>
@@ -1595,9 +1745,51 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         </div>
                       ) : null}
 
+                      {scanResultRows.length > 0 ? (
+                        <div className="max-h-[28vh] overflow-auto rounded-lg border border-slate-800">
+                          <table className="w-full text-left text-xs text-slate-200">
+                            <thead className="sticky top-0 bg-slate-900/95 text-slate-400">
+                              <tr>
+                                <th className="px-3 py-2 font-medium">Package</th>
+                                <th className="px-3 py-2 font-medium">Verdict</th>
+                                <th className="px-3 py-2 font-medium">Score</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {scanResultRows.map((row) => {
+                                const verdictStatus = row.riskStatus ?? row.malwareStatus;
+                                const verdictClass = verdictStatus === "malicious"
+                                  ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                                  : verdictStatus === "suspicious"
+                                    ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                                    : verdictStatus === "clean"
+                                      ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                                      : "border-slate-600/50 bg-slate-800/30 text-slate-400";
+                                const scoreValue = row.riskScore ?? row.malwareScore;
+                                return (
+                                  <tr key={row.id} className="border-t border-slate-800 hover:bg-slate-900/40">
+                                    <td className="px-3 py-2 font-mono text-[11px]">{row.packageName}@{row.version}</td>
+                                    <td className="px-3 py-2">
+                                      {verdictStatus ? (
+                                        <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] ${verdictClass}`}>
+                                          {verdictStatus}
+                                        </span>
+                                      ) : <span className="text-slate-500">—</span>}
+                                    </td>
+                                    <td className="px-3 py-2 text-slate-300">
+                                      {scoreValue != null ? `${(scoreValue * 100).toFixed(1)}%` : "—"}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : null}
+
                       <div className="pt-1 space-y-2">
                         <div className="flex flex-wrap gap-1">
-                          {(["full", "static_only", "lightweight", "dynamic_only"] as const).map((mode) => (
+                          {(["full", "static_only", "dynamic_only"] as const).map((mode) => (
                             <button
                               key={mode}
                               type="button"
@@ -1609,7 +1801,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
                               } disabled:cursor-not-allowed disabled:opacity-50`}
                             >
-                              {mode === "full" ? "Full" : mode === "static_only" ? "Static" : mode === "lightweight" ? "Lightweight" : "Dynamic"}
+                              {mode === "full" ? "Full" : mode === "static_only" ? "Static + Enrichment" : "Dynamic"}
                             </button>
                           ))}
                         </div>
@@ -1668,7 +1860,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     selectedPackageLabels={selectedScanPackages}
                     selectionEnabled={isPartialScan}
                     onPackageToggleSelect={toggleSelectedScanPackage}
-                    onNodeFeatureDetail={(label, features) => setGraphDetailNode({ label, features })}
+                    onNodeFeatureDetail={(label, features) => setGraphDetailNode({ label, features, scanEntry: scanResultsMap[label] ?? null })}
                   />
                 </div>
 
@@ -1687,8 +1879,107 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         ✕
                       </button>
                     </div>
-                    <div className="flex-1 overflow-y-auto px-5 py-4">
-                      <FeatureGrid features={graphDetailNode.features} />
+                    <div className="flex-1 overflow-y-auto space-y-4 px-5 py-4">
+                      {/* Verdict */}
+                      {((graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) && (graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) !== "unknown") ? (
+                        <div>
+                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">Verdict</p>
+                          <div className="flex items-center gap-2">
+                            <span className={`rounded-full border px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${
+                              (graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) === "malicious"
+                                ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                                : (graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) === "suspicious"
+                                  ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                                  : "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                            }`}>
+                              {(graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) ?? "unknown"}
+                            </span>
+                            {graphDetailNode.scanEntry.risk_overall_score != null ? (
+                              <span className="text-[11px] text-slate-400">
+                                {(graphDetailNode.scanEntry.risk_overall_score * 100).toFixed(1)}% confidence
+                              </span>
+                            ) : null}
+                          </div>
+                          {graphDetailNode.scanEntry.malware_score != null ? (
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              Classifier confidence: {(graphDetailNode.scanEntry.malware_score * 100).toFixed(1)}%
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+
+                      {/* CVE findings */}
+                      {graphDetailNode.scanEntry?.vulnerability_details && graphDetailNode.scanEntry.vulnerability_details.length > 0 ? (
+                        <div>
+                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">
+                            CVE Findings ({graphDetailNode.scanEntry.vulnerability_details.length})
+                          </p>
+                          <div className="space-y-1">
+                            {graphDetailNode.scanEntry.vulnerability_details.slice(0, 5).map((v, i) => {
+                              const href = v.advisory_id.startsWith("CVE-")
+                                ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
+                                : v.advisory_id.startsWith("GHSA-")
+                                  ? `https://github.com/advisories/${v.advisory_id}`
+                                  : null;
+                              return (
+                                <div key={i} className="flex items-center justify-between gap-2 rounded border border-amber-400/30 bg-amber-500/10 px-2 py-1">
+                                  {href ? (
+                                    <a href={href} target="_blank" rel="noopener noreferrer" className="font-mono text-[10px] text-amber-200 underline hover:text-amber-100">
+                                      {v.advisory_id}
+                                    </a>
+                                  ) : (
+                                    <span className="font-mono text-[10px] text-amber-200">{v.advisory_id}</span>
+                                  )}
+                                  {v.value != null ? (
+                                    <span className="shrink-0 text-[10px] text-slate-400">CVSS {v.value.toFixed(1)}</span>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                            {graphDetailNode.scanEntry.vulnerability_details.length > 5 ? (
+                              <p className="text-[10px] text-slate-500">+{graphDetailNode.scanEntry.vulnerability_details.length - 5} more</p>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* Reputation */}
+                      {graphDetailNode.scanEntry?.reputation_metadata && Object.keys(graphDetailNode.scanEntry.reputation_metadata).length > 0 ? (
+                        <div>
+                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">Reputation</p>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score"] as const).map((k) => {
+                              const val = graphDetailNode.scanEntry?.reputation_metadata?.[k];
+                              if (val == null) return null;
+                              const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k.replace(/_/g, " ");
+                              return (
+                                <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
+                                  <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                  <p className="mt-0.5 font-mono text-[11px] text-slate-200">
+                                    {k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}
+                                  </p>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* Static features */}
+                      {graphDetailNode.features && Object.keys(graphDetailNode.features).length > 0 ? (
+                        <div>
+                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">Static Features</p>
+                          <FeatureGrid features={graphDetailNode.features} />
+                        </div>
+                      ) : null}
+
+                      {/* Empty state */}
+                      {!graphDetailNode.scanEntry?.malware_status &&
+                        !(graphDetailNode.scanEntry?.vulnerability_details?.length) &&
+                        !(graphDetailNode.scanEntry?.reputation_metadata && Object.keys(graphDetailNode.scanEntry.reputation_metadata).length > 0) &&
+                        !graphDetailNode.features ? (
+                        <p className="text-sm text-slate-500">No scan data available for this package.</p>
+                      ) : null}
                     </div>
                   </div>
                 ) : null}
@@ -1710,11 +2001,47 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
           {activeSection === "static-analysis" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
-              <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
+              {/* Scan-in-progress / error banner */}
+              {(isScanRunning || scanError !== null || scanDetails?.status === "failed") ? (
+                <div className={`mb-4 rounded-xl border p-3 ${
+                  scanError !== null || scanDetails?.status === "failed"
+                    ? "border-rose-400/40 bg-rose-500/10"
+                    : "border-cyan-400/30 bg-cyan-500/10"
+                }`}>
+                  {isScanRunning ? (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-300">
+                          Scan in progress — {scanDisplay.phase}
+                        </p>
+                        {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
+                          <span className="text-[11px] text-slate-400">
+                            {scanDetails.scanned_packages} / {scanDetails.total_unique_packages} ({scanProgress.toFixed(0)}%)
+                          </span>
+                        ) : null}
+                      </div>
+                      {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
+                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                          <div className="h-full rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${scanProgress}%` }} />
+                        </div>
+                      ) : null}
+                      {runtimeElapsedLabel ? (
+                        <p className="mt-1 text-[11px] text-slate-500">{runtimeElapsedLabel}</p>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-rose-300">
+                      Scan error: {scanError ?? scanDetails?.error_message ?? "Unknown error"}
+                    </p>
+                  )}
+                </div>
+              ) : null}
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+                {/* Left column — controls only */}
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Static Analysis</p>
-                    <p className="mt-1 text-sm text-slate-300">Review the latest completed scan snapshot and package findings.</p>
+                    <p className="mt-1 text-sm text-slate-300">Select packages and run the static-analysis microservice only. Results appear in the right pane.</p>
                   </div>
 
                   <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-900/50 p-3">
@@ -1748,7 +2075,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         ))}
                       </div>
                     ) : null}
-                    <div className="max-h-40 overflow-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                    <div className="max-h-52 overflow-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
                       {filteredPackagesForAnalysis.length === 0 ? (
                         <p className="p-2 text-xs text-slate-400">No packages found.</p>
                       ) : (
@@ -1793,7 +2120,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                   <div className="grid gap-3 sm:grid-cols-3">
                     <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3">
                       <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Status</p>
-                      <p className="mt-1 text-sm font-medium text-slate-100">{latestScanSummary.status ?? "No completed scans yet"}</p>
+                      <p className="mt-1 text-sm font-medium text-slate-100">{latestScanSummary.status ?? "—"}</p>
                     </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3">
                       <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Processed</p>
@@ -1806,26 +2133,43 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <p className="mt-1 text-sm font-medium text-slate-100">{formatTimestampForDisplay(latestScanSummary.completedAt)}</p>
                     </div>
                   </div>
+                </div>
 
-                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Static findings</p>
-                    <div className="mt-3 space-y-2">
-                      {scanResultRows.length > 0 ? (
-                        scanResultRows.map((row) => {
-                          const isErrorRow = row.errorMessage !== null || row.status === "failed";
-                          const riskBadgeClass =
-                            row.riskStatus === "malicious"
-                              ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
-                              : row.riskStatus === "suspicious"
-                                ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
-                                : row.riskStatus === "clean"
-                                  ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
-                                  : "border-slate-600 bg-slate-800/60 text-slate-400";
+                {/* Right column — findings */}
+                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Scan Results</p>
+                    {latestScanSummary.status !== null ? (
+                      <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                        Last scan — {formatTimestampForDisplay(latestScanSummary.completedAt)}
+                      </span>
+                    ) : null}
+                  </div>
 
-                          return (
-                            <div
-                              key={row.id}
-                              className={`rounded-lg border p-3 text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
+                  {scanResultRows.length > 0 ? (
+                    <div className="space-y-2">
+                      {scanResultRows.map((row) => {
+                        const isErrorRow = row.errorMessage !== null || row.status === "failed";
+                        const isExpanded = expandedStaticResultId === row.id;
+                        const riskBadgeClass =
+                          row.riskStatus === "malicious"
+                            ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                            : row.riskStatus === "suspicious"
+                              ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                              : row.riskStatus === "clean"
+                                ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                                : "border-slate-600 bg-slate-800/60 text-slate-400";
+                        const entryFeatures = scanResultsMap[row.packageName]?.static_features ?? null;
+
+                        return (
+                          <div
+                            key={row.id}
+                            className={`rounded-lg border text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => setExpandedStaticResultId(isExpanded ? null : row.id)}
+                              className="w-full p-3 text-left"
                             >
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <p className="font-medium">
@@ -1834,16 +2178,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                 <div className="flex items-center gap-2">
                                   {row.riskStatus ? (
                                     <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${riskBadgeClass}`}>
-                                      {row.riskStatus}
+                                      {formatVerdict(row.riskStatus)}
                                     </span>
                                   ) : null}
-                                  <span className="text-[11px] uppercase tracking-[0.14em] text-slate-400">{row.status}</span>
+                                  <span className="text-[11px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
                                 </div>
                               </div>
                               <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
-                                <span>Malware score: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}</span>
+                                <span>Classifier: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : row.malwareStatus ?? "-"}</span>
                                 {row.riskScore !== null ? (
-                                  <span>Risk score: {(row.riskScore * 100).toFixed(1)}%</span>
+                                  <span>Risk: {(row.riskScore * 100).toFixed(1)}%</span>
                                 ) : null}
                               </div>
                               {row.advisoryRefs.length > 0 ? (
@@ -1862,6 +2206,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                         href={href}
                                         target="_blank"
                                         rel="noopener noreferrer"
+                                        onClick={(e) => e.stopPropagation()}
                                         className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
                                       >
                                         {ref}
@@ -1875,33 +2220,58 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                 </div>
                               ) : null}
                               {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
-                            </div>
-                          );
-                        })
-                      ) : (
-                        <p className="text-sm text-slate-400">No static findings are available yet.</p>
-                      )}
+                            </button>
+                            {isExpanded ? (
+                              <div className="border-t border-slate-700/60 px-3 pb-3 pt-2 space-y-3">
+                                <div className="flex flex-wrap gap-3 text-xs">
+                                  <div>
+                                    <p className="text-[10px] uppercase tracking-wide text-slate-500">Static Analysis</p>
+                                    <p className="mt-0.5 font-medium uppercase text-slate-200">
+                                      {row.errorMessage ? "Error" : row.malwareScore !== null ? "Completed" : "Not Run"}
+                                    </p>
+                                  </div>
+                                  {row.malwareScore !== null ? (
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-500">Classifier Score</p>
+                                      <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.malwareScore * 100).toFixed(2)}%</p>
+                                    </div>
+                                  ) : null}
+                                  {row.riskScore !== null ? (
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-500">Risk Score</p>
+                                      <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.riskScore * 100).toFixed(2)}%</p>
+                                    </div>
+                                  ) : null}
+                                  {row.scanTimestamp ? (
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-500">Scanned At</p>
+                                      <p className="mt-0.5 text-slate-300">{formatTimestampForDisplay(row.scanTimestamp)}</p>
+                                    </div>
+                                  ) : null}
+                                </div>
+                                {entryFeatures && Object.keys(entryFeatures).length > 0 ? (
+                                  <div>
+                                    <p className="mb-1.5 text-[10px] uppercase tracking-wide text-slate-500">Static Features</p>
+                                    <FeatureGrid features={entryFeatures} />
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
                     </div>
-                  </div>
-                </div>
-
-                <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Latest completed scan summary</p>
-                  {latestScanSummary.status === null ? (
-                    <p className="mt-2 text-sm text-slate-300">Run a scan to populate the static analysis summary.</p>
                   ) : (
-                    <>
-                      <p className="mt-2 text-sm text-slate-200">Status: {latestScanSummary.status}</p>
-                      <p className="mt-1 text-sm text-slate-200">
-                        Processed: {latestScanSummary.processed ?? "-"} / {latestScanSummary.total ?? "-"}
-                      </p>
-                      <p className="mt-1 text-sm text-slate-200">Completed: {formatTimestampForDisplay(latestScanSummary.completedAt)}</p>
-                    </>
+                    <p className="text-sm text-slate-400">
+                      {latestScanSummary.status !== null
+                        ? "No individual package results available for the last scan."
+                        : "Run a scan to see results here."}
+                    </p>
                   )}
 
                   <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">API</p>
-                    <p className="mt-2 text-sm text-slate-200">{scanJobId ? "/scan/{job_id}" : "Completed scan summaries appear here after a run."}</p>
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Job ID</p>
+                    <p className="mt-2 font-mono text-sm text-slate-300">{scanJobId ?? "—"}</p>
                   </div>
                 </div>
               </div>
@@ -1910,6 +2280,41 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
           {activeSection === "dynamic-analysis" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
+              {/* Scan-in-progress / error banner */}
+              {(isScanRunning || scanError !== null || scanDetails?.status === "failed") ? (
+                <div className={`mb-4 rounded-xl border p-3 ${
+                  scanError !== null || scanDetails?.status === "failed"
+                    ? "border-rose-400/40 bg-rose-500/10"
+                    : "border-cyan-400/30 bg-cyan-500/10"
+                }`}>
+                  {isScanRunning ? (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-300">
+                          Scan in progress — {scanDisplay.phase}
+                        </p>
+                        {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
+                          <span className="text-[11px] text-slate-400">
+                            {scanDetails.scanned_packages} / {scanDetails.total_unique_packages} ({scanProgress.toFixed(0)}%)
+                          </span>
+                        ) : null}
+                      </div>
+                      {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
+                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                          <div className="h-full rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${scanProgress}%` }} />
+                        </div>
+                      ) : null}
+                      {runtimeElapsedLabel ? (
+                        <p className="mt-1 text-[11px] text-slate-500">{runtimeElapsedLabel}</p>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-rose-300">
+                      Scan error: {scanError ?? scanDetails?.error_message ?? "Unknown error"}
+                    </p>
+                  )}
+                </div>
+              ) : null}
               <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div>
@@ -1980,7 +2385,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <button
                         type="button"
                         onClick={() => {
-                          void triggerPartialAnalysisScan();
+                          void triggerPartialAnalysisScan("dynamic_only");
                         }}
                         disabled={!canStartPartialAnalysisScan}
                         className="w-full rounded-md border border-cyan-400/40 bg-cyan-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
@@ -2002,10 +2407,14 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <>
                         <p className="mt-2 text-sm text-slate-200">{scanDisplay.primaryCountLabel}</p>
                         <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                          <div
-                            className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : scanDisplay.phase === "pending" ? "animate-pulse bg-cyan-300/90" : "bg-cyan-400"}`}
-                            style={{ width: `${Math.max(0, Math.min(100, scanDisplay.progressPercent))}%` }}
-                          />
+                          {(scanDisplay.phase === "pending" || (scanDisplay.phase === "running" && scanDisplay.progressPercent === 0)) ? (
+                            <div className={`h-full w-full animate-pulse rounded-full ${scanError ? "bg-rose-400/40" : "bg-cyan-300/40"}`} />
+                          ) : (
+                            <div
+                              className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : "bg-cyan-400"}`}
+                              style={{ width: `${Math.max(2, Math.min(100, scanDisplay.progressPercent))}%` }}
+                            />
+                          )}
                         </div>
                         <p className="mt-2 text-xs text-slate-400">{scanDisplay.progressLabel}</p>
                         <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-400">
@@ -2036,7 +2445,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       type="button"
                       onClick={(event) => {
                         event.stopPropagation();
-                        void triggerPackageScan();
+                        void triggerPackageScan("dynamic_only");
                       }}
                       disabled={!canStartScan}
                       className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
@@ -2052,27 +2461,117 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                   {scanJobId && scanResultRows.length > 0 ? (
                     <div className="max-h-[52vh] overflow-auto rounded-lg border border-slate-800">
                       <table className="w-full text-left text-xs text-slate-200">
-                        <thead className="bg-slate-900/90 text-slate-400">
+                        <thead className="sticky top-0 bg-slate-900/95 text-slate-400">
                           <tr>
                             <th className="px-3 py-2 font-medium">Package</th>
                             <th className="px-3 py-2 font-medium">Version</th>
-                            <th className="px-3 py-2 font-medium">Status</th>
+                            <th className="px-3 py-2 font-medium">Verdict</th>
                             <th className="px-3 py-2 font-medium">Score</th>
-                            <th className="px-3 py-2 font-medium">Error</th>
+                            <th className="px-3 py-2 font-medium w-6"></th>
                           </tr>
                         </thead>
                         <tbody>
                           {scanResultRows.map((row) => {
                             const isErrorRow = row.errorMessage !== null || row.status === "failed";
+                            const isExpanded = expandedDynamicRowId === row.id;
+                            const verdictStatus = row.riskStatus ?? row.malwareStatus;
+                            const verdictClass = verdictStatus === "malicious"
+                              ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                              : verdictStatus === "suspicious"
+                                ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                                : verdictStatus === "clean"
+                                  ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                                  : "border-slate-600 bg-slate-800/60 text-slate-400";
+                            const entryFeatures = scanResultsMap[row.packageName]?.static_features ?? null;
 
                             return (
-                              <tr key={row.id} className={isErrorRow ? "border-t border-rose-500/30 bg-rose-500/10" : "border-t border-slate-800"}>
-                                <td className="px-3 py-2">{row.packageName}</td>
-                                <td className="px-3 py-2">{row.version}</td>
-                                <td className="px-3 py-2 uppercase">{row.status}</td>
-                                <td className="px-3 py-2">{row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}</td>
-                                <td className="px-3 py-2 text-rose-200">{row.errorMessage ?? "-"}</td>
-                              </tr>
+                              <React.Fragment key={row.id}>
+                                <tr
+                                  className={`cursor-pointer transition ${isErrorRow ? "border-t border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20" : "border-t border-slate-800 hover:bg-slate-800/40"}`}
+                                  onClick={() => setExpandedDynamicRowId(isExpanded ? null : row.id)}
+                                >
+                                  <td className="px-3 py-2 font-medium">{row.packageName}</td>
+                                  <td className="px-3 py-2 text-slate-400">{row.version}</td>
+                                  <td className="px-3 py-2">
+                                    {verdictStatus ? (
+                                      <span className={`rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${verdictClass}`}>
+                                        {verdictStatus}
+                                      </span>
+                                    ) : <span className="text-slate-600">—</span>}
+                                  </td>
+                                  <td className="px-3 py-2 font-mono">
+                                    {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}
+                                  </td>
+                                  <td className="px-3 py-2 text-center text-slate-500">{isExpanded ? "▲" : "▼"}</td>
+                                </tr>
+                                {isExpanded ? (
+                                  <tr className="border-t border-slate-700/50 bg-slate-900/60">
+                                    <td colSpan={5} className="px-3 pb-3 pt-2">
+                                      <div className="space-y-3">
+                                        {/* Scores row */}
+                                        <div className="flex flex-wrap gap-4 text-xs">
+                                          <div>
+                                            <p className="text-[10px] uppercase tracking-wide text-slate-500">Analysis Status</p>
+                                            <p className="mt-0.5 font-medium uppercase text-slate-200">{row.status}</p>
+                                          </div>
+                                          {row.malwareScore !== null ? (
+                                            <div>
+                                              <p className="text-[10px] uppercase tracking-wide text-slate-500">Classifier Score</p>
+                                              <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.malwareScore * 100).toFixed(2)}%</p>
+                                            </div>
+                                          ) : null}
+                                          {row.riskScore !== null ? (
+                                            <div>
+                                              <p className="text-[10px] uppercase tracking-wide text-slate-500">Risk Score</p>
+                                              <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.riskScore * 100).toFixed(2)}%</p>
+                                            </div>
+                                          ) : null}
+                                          {row.scanTimestamp ? (
+                                            <div>
+                                              <p className="text-[10px] uppercase tracking-wide text-slate-500">Scanned At</p>
+                                              <p className="mt-0.5 text-slate-300">{formatTimestampForDisplay(row.scanTimestamp)}</p>
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                        {/* Advisory refs */}
+                                        {row.advisoryRefs.length > 0 ? (
+                                          <div>
+                                            <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Advisories</p>
+                                            <div className="flex flex-wrap gap-1.5">
+                                              {row.advisoryRefs.map((ref) => {
+                                                const isCve = ref.toUpperCase().startsWith("CVE-");
+                                                const isGhsa = ref.toUpperCase().startsWith("GHSA-");
+                                                const href = isCve
+                                                  ? `https://nvd.nist.gov/vuln/detail/${ref}`
+                                                  : isGhsa ? `https://github.com/advisories/${ref}` : null;
+                                                return href ? (
+                                                  <a key={ref} href={href} target="_blank" rel="noopener noreferrer"
+                                                    className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition">
+                                                    {ref}
+                                                  </a>
+                                                ) : (
+                                                  <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{ref}</span>
+                                                );
+                                              })}
+                                            </div>
+                                          </div>
+                                        ) : null}
+                                        {/* Error */}
+                                        {row.errorMessage ? (
+                                          <p className="text-xs text-rose-200">{row.errorMessage}</p>
+                                        ) : null}
+                                        {/* Static features */}
+                                        {entryFeatures && Object.keys(entryFeatures).length > 0 ? (
+                                          <div>
+                                            <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Static Features</p>
+                                            <FeatureGrid features={entryFeatures} />
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                ) : null}
+                              </React.Fragment>
                             );
                           })}
                         </tbody>
@@ -2604,7 +3103,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               ? "border-blue-400/50 bg-blue-500/15 text-blue-100"
                               : job.scan_mode === "static_only"
                                 ? "border-purple-400/50 bg-purple-500/15 text-purple-100"
-                                : job.scan_mode === "lightweight"
+                                : job.scan_mode === "static_classifier"
+                                  ? "border-purple-300/60 bg-purple-500/15 text-purple-100"
+                                : (job.scan_mode === "lightweight" || job.scan_mode === "lightweight_cve" || job.scan_mode === "lightweight_librariesio")
                                   ? "border-teal-400/50 bg-teal-500/15 text-teal-100"
                                   : "border-orange-400/50 bg-orange-500/15 text-orange-100";
                             const statusBadgeClass = job.status === "completed"
@@ -2623,7 +3124,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   <td className="px-4 py-3 uppercase text-slate-400">{job.ecosystem}</td>
                                   <td className="px-4 py-3">
                                     <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${modeBadgeClass}`}>
-                                      {job.scan_mode === "full" ? "Full" : job.scan_mode === "static_only" ? "Static" : job.scan_mode === "lightweight" ? "Lightweight" : "Dynamic"}
+                                      {job.scan_mode === "full"
+                                        ? "Full"
+                                        : job.scan_mode === "static_only"
+                                          ? "Static + Enrichment"
+                                          : job.scan_mode === "static_classifier"
+                                            ? "Static Analysis"
+                                            : job.scan_mode === "lightweight"
+                                              ? "Lightweight"
+                                              : job.scan_mode === "lightweight_cve"
+                                                ? "CVE Only"
+                                                : job.scan_mode === "lightweight_librariesio"
+                                                  ? "Rep Only"
+                                                  : "Dynamic"}
                                     </span>
                                   </td>
                                   <td className="px-4 py-3">
@@ -2664,46 +3177,122 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                             {selectedHistoryJob.error_message ? <div><p className="text-slate-500 uppercase tracking-[0.1em]">Error</p><p className="mt-1 text-rose-200">{selectedHistoryJob.error_message}</p></div> : null}
                                           </div>
                                           {selectedHistoryJob.results && selectedHistoryJob.results.length > 0 ? (
-                                            <div className="max-h-96 overflow-auto rounded-lg border border-slate-800">
+                                            <div className="max-h-[480px] overflow-auto rounded-lg border border-slate-800">
                                               <table className="w-full text-left text-[11px] text-slate-300">
-                                                <thead className="bg-slate-900/80 text-slate-500 sticky top-0">
+                                                <thead className="sticky top-0 bg-slate-900/80 text-slate-500">
                                                   <tr>
                                                     <th className="px-3 py-2">Package</th>
                                                     <th className="px-3 py-2">Status</th>
                                                     <th className="px-3 py-2">Score</th>
                                                     <th className="px-3 py-2">CVEs</th>
-                                                    <th className="px-3 py-2">Features</th>
+                                                    <th className="px-3 py-2">Analysis</th>
+                                                    <th className="px-3 py-2">Details</th>
                                                   </tr>
                                                 </thead>
                                                 <tbody>
-                                                  {selectedHistoryJob.results.slice(0, 100).map((result) => (
-                                                    <React.Fragment key={result.id}>
-                                                      <tr className="border-t border-slate-800/60">
-                                                        <td className="px-3 py-1.5">{result.package_name}@{result.package_version}</td>
-                                                        <td className="px-3 py-1.5 uppercase">{result.malware_status}</td>
-                                                        <td className="px-3 py-1.5">{(result.risk_overall_score * 100).toFixed(0)}%</td>
-                                                        <td className="px-3 py-1.5">{result.advisory_references.length > 0 ? result.advisory_references.length : "-"}</td>
-                                                        <td className="px-3 py-1.5">
-                                                          {result.static_features && Object.keys(result.static_features).length > 0 ? (
-                                                            <button
-                                                              type="button"
-                                                              onClick={() => setExpandedResultId(expandedResultId === result.id ? null : result.id)}
-                                                              className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
-                                                            >
-                                                              {expandedResultId === result.id ? "hide" : "view"}
-                                                            </button>
-                                                          ) : <span className="text-slate-600">—</span>}
-                                                        </td>
-                                                      </tr>
-                                                      {expandedResultId === result.id && result.static_features ? (
-                                                        <tr key={`${result.id}-features`} className="bg-slate-900/40">
-                                                          <td colSpan={5} className="px-3 pb-3 pt-1">
-                                                            <FeatureGrid features={result.static_features} />
+                                                  {selectedHistoryJob.results.slice(0, 100).map((result) => {
+                                                    const cveCount = Math.max(
+                                                      result.advisory_references.length,
+                                                      result.vulnerability_details?.length ?? 0,
+                                                    );
+                                                    const hasDetails =
+                                                      (result.static_features && Object.keys(result.static_features).length > 0) ||
+                                                      (result.vulnerability_details && result.vulnerability_details.length > 0) ||
+                                                      (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0);
+                                                    const isExpRow = expandedResultId === result.id;
+                                                    return (
+                                                      <React.Fragment key={result.id}>
+                                                        <tr className="border-t border-slate-800/60">
+                                                          <td className="px-3 py-1.5 font-mono">{result.package_name}@{result.package_version}</td>
+                                                          <td className={`px-3 py-1.5 font-semibold uppercase text-[10px] ${verdictBadgeClass(result.risk_overall_status)}`}>{formatVerdict(result.risk_overall_status)}</td>
+                                                          <td className="px-3 py-1.5">{(result.risk_overall_score * 100).toFixed(0)}%</td>
+                                                          <td className="px-3 py-1.5">{cveCount > 0 ? cveCount : "—"}</td>
+                                                          <td className="px-3 py-1.5">
+                                                            <div className="flex flex-wrap gap-1">
+                                                              {(result.analyzed_by ?? []).map((a) => (
+                                                                <span key={a} className="rounded border border-slate-600 bg-slate-800/60 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-slate-300">{a}</span>
+                                                              ))}
+                                                              {result.lookup_status ? Object.entries(result.lookup_status).map(([src, st]) => (
+                                                                <span key={src} className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(st)}`}>
+                                                                  {lookupStatusLabel(src, st)}
+                                                                </span>
+                                                              )) : null}
+                                                            </div>
+                                                          </td>
+                                                          <td className="px-3 py-1.5">
+                                                            {hasDetails ? (
+                                                              <button
+                                                                type="button"
+                                                                onClick={() => setExpandedResultId(isExpRow ? null : result.id)}
+                                                                className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
+                                                              >
+                                                                {isExpRow ? "hide" : "view"}
+                                                              </button>
+                                                            ) : <span className="text-slate-600">—</span>}
                                                           </td>
                                                         </tr>
-                                                      ) : null}
-                                                    </React.Fragment>
-                                                  ))}
+                                                        {isExpRow ? (
+                                                          <tr key={`${result.id}-detail`} className="bg-slate-900/40">
+                                                            <td colSpan={6} className="px-3 pb-4 pt-2">
+                                                              <div className="space-y-4">
+                                                                {result.static_features && Object.keys(result.static_features).length > 0 ? (
+                                                                  <div>
+                                                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Static Features</p>
+                                                                    <FeatureGrid features={result.static_features} />
+                                                                  </div>
+                                                                ) : null}
+                                                                {result.vulnerability_details && result.vulnerability_details.length > 0 ? (
+                                                                  <div>
+                                                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE Findings ({result.vulnerability_details.length})</p>
+                                                                    <table className="w-full text-[10px]">
+                                                                      <thead><tr className="text-slate-500"><th className="pb-1 pr-3 text-left">Advisory</th><th className="pb-1 pr-3 text-left">Source</th><th className="pb-1 pr-3 text-left">CVSS</th><th className="pb-1 text-left">Description</th></tr></thead>
+                                                                      <tbody>
+                                                                        {result.vulnerability_details.map((v, i) => {
+                                                                          const href = v.advisory_id.startsWith("CVE-")
+                                                                            ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
+                                                                            : v.advisory_id.startsWith("GHSA-")
+                                                                              ? `https://github.com/advisories/${v.advisory_id}`
+                                                                              : null;
+                                                                          return (
+                                                                            <tr key={i} className="border-t border-slate-800/40">
+                                                                              <td className="py-1 pr-3 font-mono text-indigo-300">
+                                                                                {href ? <a href={href} target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-100">{v.advisory_id}</a> : v.advisory_id}
+                                                                              </td>
+                                                                              <td className="py-1 pr-3 uppercase text-slate-400">{v.source}</td>
+                                                                              <td className="py-1 pr-3 text-slate-300">{v.value != null ? v.value.toFixed(1) : "—"}</td>
+                                                                              <td className="py-1 text-slate-400 max-w-xs truncate">{v.details ?? "—"}</td>
+                                                                            </tr>
+                                                                          );
+                                                                        })}
+                                                                      </tbody>
+                                                                    </table>
+                                                                  </div>
+                                                                ) : null}
+                                                                {result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0 ? (
+                                                                  <div>
+                                                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Reputation (Libraries.io)</p>
+                                                                    <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                                                                      {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score"] as const).map((k) => {
+                                                                        const val = result.reputation_metadata?.[k];
+                                                                        if (val == null) return null;
+                                                                        const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k.replace(/_/g, " ");
+                                                                        return (
+                                                                          <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
+                                                                            <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                                                            <p className="mt-0.5 font-mono text-[11px] text-slate-200">{k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}</p>
+                                                                          </div>
+                                                                        );
+                                                                      })}
+                                                                    </div>
+                                                                  </div>
+                                                                ) : null}
+                                                              </div>
+                                                            </td>
+                                                          </tr>
+                                                        ) : null}
+                                                      </React.Fragment>
+                                                    );
+                                                  })}
                                                 </tbody>
                                               </table>
                                             </div>
@@ -2723,6 +3312,369 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 )}
               </div>
             </div>
+          ) : null}
+
+          {activeSection === "lightweight" ? (
+            <div className="flex h-full flex-col overflow-hidden px-4 pb-6 pt-4">
+              {/* Header */}
+              <div className="mb-4 flex-shrink-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Lightweight Scan</p>
+                <p className="mt-1 text-sm text-slate-400">
+                  Queries CVE databases (OSV + NVD) and Libraries.io for known vulnerabilities and package reputation.
+                  No ML model — best for quickly checking known packages against published advisories.
+                </p>
+              </div>
+
+              <div className="flex min-h-0 flex-1 gap-4">
+              {/* Left pane — configuration */}
+              <div className="w-80 flex-shrink-0 space-y-4 overflow-y-auto">
+
+                {/* Scope selector */}
+                <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+                  <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Scan Scope</p>
+                  <div className="flex gap-3">
+                    {(["partial", "full"] as const).map((scope) => (
+                      <button
+                        key={scope}
+                        type="button"
+                        disabled={isLightweightRunning}
+                        onClick={() => setLightweightScope(scope)}
+                        className={`rounded-full border px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
+                          lightweightScope === scope
+                            ? "border-cyan-300/70 bg-cyan-500/20 text-cyan-50"
+                            : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
+                        } disabled:cursor-not-allowed disabled:opacity-50`}
+                      >
+                        {scope === "partial" ? "Partial — recommended" : `Full — all ${availablePackagesForAnalysis.length} packages`}
+                      </button>
+                    ))}
+                  </div>
+                  {lightweightScope === "partial" ? (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-[11px] text-slate-500">
+                        Tip: start with packages you explicitly declared in your manifest — skip deep transitive deps for now.
+                      </p>
+                      <input
+                        type="text"
+                        placeholder="Search packages..."
+                        value={lightweightPackageSearch}
+                        onChange={(e) => setLightweightPackageSearch(e.target.value)}
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60"
+                      />
+                      {lightweightSelectedPackages.length > 0 ? (
+                        <div className="flex flex-wrap gap-2 rounded-md bg-slate-950/40 p-2">
+                          {lightweightSelectedPackages.map((pkg) => (
+                            <div
+                              key={pkg}
+                              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/50 bg-cyan-500/20 px-2.5 py-1 text-xs text-cyan-100"
+                            >
+                              <span className="truncate font-medium">{pkg}</span>
+                              <button
+                                type="button"
+                                onClick={() => setLightweightSelectedPackages((prev) => prev.filter((p) => p !== pkg))}
+                                className="ml-0.5 flex h-4 w-4 items-center justify-center rounded-full transition hover:bg-cyan-400/30"
+                                title="Remove package"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="max-h-60 overflow-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                        {(() => {
+                          const filtered = availablePackagesForAnalysis.filter(
+                            (pkg) => !lightweightPackageSearch || pkg.toLowerCase().includes(lightweightPackageSearch.toLowerCase()),
+                          );
+                          if (filtered.length === 0) {
+                            return <p className="p-2 text-xs text-slate-400">{availablePackagesForAnalysis.length === 0 ? "No packages loaded yet." : "No packages match your search."}</p>;
+                          }
+                          return (
+                            <div className="space-y-1">
+                              {filtered.map((pkg) => {
+                                const isSelected = lightweightSelectedPackages.includes(pkg);
+                                return (
+                                  <button
+                                    key={pkg}
+                                    type="button"
+                                    onClick={() =>
+                                      setLightweightSelectedPackages((prev) =>
+                                        isSelected ? prev.filter((p) => p !== pkg) : [...prev, pkg],
+                                      )
+                                    }
+                                    className={`w-full rounded-md border px-3 py-2 text-left text-xs transition ${
+                                      isSelected
+                                        ? "border-cyan-400/60 bg-cyan-500/20 font-medium text-cyan-100"
+                                        : "border-slate-700 bg-slate-950/40 text-slate-300 hover:border-slate-600 hover:bg-slate-900/50"
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between">
+                                      <span className="truncate">{pkg}</span>
+                                      {isSelected ? <span className="ml-2 text-cyan-400">✓</span> : null}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    </div>
+                  ) : null}
+                  {lightweightSources.librariesio ? (
+                    <div className="mt-3 rounded-lg border border-slate-700/40 bg-slate-900/60 px-3 py-2">
+                      <p className="text-[11px] text-slate-400">
+                        Libraries.io is rate-limited to <strong className="text-amber-300">60 packages/min</strong>.
+                        {(() => {
+                          const count = lightweightScope === "full" ? availablePackagesForAnalysis.length : lightweightSelectedPackages.length;
+                          return count > 0 ? (
+                            <span> Scanning <strong className="text-slate-200">{count}</strong> package{count === 1 ? "" : "s"}{count > 60 ? <span> will take ~<strong className="text-amber-300">{Math.ceil(count / 60)} min</strong></span> : null} for Libraries.io data.</span>
+                          ) : null;
+                        })()}
+                        {" "}CVE lookups are fetched live from OSV and NVD.
+                      </p>
+                    </div>
+                  ) : null}
+                </div>
+
+                {/* Data sources */}
+                <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+                  <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Data Sources</p>
+                  <div className="flex flex-wrap gap-5">
+                    {(["cve", "librariesio"] as const).map((src) => {
+                      const label = src === "cve" ? "CVE" : "Libraries.io";
+                      const tooltip = src === "cve"
+                        ? "Queries OSV and NVD databases for known CVEs affecting each package. Results are cached — fast regardless of package count."
+                        : "Queries Libraries.io for SourceRank, stars, forks, and dependents. Rate-limited to 60 packages/min — large scopes may take several minutes.";
+                      const checked = lightweightSources[src];
+                      return (
+                        <label
+                          key={src}
+                          title={tooltip}
+                          className="flex cursor-pointer items-center gap-2 text-[12px] font-medium text-slate-200 select-none"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={isLightweightRunning}
+                            onChange={() => setLightweightSources((prev) => ({ ...prev, [src]: !prev[src] }))}
+                            className="accent-cyan-400 h-3.5 w-3.5"
+                          />
+                          {label}
+                          <span className="text-[10px] text-slate-500">{src === "cve" ? "OSV + NVD" : "SourceRank"}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {!lightweightSources.cve && !lightweightSources.librariesio ? (
+                    <p className="mt-2 text-[11px] text-amber-300">Select at least one data source.</p>
+                  ) : null}
+                </div>
+
+                {/* Start button */}
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    disabled={
+                      isLightweightRunning ||
+                      (!lightweightSources.cve && !lightweightSources.librariesio) ||
+                      (lightweightScope === "partial" && lightweightSelectedPackages.length === 0)
+                    }
+                    onClick={() => { void triggerLightweightScan(); }}
+                    className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isLightweightRunning ? "Running…" : "Start Lightweight Scan"}
+                  </button>
+                </div>
+
+              </div>
+              {/* Right pane — progress + results */}
+              <div className="flex flex-1 flex-col gap-4 overflow-y-auto">
+
+                {/* Progress / status block — visible once a scan starts */}
+                {(isLightweightRunning || lightweightJob !== null || lightweightError !== null) ? (
+                  <div className={`rounded-xl border p-4 ${
+                    lightweightError || lightweightJob?.status === "failed"
+                      ? "border-rose-400/40 bg-rose-500/10"
+                      : lightweightJob?.status === "completed"
+                        ? "border-emerald-400/40 bg-emerald-500/10"
+                        : "border-slate-700/60 bg-slate-900/60"
+                  }`}>
+                    <div className="flex items-center justify-between gap-4">
+                      <p className={`text-[11px] font-semibold uppercase tracking-[0.14em] ${
+                        lightweightError || lightweightJob?.status === "failed" ? "text-rose-300"
+                        : lightweightJob?.status === "completed" ? "text-emerald-300"
+                        : "text-cyan-300"
+                      }`}>
+                        {lightweightError ? "Error"
+                          : lightweightJob?.status === "failed" ? "Scan failed"
+                          : lightweightJob?.status === "completed" ? `Completed — ${lightweightJob.results?.length ?? 0} package${(lightweightJob.results?.length ?? 0) === 1 ? "" : "s"}`
+                          : isLightweightRunning && lightweightJob?.status === "running" ? "Scanning…"
+                          : isLightweightRunning ? "Starting…"
+                          : "Pending"}
+                      </p>
+                      {isLightweightRunning && lightweightJob && lightweightJob.total_unique_packages > 0 ? (
+                        <span className="text-[11px] text-slate-400">
+                          {lightweightJob.scanned_packages} / {lightweightJob.total_unique_packages} ({lightweightJob.progress_percent.toFixed(0)}%)
+                        </span>
+                      ) : isLightweightRunning ? (
+                        <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400/40 border-t-cyan-400" />
+                      ) : null}
+                    </div>
+                    {lightweightJob && lightweightJob.total_unique_packages > 0 ? (
+                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${lightweightJob.status === "completed" ? "bg-emerald-500" : "bg-cyan-500"}`}
+                          style={{ width: `${lightweightJob.progress_percent}%` }}
+                        />
+                      </div>
+                    ) : null}
+                    {lightweightError ? (
+                      <p className="mt-1 text-[11px] text-rose-300">{lightweightError}</p>
+                    ) : lightweightJob?.status === "failed" && lightweightJob.error_message ? (
+                      <p className="mt-1 text-[11px] text-rose-300">{lightweightJob.error_message}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {/* Results */}
+                {lightweightJob?.status === "completed" && lightweightJob.results && lightweightJob.results.length > 0 ? (
+                  <div className="rounded-xl border border-slate-700/60 bg-slate-900/40">
+                    <div className="border-b border-slate-800 px-4 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
+                        Results — {lightweightJob.results.length} package{lightweightJob.results.length === 1 ? "" : "s"}
+                      </p>
+                    </div>
+                    <div className="overflow-auto">
+                      <table className="w-full text-left text-[11px] text-slate-300">
+                        <thead className="sticky top-0 bg-slate-900/80 text-slate-500">
+                          <tr>
+                            <th className="px-3 py-2">Package</th>
+                            <th className="px-3 py-2">Risk</th>
+                            <th className="px-3 py-2">CVEs</th>
+                            <th className="px-3 py-2">CVE Source</th>
+                            <th className="px-3 py-2">Libraries.io</th>
+                            <th className="px-3 py-2">Details</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {lightweightJob.results.map((result) => {
+                            const cveCount = Math.max(
+                              result.advisory_references.length,
+                              result.vulnerability_details?.length ?? 0,
+                            );
+                            const cveStatus = result.lookup_status?.cve;
+                            const libStatus = result.lookup_status?.librariesio;
+                            const isExpRow = lightweightExpandedId === result.id;
+                            const hasDetails =
+                              (result.vulnerability_details && result.vulnerability_details.length > 0) ||
+                              (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0);
+                            return (
+                              <React.Fragment key={result.id}>
+                                <tr className="border-t border-slate-800/60">
+                                  <td className="px-3 py-1.5 font-mono">{result.package_name}@{result.package_version}</td>
+                                  <td className="px-3 py-1.5">
+                                    <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${
+                                      result.risk_overall_status === "malicious"
+                                        ? "border-rose-400/40 bg-rose-500/10 text-rose-200"
+                                        : result.risk_overall_status === "suspicious"
+                                          ? "border-amber-400/40 bg-amber-500/10 text-amber-200"
+                                          : "border-emerald-400/40 bg-emerald-500/10 text-emerald-200"
+                                    }`}>
+                                      {(result.risk_overall_score * 100).toFixed(0)}% {result.risk_overall_status}
+                                    </span>
+                                  </td>
+                                  <td className="px-3 py-1.5">{cveCount > 0 ? cveCount : "—"}</td>
+                                  <td className="px-3 py-1.5">
+                                    {cveStatus ? (
+                                      <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(cveStatus)}`}>
+                                        {lookupStatusLabel("cve", cveStatus)}
+                                      </span>
+                                    ) : <span className="text-slate-600">—</span>}
+                                  </td>
+                                  <td className="px-3 py-1.5">
+                                    {libStatus ? (
+                                      <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(libStatus)}`}>
+                                        {lookupStatusLabel("librariesio", libStatus)}
+                                      </span>
+                                    ) : <span className="text-slate-600">—</span>}
+                                  </td>
+                                  <td className="px-3 py-1.5">
+                                    {hasDetails ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => setLightweightExpandedId(isExpRow ? null : result.id)}
+                                        className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
+                                      >
+                                        {isExpRow ? "hide" : "view"}
+                                      </button>
+                                    ) : <span className="text-slate-600">—</span>}
+                                  </td>
+                                </tr>
+                                {isExpRow ? (
+                                  <tr key={`${result.id}-lw-detail`} className="bg-slate-900/40">
+                                    <td colSpan={6} className="px-3 pb-4 pt-2">
+                                      <div className="space-y-4">
+                                        {result.vulnerability_details && result.vulnerability_details.length > 0 ? (
+                                          <div>
+                                            <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE Findings ({result.vulnerability_details.length})</p>
+                                            <table className="w-full text-[10px]">
+                                              <thead><tr className="text-slate-500"><th className="pb-1 pr-3 text-left">Advisory</th><th className="pb-1 pr-3 text-left">Source</th><th className="pb-1 pr-3 text-left">CVSS</th><th className="pb-1 text-left">Description</th></tr></thead>
+                                              <tbody>
+                                                {result.vulnerability_details.map((v, i) => {
+                                                  const href = v.advisory_id.startsWith("CVE-")
+                                                    ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
+                                                    : v.advisory_id.startsWith("GHSA-")
+                                                      ? `https://github.com/advisories/${v.advisory_id}`
+                                                      : null;
+                                                  return (
+                                                    <tr key={i} className="border-t border-slate-800/40">
+                                                      <td className="py-1 pr-3 font-mono text-indigo-300">
+                                                        {href ? <a href={href} target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-100">{v.advisory_id}</a> : v.advisory_id}
+                                                      </td>
+                                                      <td className="py-1 pr-3 uppercase text-slate-400">{v.source}</td>
+                                                      <td className="py-1 pr-3 text-slate-300">{v.value != null ? v.value.toFixed(1) : "—"}</td>
+                                                      <td className="py-1 text-slate-400 max-w-xs truncate">{v.details ?? "—"}</td>
+                                                    </tr>
+                                                  );
+                                                })}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        ) : null}
+                                        {result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0 ? (
+                                          <div>
+                                            <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Reputation (Libraries.io)</p>
+                                            <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                                              {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score", "package_age_days", "maintainer_count"] as const).map((k) => {
+                                                const val = result.reputation_metadata?.[k];
+                                                if (val == null) return null;
+                                                const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k === "package_age_days" ? "Age (days)" : k === "maintainer_count" ? "Maintainers" : k.replace(/_/g, " ");
+                                                return (
+                                                  <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
+                                                    <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                                    <p className="mt-0.5 font-mono text-[11px] text-slate-200">{k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}</p>
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                ) : null}
+                              </React.Fragment>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
           ) : null}
 
           {activeSection === "add" ? (
