@@ -1124,6 +1124,10 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setLatestScanSummary({ status: null, processed: null, total: null, completedAt: null });
       } else {
         setLatestScanSummary(normalizeLatestCompletedScan(latestJob));
+        if (latestJob.results && latestJob.results.length > 0) {
+          const rows = latestJob.results.map((r, i) => normalizeResultRow(r, i));
+          setScanResultRows(rows);
+        }
       }
     } catch {
       if (cachedScanResults === null) {
@@ -1160,6 +1164,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         scanRetryAttemptRef.current = 0;
 
         if (SCAN_TERMINAL_DONE.has(statusValue)) {
+          if (Array.isArray(payload.results) && payload.results.length > 0) {
+            const finalNormalized = normalizeScanResultsPayload({ results: payload.results });
+            setScanResultRows(finalNormalized.rows);
+            setScanResultsMap(prev => ({ ...prev, ...finalNormalized.map }));
+            liveResultKeysRef.current = new Set(finalNormalized.rows.map(buildResultDedupKey));
+          }
           setIsScanRunning(false);
           setScanStatus("Scan completed. Applying latest highlights.");
           setScanProgress(100);
