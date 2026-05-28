@@ -1339,7 +1339,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         setIsScanRunning(false);
       }
     }
-  }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages, activeScanMode]);
+  }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages, activeScanMode, forceRescan]);
 
   const triggerPartialAnalysisScan = useCallback(async (scanMode: ScanMode = "static") => {
     if (selectedAnalysisPackages.length === 0 || isScanRunning) {
