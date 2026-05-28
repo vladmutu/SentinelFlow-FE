@@ -44,7 +44,7 @@ interface AddDependencyPanelProps {
   client?: DependencyApiClient;
 }
 
-const SEARCH_DEBOUNCE_MS = 300;
+const SEARCH_DEBOUNCE_MS = 150;
 const SEARCH_PAGE_SIZE = 8;
 
 const defaultDependencyApiClient: DependencyApiClient = {

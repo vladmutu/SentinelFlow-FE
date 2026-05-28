@@ -331,6 +331,9 @@ export function mapDependencyApiError(error: unknown): string {
   }
 
   if (error instanceof Error) {
+    if (/(network|fetch)/i.test(error.message)) {
+      return "Cannot reach the backend server. Make sure it is running and try again.";
+    }
     return error.message;
   }
 
@@ -495,6 +498,7 @@ export async function createDependencyPr(
     },
     credentials: "include",
     body: JSON.stringify(request),
+    signal: AbortSignal.timeout(150_000),
   });
 
   const payload = await parseJsonSafe(response);

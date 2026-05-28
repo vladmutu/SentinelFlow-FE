@@ -3,7 +3,7 @@ import {
   StaticFeatures,
   DynamicFinding,
   ScanHistoryItem,
-  ScanMode,
+  ScanHistoryMode,
   RiskStatus,
 } from "@/app/lib/api/scan-api";
 
@@ -281,34 +281,34 @@ export function buildScanHistoryDisplay(item: ScanHistoryItem): ScanHistoryDispl
   };
 }
 
-export function formatScanModeDisplay(mode: ScanMode): string {
+export function formatScanModeDisplay(mode: ScanHistoryMode): string {
   switch (mode) {
     case "full":
       return "Full";
-    case "static_only":
+    case "static_enrichment":
       return "Static";
-    case "static_classifier":
+    case "static":
       return "Static Analysis";
     case "lightweight":
       return "Lightweight";
-    case "dynamic_only":
+    case "dynamic":
       return "Dynamic";
     default:
       return mode;
   }
 }
 
-export function getScanModeColor(mode: ScanMode): string {
+export function getScanModeColor(mode: ScanHistoryMode): string {
   switch (mode) {
     case "full":
       return "blue";
-    case "static_only":
+    case "static_enrichment":
       return "purple";
-    case "static_classifier":
+    case "static":
       return "purple";
     case "lightweight":
       return "teal";
-    case "dynamic_only":
+    case "dynamic":
       return "orange";
     default:
       return "slate";

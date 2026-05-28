@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import React, { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AddDependencyPanel } from "@/app/components/add-dependency-panel";
@@ -58,6 +58,7 @@ type ScanResultRow = {
   malwareScore: number | null;
   riskStatus: string | null;
   riskScore: number | null;
+  analysisStatus: string | null;
   advisoryRefs: string[];
   errorMessage: string | null;
   scanTimestamp: string | null;
@@ -71,6 +72,7 @@ type LatestScanSummary = {
 };
 
 type ScanScope = "full" | "partial";
+type ScanHistoryStatusFilter = "all" | ScanHistoryItem["status"];
 
 type RepoCoordinates = {
   owner: string;
@@ -160,6 +162,24 @@ function verdictBadgeClass(status: string | null | undefined): string {
   }
 }
 
+function getScanModeLabel(mode: string): string {
+  switch (mode) {
+    case "full":
+      return "Full";
+    case "static_enrichment":
+      return "Static + Enrichment";
+    case "dynamic":
+      return "Dynamic";
+    case "static":
+      return "Static";
+    case "lightweight":
+      return "Lightweight";
+    case "unknown":
+    default:
+      return "Unknown";
+  }
+}
+
 function buildResultDedupKey(row: ScanResultRow): string {
   return `${row.packageName}|${row.version}|${row.scanTimestamp ?? "-"}|${row.status}|${row.errorMessage ?? "-"}`;
 }
@@ -202,6 +222,7 @@ function normalizeResultRow(input: unknown, index: number): ScanResultRow {
   const errorMessage =
     coerceString(record.error_message) ?? coerceString(record.error) ?? coerceString(record.failure_reason);
   const scanTimestamp = coerceString(record.scan_timestamp);
+  const analysisStatus = coerceString(record.analysis_status);
 
   return {
     id: coerceString(record.id) ?? `${packageName}@${version}:${index}`,
@@ -212,6 +233,7 @@ function normalizeResultRow(input: unknown, index: number): ScanResultRow {
     malwareScore,
     riskStatus,
     riskScore,
+    analysisStatus,
     advisoryRefs,
     errorMessage,
     scanTimestamp,
@@ -268,6 +290,7 @@ function normalizeScanResultsPayload(payload: unknown): {
           malwareScore,
           riskStatus: coerceString(entryRecord.risk_overall_status),
           riskScore: coerceNonNegativeNumber(entryRecord.risk_overall_score),
+          analysisStatus: coerceString(entryRecord.analysis_status),
           advisoryRefs: Array.isArray(entryRecord.advisory_references)
             ? (entryRecord.advisory_references as unknown[]).filter((r): r is string => typeof r === "string")
             : [],
@@ -592,6 +615,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [scanHistoryJobs, setScanHistoryJobs] = useState<ScanHistoryItem[]>([]);
   const [isScanHistoryLoading, setIsScanHistoryLoading] = useState(false);
   const [scanHistoryTotal, setScanHistoryTotal] = useState(0);
+  const [scanHistoryPage, setScanHistoryPage] = useState(1);
+  const [scanHistoryModeFilter, setScanHistoryModeFilter] = useState<"all" | ScanMode>("all");
+  const [scanHistoryStatusFilter, setScanHistoryStatusFilter] = useState<ScanHistoryStatusFilter>("all");
   const [selectedHistoryJobId, setSelectedHistoryJobId] = useState<string | null>(null);
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<ScanJobResponse | null>(null);
   const [isHistoryJobLoading, setIsHistoryJobLoading] = useState(false);
@@ -609,6 +635,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [lightweightError, setLightweightError] = useState<string | null>(null);
   const [lightweightExpandedId, setLightweightExpandedId] = useState<string | null>(null);
   const lightweightPollTimerRef = useRef<number | null>(null);
+  const historyScrollRef = useRef<HTMLDivElement | null>(null);
   // SBOM
   const [sbomDocument, setSbomDocument] = useState<SbomDocument | null>(null);
   const [isSbomLoading, setIsSbomLoading] = useState(false);
@@ -622,6 +649,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [packageDetailsScanEntry, setPackageDetailsScanEntry] = useState<{ advisory_references?: string[]; risk_overall_status?: string; risk_overall_score?: number; risk_allowlisted?: boolean; static_features?: Record<string, number | null>; dynamic_findings?: DynamicFinding | null; analyzed_by?: string[]; risk_assessment?: Record<string, unknown>; vulnerability_details?: VulnerabilityDetail[] | null; reputation_metadata?: Record<string, unknown> | null; lookup_status?: LookupStatus | null } | null>(null);
   // Scan mode
   const [activeScanMode, setActiveScanMode] = useState<ScanMode>("full");
+  const [forceRescan, setForceRescan] = useState(false);
   const isMountedRef = useRef(true);
   const scanPollTimerRef = useRef<number | null>(null);
   const elapsedTickerRef = useRef<number | null>(null);
@@ -745,6 +773,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     setScanHistoryJobs([]);
     setIsScanHistoryLoading(false);
     setScanHistoryTotal(0);
+    setScanHistoryPage(1);
+    setScanHistoryModeFilter("all");
+    setScanHistoryStatusFilter("all");
     setSelectedHistoryJobId(null);
     setSelectedHistoryJob(null);
     setSbomDocument(null);
@@ -1233,6 +1264,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     // the previous job's `started_at` while we resolve repository coordinates.
     setScanDetails(null);
     setScanResultRows([]);
+    setScanResultsMap({});
     setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
     scanRetryAttemptRef.current = 0;
@@ -1262,6 +1294,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         ecosystem,
         scan_mode: scanMode,
         selected_packages: isPartialScan && selectedScanPackages.length > 0 ? selectedScanPackages : undefined,
+        force_rescan: forceRescan || undefined,
       });
 
       if (!triggerPayload.job_id) {
@@ -1298,7 +1331,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages, activeScanMode]);
 
-  const triggerPartialAnalysisScan = useCallback(async (scanMode: ScanMode = "static_classifier") => {
+  const triggerPartialAnalysisScan = useCallback(async (scanMode: ScanMode = "static") => {
     if (selectedAnalysisPackages.length === 0 || isScanRunning) {
       return;
     }
@@ -1311,6 +1344,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     // from a prior job before the new job's metadata is available.
     setScanDetails(null);
     setScanResultRows([]);
+    setScanResultsMap({});
     setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
     scanRetryAttemptRef.current = 0;
@@ -1333,6 +1367,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         ecosystem,
         scan_mode: scanMode,
         selected_packages: selectedAnalysisPackages,
+        force_rescan: true,
       });
 
       if (!triggerPayload.job_id) {
@@ -1381,12 +1416,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
       const scanCtx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
 
-      const lwScanMode: ScanMode =
-        lightweightSources.cve && lightweightSources.librariesio
-          ? "lightweight"
-          : lightweightSources.cve
-            ? "lightweight_cve"
-            : "lightweight_librariesio";
+      const lwScanMode: ScanMode = "lightweight";
 
       const triggerPayload = await triggerScan(scanCtx, {
         ecosystem,
@@ -1492,18 +1522,76 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const loadScanHistory = useCallback(async () => {
     if (!API_BASE_URL) return;
     setIsScanHistoryLoading(true);
+    setScanHistoryJobs([]);
+    setScanHistoryTotal(0);
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
-      const result = await getScanHistory(scanContext, 1, 20);
+      const result = await getScanHistory(scanContext, {
+        page: 1,
+        per_page: 25,
+        scan_mode: scanHistoryModeFilter === "all" ? undefined : scanHistoryModeFilter,
+        status: scanHistoryStatusFilter === "all" ? undefined : scanHistoryStatusFilter,
+      });
       if (isMountedRef.current) {
         setScanHistoryJobs(result.jobs);
         setScanHistoryTotal(result.total);
+        setScanHistoryPage(result.page);
       }
     } catch { /* silent */ } finally {
       if (isMountedRef.current) setIsScanHistoryLoading(false);
     }
-  }, [resolveRepoCoordinates]);
+  }, [resolveRepoCoordinates, scanHistoryModeFilter, scanHistoryStatusFilter]);
+
+  const loadMoreScanHistory = useCallback(async () => {
+    if (!API_BASE_URL || isScanHistoryLoading || scanHistoryJobs.length >= scanHistoryTotal) {
+      return;
+    }
+
+    const nextPage = scanHistoryPage + 1;
+    setIsScanHistoryLoading(true);
+
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const result = await getScanHistory(scanContext, {
+        page: nextPage,
+        per_page: 25,
+        scan_mode: scanHistoryModeFilter === "all" ? undefined : scanHistoryModeFilter,
+        status: scanHistoryStatusFilter === "all" ? undefined : scanHistoryStatusFilter,
+      });
+
+      if (isMountedRef.current) {
+        setScanHistoryJobs((current) => {
+          const existingIds = new Set(current.map((job) => job.id));
+          const merged = [...current];
+          result.jobs.forEach((job) => {
+            if (!existingIds.has(job.id)) {
+              merged.push(job);
+            }
+          });
+          return merged;
+        });
+        setScanHistoryTotal(result.total);
+        setScanHistoryPage(result.page);
+      }
+    } catch {
+      // silent
+    } finally {
+      if (isMountedRef.current) {
+        setIsScanHistoryLoading(false);
+      }
+    }
+  }, [API_BASE_URL, isScanHistoryLoading, resolveRepoCoordinates, scanHistoryJobs.length, scanHistoryModeFilter, scanHistoryPage, scanHistoryStatusFilter, scanHistoryTotal]);
+
+  const handleHistoryScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    const target = event.currentTarget;
+    const nearBottom = target.scrollTop + target.clientHeight >= target.scrollHeight - 160;
+
+    if (nearBottom && !isScanHistoryLoading && scanHistoryJobs.length < scanHistoryTotal) {
+      void loadMoreScanHistory();
+    }
+  }, [isScanHistoryLoading, loadMoreScanHistory, scanHistoryJobs.length, scanHistoryTotal]);
 
   const loadHistoryJobDetails = useCallback(async (jobId: string) => {
     if (!API_BASE_URL) return;
@@ -1562,11 +1650,18 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
   useEffect(() => {
     if (activeSection === "history") {
+      setScanHistoryPage(1);
+      setSelectedHistoryJobId(null);
+      setSelectedHistoryJob(null);
+      setExpandedResultId(null);
       void loadScanHistory();
+      if (historyScrollRef.current) {
+        historyScrollRef.current.scrollTop = 0;
+      }
     }
-    // Only re-run when the active section changes, not every loadScanHistory recreation
+    // Only re-run when the active section or filter changes, not every loadScanHistory recreation
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSection, decodedId]);
+  }, [activeSection, decodedId, scanHistoryModeFilter, scanHistoryStatusFilter]);
 
   // When history refreshes and the currently-selected job transitions from running→done, re-fetch its details.
   useEffect(() => {
@@ -1789,7 +1884,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
                       <div className="pt-1 space-y-2">
                         <div className="flex flex-wrap gap-1">
-                          {(["full", "static_only", "dynamic_only"] as const).map((mode) => (
+                          {(["full", "static_enrichment", "dynamic", "static"] as const).map((mode) => (
                             <button
                               key={mode}
                               type="button"
@@ -1801,10 +1896,20 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
                               } disabled:cursor-not-allowed disabled:opacity-50`}
                             >
-                              {mode === "full" ? "Full" : mode === "static_only" ? "Static + Enrichment" : "Dynamic"}
+                              {getScanModeLabel(mode)}
                             </button>
                           ))}
                         </div>
+                        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-400">
+                          <input
+                            type="checkbox"
+                            checked={forceRescan}
+                            onChange={(e) => setForceRescan(e.target.checked)}
+                            disabled={isScanRunning}
+                            className="h-3.5 w-3.5 accent-cyan-400"
+                          />
+                          Force full rescan
+                        </label>
                         <div className="flex flex-wrap gap-2">
                           <button
                             type="button"
@@ -2020,11 +2125,13 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           </span>
                         ) : null}
                       </div>
-                      {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
-                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                        {(scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 && scanProgress > 0) ? (
                           <div className="h-full rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${scanProgress}%` }} />
-                        </div>
-                      ) : null}
+                        ) : (
+                          <div className="h-full w-full animate-pulse rounded-full bg-cyan-300/40" />
+                        )}
+                      </div>
                       {runtimeElapsedLabel ? (
                         <p className="mt-1 text-[11px] text-slate-500">{runtimeElapsedLabel}</p>
                       ) : null}
@@ -2299,11 +2406,13 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           </span>
                         ) : null}
                       </div>
-                      {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
-                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                        {(scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 && scanProgress > 0) ? (
                           <div className="h-full rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${scanProgress}%` }} />
-                        </div>
-                      ) : null}
+                        ) : (
+                          <div className="h-full w-full animate-pulse rounded-full bg-cyan-300/40" />
+                        )}
+                      </div>
                       {runtimeElapsedLabel ? (
                         <p className="mt-1 text-[11px] text-slate-500">{runtimeElapsedLabel}</p>
                       ) : null}
@@ -2385,7 +2494,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <button
                         type="button"
                         onClick={() => {
-                          void triggerPartialAnalysisScan("dynamic_only");
+                          void triggerPartialAnalysisScan("dynamic");
                         }}
                         disabled={!canStartPartialAnalysisScan}
                         className="w-full rounded-md border border-cyan-400/40 bg-cyan-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
@@ -2430,28 +2539,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 </div>
 
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current job package results</p>
-                      {scanJobId ? (
-                        <p className="mt-2 text-xs text-slate-400">
-                          Rows: {scanResultRows.length} · Failed rows: {liveFailedRowsCount}
-                        </p>
-                      ) : (
-                        <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows from /scan/{'{'}job_id{'}'}.</p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void triggerPackageScan("dynamic_only");
-                      }}
-                      disabled={!canStartScan}
-                      className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {scanStartLabel}
-                    </button>
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current job package results</p>
+                    {scanJobId ? (
+                      <p className="mt-2 text-xs text-slate-400">
+                        Rows: {scanResultRows.length} · Failed rows: {liveFailedRowsCount}
+                      </p>
+                    ) : (
+                      <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows from /scan/{'{'}job_id{'}'}.</p>
+                    )}
                   </div>
 
                   {scanJobId && scanResultRows.length === 0 ? (
@@ -2500,7 +2596,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     ) : <span className="text-slate-600">—</span>}
                                   </td>
                                   <td className="px-3 py-2 font-mono">
-                                    {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : "-"}
+                                    {(row.riskScore ?? row.malwareScore) !== null ? `${((row.riskScore ?? row.malwareScore)! * 100).toFixed(1)}%` : "-"}
                                   </td>
                                   <td className="px-3 py-2 text-center text-slate-500">{isExpanded ? "▲" : "▼"}</td>
                                 </tr>
@@ -2512,7 +2608,10 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                         <div className="flex flex-wrap gap-4 text-xs">
                                           <div>
                                             <p className="text-[10px] uppercase tracking-wide text-slate-500">Analysis Status</p>
-                                            <p className="mt-0.5 font-medium uppercase text-slate-200">{row.status}</p>
+                                            <p className="mt-0.5 font-medium uppercase text-slate-200">{row.analysisStatus ?? row.malwareStatus ?? "—"}</p>
+                                            {(!row.analysisStatus || ["skipped", "not_malicious", "mode_excluded"].includes(row.analysisStatus)) ? (
+                                              <p className="mt-0.5 text-[10px] text-slate-500">Dynamic analysis not run — check MicroVMService</p>
+                                            ) : null}
                                           </div>
                                           {row.malwareScore !== null ? (
                                             <div>
@@ -3052,21 +3151,53 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           {activeSection === "history" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
               <div className="space-y-4">
-                <div className="flex items-center justify-between rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <div>
+                <div className="flex flex-wrap items-end justify-between gap-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                  <div className="space-y-1">
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-300">Scan History</p>
-                    <p className="mt-1 text-sm text-slate-300">
-                      {scanHistoryTotal > 0 ? `${scanHistoryTotal} scan job${scanHistoryTotal !== 1 ? "s" : ""} found.` : "View all scans performed on this repository."}
+                    <p className="text-sm text-slate-300">
+                      Showing {scanHistoryJobs.length} of {scanHistoryTotal} scan job{scanHistoryTotal === 1 ? "" : "s"}.
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => { void loadScanHistory(); }}
-                    disabled={isScanHistoryLoading}
-                    className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-slate-300 transition hover:border-slate-500 disabled:opacity-50"
-                  >
-                    {isScanHistoryLoading ? "Loading..." : "Refresh"}
-                  </button>
+                  <div className="flex flex-wrap items-end gap-3">
+                    <label className="space-y-1 text-xs text-slate-400">
+                      <span className="block uppercase tracking-[0.12em]">Scan Type</span>
+                      <select
+                        value={scanHistoryModeFilter}
+                        onChange={(event) => setScanHistoryModeFilter(event.target.value as "all" | ScanMode)}
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 outline-none transition focus:border-indigo-400"
+                      >
+                        <option value="all">All scans</option>
+                        <option value="full">Full</option>
+                        <option value="static_enrichment">Static + Enrichment</option>
+                        <option value="dynamic">Dynamic</option>
+                        <option value="static">Static</option>
+                        <option value="lightweight">Lightweight</option>
+                      </select>
+                    </label>
+                    <label className="space-y-1 text-xs text-slate-400">
+                      <span className="block uppercase tracking-[0.12em]">Status</span>
+                      <select
+                        value={scanHistoryStatusFilter}
+                        onChange={(event) => setScanHistoryStatusFilter(event.target.value as ScanHistoryStatusFilter)}
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 outline-none transition focus:border-indigo-400"
+                      >
+                        <option value="all">All statuses</option>
+                        <option value="cancelled">Cancelled</option>
+                        <option value="completed">Completed</option>
+                        <option value="failed">Failed</option>
+                        <option value="running">Running</option>
+                        <option value="pending">Pending</option>
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => { void loadScanHistory(); }}
+                      disabled={isScanHistoryLoading}
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-slate-300 transition hover:border-slate-500 disabled:opacity-50"
+                    >
+                      {isScanHistoryLoading ? "Loading..." : "Refresh"}
+                    </button>
+                  </div>
                 </div>
 
                 {isScanHistoryLoading && scanHistoryJobs.length === 0 ? (
@@ -3080,7 +3211,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     <p className="text-sm text-slate-400">No scan history yet. Start a scan from the Dependency Graph tab.</p>
                   </div>
                 ) : (
-                  <div className="overflow-hidden rounded-2xl border border-slate-700 bg-slate-950/70">
+                  <div
+                    ref={historyScrollRef}
+                    onScroll={handleHistoryScroll}
+                    className="max-h-[62vh] overflow-y-auto rounded-2xl border border-slate-700 bg-slate-950/70"
+                  >
                     <div className="overflow-x-auto">
                       <table className="w-full text-left text-xs text-slate-200">
                         <thead className="border-b border-slate-800 bg-slate-900/80 text-slate-400">
@@ -3101,13 +3236,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               : "-";
                             const modeBadgeClass = job.scan_mode === "full"
                               ? "border-blue-400/50 bg-blue-500/15 text-blue-100"
-                              : job.scan_mode === "static_only"
+                              : job.scan_mode === "static_enrichment"
                                 ? "border-purple-400/50 bg-purple-500/15 text-purple-100"
-                                : job.scan_mode === "static_classifier"
-                                  ? "border-purple-300/60 bg-purple-500/15 text-purple-100"
-                                : (job.scan_mode === "lightweight" || job.scan_mode === "lightweight_cve" || job.scan_mode === "lightweight_librariesio")
-                                  ? "border-teal-400/50 bg-teal-500/15 text-teal-100"
-                                  : "border-orange-400/50 bg-orange-500/15 text-orange-100";
+                                : job.scan_mode === "dynamic"
+                                  ? "border-orange-400/50 bg-orange-500/15 text-orange-100"
+                                  : job.scan_mode === "static"
+                                    ? "border-indigo-400/50 bg-indigo-500/15 text-indigo-100"
+                                    : job.scan_mode === "lightweight"
+                                      ? "border-teal-400/50 bg-teal-500/15 text-teal-100"
+                                      : "border-slate-500/50 bg-slate-500/15 text-slate-200";
                             const statusBadgeClass = job.status === "completed"
                               ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
                               : job.status === "running" || job.status === "pending"
@@ -3124,19 +3261,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   <td className="px-4 py-3 uppercase text-slate-400">{job.ecosystem}</td>
                                   <td className="px-4 py-3">
                                     <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${modeBadgeClass}`}>
-                                      {job.scan_mode === "full"
-                                        ? "Full"
-                                        : job.scan_mode === "static_only"
-                                          ? "Static + Enrichment"
-                                          : job.scan_mode === "static_classifier"
-                                            ? "Static Analysis"
-                                            : job.scan_mode === "lightweight"
-                                              ? "Lightweight"
-                                              : job.scan_mode === "lightweight_cve"
-                                                ? "CVE Only"
-                                                : job.scan_mode === "lightweight_librariesio"
-                                                  ? "Rep Only"
-                                                  : "Dynamic"}
+                                      {getScanModeLabel(job.scan_mode)}
                                     </span>
                                   </td>
                                   <td className="px-4 py-3">
@@ -3726,7 +3851,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
               aria-label="Close AI chat"
               title="Close AI chat"
             >
-              <span className="text-sm font-semibold leading-none">×</span>
+              <span className="text-sm font-semibold leading-none">✕</span>
             </button>
           </div>
 

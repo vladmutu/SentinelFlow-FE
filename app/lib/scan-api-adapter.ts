@@ -206,13 +206,13 @@ export function getScanModeColor(scanMode: string): string {
   switch (scanMode) {
     case "full":
       return "blue";
-    case "static_only":
+    case "static_enrichment":
       return "purple";
-    case "static_classifier":
+    case "static":
       return "purple";
-    case "static_dynamic":
+    case "lightweight":
       return "teal";
-    case "dynamic_only":
+    case "dynamic":
       return "orange";
     default:
       return "slate";
@@ -226,14 +226,14 @@ export function formatScanModeLabel(scanMode: string): string {
   switch (scanMode) {
     case "full":
       return "Full Scan";
-    case "static_only":
-      return "Static Analysis Only";
-    case "static_classifier":
+    case "static_enrichment":
+      return "Static + Enrichment";
+    case "static":
       return "Static Analysis";
-    case "static_dynamic":
-      return "Static + Dynamic";
-    case "dynamic_only":
-      return "Dynamic Analysis Only";
+    case "lightweight":
+      return "Lightweight (CVE + Reputation)";
+    case "dynamic":
+      return "Dynamic Analysis";
     default:
       return scanMode;
   }

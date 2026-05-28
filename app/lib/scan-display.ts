@@ -84,16 +84,16 @@ export function getScanModeLabel(mode: ScanMode): string {
   switch (mode) {
     case "full":
       return "Full Scan";
-    case "static_only":
-      return "Static Only";
-    case "static_classifier":
+    case "static_enrichment":
+      return "Static + Enrichment";
+    case "static":
       return "Static Analysis";
     case "lightweight":
       return "Lightweight (CVE + Reputation)";
-    case "dynamic_only":
-      return "Dynamic Only";
+    case "dynamic":
+      return "Dynamic";
     default:
-      return mode;
+      return "Unknown";
   }
 }
 
@@ -226,7 +226,9 @@ export function deriveScanDisplay(
   }
 
   const phase = scanDetails.status as "pending" | "running" | "completed" | "failed" | "cancelled";
-  const progressPercent = Math.max(0, Math.min(100, scanDetails.progress_percent || 0));
+  const progressPercent = scanDetails.progress_percent != null
+    ? Math.max(0, Math.min(100, scanDetails.progress_percent))
+    : liveProgress;
   const progressLabel = `${Math.round(progressPercent)}%`;
   const elapsedLabel = formatDuration(scanDetails.elapsed_seconds ?? 0);
 

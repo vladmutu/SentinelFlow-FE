@@ -4,7 +4,8 @@ import { Ecosystem } from "@/app/types/dashboard";
 // TYPES - Scan Management
 // ============================================================================
 
-export type ScanMode = "full" | "static_only" | "static_classifier" | "lightweight" | "lightweight_cve" | "lightweight_librariesio" | "dynamic_only";
+export type ScanMode = "full" | "static_enrichment" | "dynamic" | "static" | "lightweight";
+export type ScanHistoryMode = ScanMode | "unknown";
 export type ScanStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type MalwareStatus = "clean" | "malicious" | "suspicious" | "error" | "unknown";
 export type RiskStatus = "clean" | "suspicious" | "malicious";
@@ -15,11 +16,13 @@ export interface ScanTriggerRequest {
   ecosystem: Ecosystem;
   selected_packages?: string[];
   scan_mode?: ScanMode;
+  force_rescan?: boolean;
 }
 
 export interface ScanTriggerResponse {
   job_id: string;
   status: ScanStatus;
+  from_cache?: boolean;
 }
 
 export type StaticFeatures = Record<string, number>;
@@ -115,7 +118,7 @@ export interface ScanJobResponse {
 export interface ScanHistoryItem {
   id: string;
   ecosystem: Ecosystem;
-  scan_mode: ScanMode;
+  scan_mode: ScanHistoryMode;
   status: ScanStatus;
   total_packages: number;
   processed_packages?: number;
@@ -133,6 +136,13 @@ export interface ScanHistoryResponse {
   total: number;
   page: number;
   per_page: number;
+}
+
+export interface ScanHistoryRequest {
+  page?: number;
+  per_page?: number;
+  scan_mode?: ScanMode;
+  status?: ScanStatus;
 }
 
 // Map of "package@version" -> ScanResultMapEntry
@@ -391,7 +401,7 @@ function normalizeScanJob(payload: unknown): ScanJobResponse {
     owner: typeof record.owner === "string" ? record.owner : "",
     repo_name: typeof record.repo_name === "string" ? record.repo_name : "",
     ecosystem: (record.ecosystem === "npm" || record.ecosystem === "pypi") ? record.ecosystem : "npm",
-    scan_mode: (["full", "static_only", "static_classifier", "lightweight", "lightweight_cve", "lightweight_librariesio", "dynamic_only"].includes(String(record.scan_mode))
+    scan_mode: (["full", "static_enrichment", "dynamic", "static", "lightweight"].includes(String(record.scan_mode))
       ? record.scan_mode
       : "full") as ScanMode,
     status: (["pending", "running", "completed", "failed", "cancelled"].includes(String(record.status))
@@ -657,13 +667,27 @@ export async function getPaginatedScanResults(
 
 export async function getScanHistory(
   context: ScanApiContext,
-  page = 1,
+  requestOrPage: ScanHistoryRequest | number = 1,
   perPage = 20,
   options?: { signal?: AbortSignal },
 ): Promise<ScanHistoryResponse> {
-  const sanitizedPage = Math.max(1, Math.floor(page));
-  const sanitizedPerPage = Math.max(1, Math.min(100, Math.floor(perPage)));
-  const url = `${context.baseUrl}/api/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.repoName)}/scan/history?page=${sanitizedPage}&per_page=${sanitizedPerPage}`;
+  const request: ScanHistoryRequest = typeof requestOrPage === "number"
+    ? { page: requestOrPage, per_page: perPage }
+    : requestOrPage;
+
+  const sanitizedPage = Math.max(1, Math.floor(request.page ?? 1));
+  const sanitizedPerPage = Math.max(1, Math.min(100, Math.floor(request.per_page ?? perPage)));
+  const urlSearchParams = new URLSearchParams({
+    page: String(sanitizedPage),
+    per_page: String(sanitizedPerPage),
+  });
+  if (request.scan_mode) {
+    urlSearchParams.set("scan_mode", request.scan_mode);
+  }
+  if (request.status) {
+    urlSearchParams.set("status", request.status);
+  }
+  const url = `${context.baseUrl}/api/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.repoName)}/scan/history?${urlSearchParams.toString()}`;
 
   const response = await fetch(url, {
     method: "GET",
@@ -698,9 +722,9 @@ export async function getScanHistory(
       return {
         id: typeof entry.id === "string" ? entry.id : "",
         ecosystem: (entry.ecosystem === "npm" || entry.ecosystem === "pypi") ? entry.ecosystem : "npm",
-        scan_mode: (["full", "static_only", "static_classifier", "lightweight", "lightweight_cve", "lightweight_librariesio", "dynamic_only"].includes(String(entry.scan_mode))
+        scan_mode: (["full", "static_enrichment", "dynamic", "static", "lightweight", "unknown"].includes(String(entry.scan_mode))
           ? entry.scan_mode
-          : "full") as ScanMode,
+          : "unknown") as ScanHistoryMode,
         status: (["pending", "running", "completed", "failed", "cancelled"].includes(String(entry.status))
           ? entry.status
           : "pending") as ScanStatus,
