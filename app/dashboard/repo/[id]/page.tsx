@@ -1451,7 +1451,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
             // loadScanHistory is declared after triggerLightweightScan — safe to call directly
             void loadScanHistory();
           } else {
-            lightweightPollTimerRef.current = window.setTimeout(() => { void poll(); }, 2000);
+            lightweightPollTimerRef.current = window.setTimeout(() => { void poll(); }, 800);
           }
         } catch (err) {
           if (!isMountedRef.current) return;
