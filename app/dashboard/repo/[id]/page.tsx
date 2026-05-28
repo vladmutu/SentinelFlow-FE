@@ -633,6 +633,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [lightweightJob, setLightweightJob] = useState<ScanJobResponse | null>(null);
   const [isLightweightRunning, setIsLightweightRunning] = useState(false);
   const [lightweightError, setLightweightError] = useState<string | null>(null);
+  const [isLightweightCancelling, setIsLightweightCancelling] = useState(false);
   const [lightweightExpandedId, setLightweightExpandedId] = useState<string | null>(null);
   const lightweightPollTimerRef = useRef<number | null>(null);
   const historyScrollRef = useRef<HTMLDivElement | null>(null);
@@ -1466,6 +1467,26 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [lightweightScope, lightweightSelectedPackages, lightweightSources, resolveRepoCoordinates]);
 
+  const cancelLightweightScan = useCallback(async () => {
+    if (!lightweightJob?.id || isLightweightCancelling) return;
+    setIsLightweightCancelling(true);
+    if (lightweightPollTimerRef.current !== null) {
+      window.clearTimeout(lightweightPollTimerRef.current);
+      lightweightPollTimerRef.current = null;
+    }
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanCtx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      await apiCancelScan(scanCtx, lightweightJob.id);
+    } catch {
+      // ignore — local state is updated regardless
+    } finally {
+      setIsLightweightRunning(false);
+      setLightweightJob(prev => prev ? { ...prev, status: "cancelled" } : null);
+      setIsLightweightCancelling(false);
+    }
+  }, [isLightweightCancelling, lightweightJob, resolveRepoCoordinates]);
+
   const cancelScanJob = useCallback(async () => {
     if (!scanJobId || isCancellingScan) {
       return;
@@ -2232,6 +2253,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         Run Analysis on {selectedAnalysisPackages.length} Package{selectedAnalysisPackages.length === 1 ? "" : "s"}
                       </button>
                     ) : null}
+                    {canCancelScan ? (
+                      <button
+                        type="button"
+                        onClick={() => { void cancelScanJob(); }}
+                        disabled={isCancellingScan}
+                        className="w-full rounded-md border border-rose-400/40 bg-rose-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {isCancellingScan ? "Stopping..." : "Stop Scan"}
+                      </button>
+                    ) : null}
                   </div>
 
                   <div className="grid gap-3 sm:grid-cols-3">
@@ -2510,6 +2541,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         className="w-full rounded-md border border-cyan-400/40 bg-cyan-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-cyan-100 transition hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         Run Analysis on {selectedAnalysisPackages.length} Package{selectedAnalysisPackages.length === 1 ? "" : "s"}
+                      </button>
+                    ) : null}
+                    {canCancelScan ? (
+                      <button
+                        type="button"
+                        onClick={() => { void cancelScanJob(); }}
+                        disabled={isCancellingScan}
+                        className="w-full rounded-md border border-rose-400/40 bg-rose-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {isCancellingScan ? "Stopping..." : "Stop Scan"}
                       </button>
                     ) : null}
                   </div>
@@ -3620,6 +3661,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                   >
                     {isLightweightRunning ? "Running…" : "Start Lightweight Scan"}
                   </button>
+                  {isLightweightRunning && lightweightJob?.id ? (
+                    <button
+                      type="button"
+                      onClick={() => { void cancelLightweightScan(); }}
+                      disabled={isLightweightCancelling}
+                      className="inline-flex items-center rounded-lg border border-rose-400/40 bg-rose-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {isLightweightCancelling ? "Stopping..." : "Stop Scan"}
+                    </button>
+                  ) : null}
                 </div>
 
               </div>
