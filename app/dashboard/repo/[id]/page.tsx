@@ -47,6 +47,7 @@ type ScanResultMapEntry = {
   vulnerability_details?: VulnerabilityDetail[] | null;
   reputation_metadata?: Record<string, unknown> | null;
   lookup_status?: LookupStatus | null;
+  dynamic_findings?: DynamicFinding | null;
 };
 
 type ScanResultRow = {
@@ -1196,15 +1197,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           return;
         }
 
-        if (isPollingStatus(statusValue)) {
-          if (scanPollTimerRef.current !== null) {
-            window.clearTimeout(scanPollTimerRef.current);
-          }
-
-          scanPollTimerRef.current = window.setTimeout(() => {
-            void pollScanJob(owner, repoName, jobId, headers);
-          }, SCAN_POLL_INTERVAL_MS);
+        // Always continue polling for any non-terminal status.
+        // Removing the isPollingStatus guard ensures an unexpected or "unknown"
+        // status value never silently kills the polling chain.
+        if (scanPollTimerRef.current !== null) {
+          window.clearTimeout(scanPollTimerRef.current);
         }
+
+        scanPollTimerRef.current = window.setTimeout(() => {
+          void pollScanJob(owner, repoName, jobId, headers);
+        }, SCAN_POLL_INTERVAL_MS);
       } catch (pollError) {
         if (!isMountedRef.current) {
           return;
@@ -2109,6 +2111,46 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         </div>
                       ) : null}
 
+                      {graphDetailNode.scanEntry?.dynamic_findings &&
+                        graphDetailNode.scanEntry.dynamic_findings.status &&
+                        graphDetailNode.scanEntry.dynamic_findings.status !== "skipped" ? (
+                        <div>
+                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">
+                            Dynamic Analysis
+                          </p>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            {(
+                              [
+                                ["Status",    graphDetailNode.scanEntry.dynamic_findings.status],
+                                ["Coverage",  graphDetailNode.scanEntry.dynamic_findings.coverage],
+                                ["Risk Score", graphDetailNode.scanEntry.dynamic_findings.risk_score != null
+                                  ? `${(graphDetailNode.scanEntry.dynamic_findings.risk_score * 100).toFixed(1)}%`
+                                  : null],
+                                ["VM Evasion", graphDetailNode.scanEntry.dynamic_findings.vm_evasion_observed != null
+                                  ? (graphDetailNode.scanEntry.dynamic_findings.vm_evasion_observed ? "Detected" : "None")
+                                  : null],
+                                ["IOC Hit", graphDetailNode.scanEntry.dynamic_findings.ioc_hit != null
+                                  ? (graphDetailNode.scanEntry.dynamic_findings.ioc_hit ? "Yes" : "None")
+                                  : null],
+                              ] as [string, string | null | undefined][]
+                            )
+                              .filter(([, v]) => v != null)
+                              .map(([label, value]) => (
+                                <div key={label} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
+                                  <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                  <p className={`mt-0.5 font-mono text-[11px] ${
+                                    (label === "VM Evasion" || label === "IOC Hit") && value !== "None"
+                                      ? "text-rose-300"
+                                      : "text-slate-200"
+                                  }`}>
+                                    {value}
+                                  </p>
+                                </div>
+                              ))}
+                          </div>
+                        </div>
+                      ) : null}
+
                       {/* Empty state */}
                       {!graphDetailNode.scanEntry?.malware_status &&
                         !(graphDetailNode.scanEntry?.vulnerability_details?.length) &&
@@ -2939,6 +2981,57 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           {packageDetailsScanEntry?.dynamic_findings && packageDetailsScanEntry.analyzed_by?.includes("dynamic") ? (
                             <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/50 p-4">
                               <p className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-400">Dynamic Analysis</p>
+
+                              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">Status</p>
+                                  <p className="mt-1 font-mono text-sm text-slate-200">
+                                    {packageDetailsScanEntry.dynamic_findings.status ?? "—"}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">Coverage</p>
+                                  <p className="mt-1 font-mono text-sm text-slate-200">
+                                    {packageDetailsScanEntry.dynamic_findings.coverage ?? "—"}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">Risk Score</p>
+                                  <p className="mt-1 font-mono text-sm text-slate-200">
+                                    {packageDetailsScanEntry.dynamic_findings.risk_score != null
+                                      ? `${(packageDetailsScanEntry.dynamic_findings.risk_score * 100).toFixed(1)}%`
+                                      : "—"}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">VM Evasion</p>
+                                  <p className={`mt-1 font-mono text-sm font-semibold ${
+                                    packageDetailsScanEntry.dynamic_findings.vm_evasion_observed
+                                      ? "text-rose-300"
+                                      : "text-emerald-300"
+                                  }`}>
+                                    {packageDetailsScanEntry.dynamic_findings.vm_evasion_observed ? "Detected" : "None"}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">IOC Hit</p>
+                                  <p className={`mt-1 font-mono text-sm font-semibold ${
+                                    packageDetailsScanEntry.dynamic_findings.ioc_hit
+                                      ? "text-rose-300"
+                                      : "text-emerald-300"
+                                  }`}>
+                                    {packageDetailsScanEntry.dynamic_findings.ioc_hit ? "Yes" : "None"}
+                                  </p>
+                                </div>
+                                {packageDetailsScanEntry.dynamic_findings.sandbox_provider ? (
+                                  <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+                                    <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">Sandbox</p>
+                                    <p className="mt-1 font-mono text-sm text-slate-200">
+                                      {packageDetailsScanEntry.dynamic_findings.sandbox_provider}
+                                    </p>
+                                  </div>
+                                ) : null}
+                              </div>
 
                               <div className="flex flex-wrap gap-2">
                                 {packageDetailsScanEntry.dynamic_findings.status ? (

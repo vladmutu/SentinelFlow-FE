@@ -30,6 +30,8 @@ export type StaticFeatures = Record<string, number>;
 export interface DynamicFinding {
   status?: string;
   coverage?: string;
+  risk_score?: number | null;
+  ioc_hit?: boolean;
   sandbox_provider?: string;
   sandbox_job_id?: string;
   sandbox_timed_out?: boolean;
@@ -323,6 +325,8 @@ function normalizeScanResult(payload: unknown): ScanResultResponse {
     ? {
         status: typeof dynamicFindings.status === "string" ? dynamicFindings.status : undefined,
         coverage: typeof dynamicFindings.coverage === "string" ? dynamicFindings.coverage : undefined,
+        risk_score: typeof dynamicFindings.risk_score === "number" ? dynamicFindings.risk_score : null,
+        ioc_hit: typeof dynamicFindings.ioc_hit === "boolean" ? dynamicFindings.ioc_hit : undefined,
         sandbox_provider: typeof dynamicFindings.sandbox_provider === "string" ? dynamicFindings.sandbox_provider : undefined,
         sandbox_job_id: typeof dynamicFindings.sandbox_job_id === "string" ? dynamicFindings.sandbox_job_id : undefined,
         sandbox_timed_out: typeof dynamicFindings.sandbox_timed_out === "boolean" ? dynamicFindings.sandbox_timed_out : undefined,
