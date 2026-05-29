@@ -631,6 +631,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
   const [expandedStaticResultId, setExpandedStaticResultId] = useState<string | null>(null);
   const [expandedDynamicRowId, setExpandedDynamicRowId] = useState<string | null>(null);
+  const [selectedStaticJobId, setSelectedStaticJobId] = useState<string | null>(null);
+  const [selectedDynamicJobId, setSelectedDynamicJobId] = useState<string | null>(null);
+  const [selectedLightweightJobId, setSelectedLightweightJobId] = useState<string | null>(null);
   const [graphDetailNode, setGraphDetailNode] = useState<{ label: string; features: Record<string, number> | null; scanEntry: ScanResultMapEntry | null } | null>(null);
   // Lightweight scan tab
   const [lightweightScope, setLightweightScope] = useState<"partial" | "full">("partial");
@@ -744,6 +747,24 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
     return scanDisplay.elapsedLabel;
   }, [liveElapsedSeconds, scanDisplay.elapsedLabel, scanDisplay.phase]);
+
+  const staticTabResults = useMemo((): ScanResultRow[] => {
+    const job = selectedStaticJobId ? activeScanJobs.get(selectedStaticJobId) : null;
+    if (!job?.details) return [];
+    return normalizeScanResultsPayload(job.details).rows;
+  }, [selectedStaticJobId, activeScanJobs]);
+
+  const dynamicTabResults = useMemo((): ScanResultRow[] => {
+    const job = selectedDynamicJobId ? activeScanJobs.get(selectedDynamicJobId) : null;
+    if (!job?.details) return [];
+    return normalizeScanResultsPayload(job.details).rows;
+  }, [selectedDynamicJobId, activeScanJobs]);
+
+  const lightweightTabResults = useMemo((): ScanResultResponse[] => {
+    const job = selectedLightweightJobId ? activeScanJobs.get(selectedLightweightJobId) : null;
+    const details = job?.details as (InternalScanJobResponse & { results?: ScanResultResponse[] }) | null | undefined;
+    return details?.results ?? [];
+  }, [selectedLightweightJobId, activeScanJobs]);
 
   const sections = [
     { key: "graph", label: "Dependency Graph" },
@@ -1408,6 +1429,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
       setActiveScanJobs(current => new Map(current).set(jobId, newJob));
       setHasScanned(true);
+      if (sourceTab === "static-analysis") setSelectedStaticJobId(jobId);
+      if (sourceTab === "dynamic-analysis") setSelectedDynamicJobId(jobId);
 
       const timer = window.setTimeout(() => {
         void pollScanJob(owner, repoName, jobId, headers);
@@ -1455,6 +1478,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       };
 
       setActiveScanJobs(current => new Map(current).set(jobId, newJob));
+      setSelectedLightweightJobId(jobId);
 
       const timer = window.setTimeout(() => {
         void pollScanJob(owner, repoName, jobId, headers);
@@ -2258,7 +2282,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "static-analysis").map(job => (
                           <div
                             key={job.jobId}
-                            className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                            onClick={() => setSelectedStaticJobId(job.jobId)}
+                            className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedStaticJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
                           >
                             <div className="flex items-center gap-2">
                               {(job.status === "pending" || job.status === "running") ? (
@@ -2316,16 +2341,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Scan Results</p>
-                    {latestScanSummary.status !== null ? (
+                    {selectedStaticJobId ? (
                       <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2.5 py-0.5 text-[10px] font-medium text-cyan-300">
-                        Last scan — {formatTimestampForDisplay(latestScanSummary.completedAt)}
+                        {activeScanJobs.get(selectedStaticJobId)?.status ?? "—"}
                       </span>
                     ) : null}
                   </div>
 
-                  {scanResultRows.length > 0 ? (
+                  {staticTabResults.length > 0 ? (
                     <div className="space-y-2">
-                      {scanResultRows.map((row) => {
+                      {staticTabResults.map((row) => {
                         const isErrorRow = row.errorMessage !== null || row.status === "failed";
                         const isExpanded = expandedStaticResultId === row.id;
                         const riskBadgeClass =
@@ -2440,9 +2465,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     </div>
                   ) : (
                     <p className="text-sm text-slate-400">
-                      {latestScanSummary.status !== null
-                        ? "No individual package results available for the last scan."
-                        : "Run a scan to see results here."}
+                      {selectedStaticJobId
+                        ? "No results available for the selected scan yet."
+                        : "Select a scan above to view results."}
                     </p>
                   )}
 
@@ -2537,7 +2562,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "dynamic-analysis").map(job => (
                           <div
                             key={job.jobId}
-                            className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                            onClick={() => setSelectedDynamicJobId(job.jobId)}
+                            className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedDynamicJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
                           >
                             <div className="flex items-center gap-2">
                               {(job.status === "pending" || job.status === "running") ? (
@@ -2577,17 +2603,21 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div>
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Latest scan package results</p>
-                    {scanResultRows.length > 0 ? (
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">
+                      {selectedDynamicJobId ? "Selected scan results" : "Package Results"}
+                    </p>
+                    {dynamicTabResults.length > 0 ? (
                       <p className="mt-2 text-xs text-slate-400">
-                        Rows: {scanResultRows.length} · Failed rows: {liveFailedRowsCount}
+                        Rows: {dynamicTabResults.length} · Failed rows: {dynamicTabResults.filter(r => r.errorMessage !== null || r.status === "failed").length}
                       </p>
                     ) : (
-                      <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows.</p>
+                      <p className="mt-2 text-xs text-slate-400">
+                        {selectedDynamicJobId ? "No results yet for selected scan." : "Select a scan above to view results."}
+                      </p>
                     )}
                   </div>
 
-                  {scanResultRows.length > 0 ? (
+                  {dynamicTabResults.length > 0 ? (
                     <div className="max-h-[52vh] overflow-auto rounded-lg border border-slate-800">
                       <table className="w-full text-left text-xs text-slate-200">
                         <thead className="sticky top-0 bg-slate-900/95 text-slate-400">
@@ -2600,7 +2630,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           </tr>
                         </thead>
                         <tbody>
-                          {scanResultRows.map((row) => {
+                          {dynamicTabResults.map((row) => {
                             const isErrorRow = row.errorMessage !== null || row.status === "failed";
                             const isExpanded = expandedDynamicRowId === row.id;
                             const verdictStatus = row.riskStatus ?? row.malwareStatus;
@@ -2710,7 +2740,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       </table>
                     </div>
                   ) : (
-                    <p className="text-sm text-slate-300">No dynamic rows are available yet.</p>
+                    <p className="text-sm text-slate-300">
+                      {selectedDynamicJobId ? "No results yet for selected scan." : "Select a scan above to view results."}
+                    </p>
                   )}
                 </div>
               </div>
@@ -3700,7 +3732,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").map(job => (
                       <div
                         key={job.jobId}
-                        className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                        onClick={() => setSelectedLightweightJobId(job.jobId)}
+                        className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedLightweightJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
                       >
                         <div className="flex items-center gap-2">
                           {(job.status === "pending" || job.status === "running") ? (
@@ -3740,22 +3773,26 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 ) : null}
 
               </div>
-              {/* Right pane — per-job progress + results */}
+              {/* Right pane — selected-job progress + results */}
               <div className="flex flex-1 flex-col gap-4 overflow-y-auto">
-                {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").length === 0 ? (
+                {!selectedLightweightJobId ? (
                   <div className="rounded-xl border border-slate-700/60 bg-slate-900/40 p-6 text-center">
-                    <p className="text-sm text-slate-400">Start a lightweight scan to see results here.</p>
+                    <p className="text-sm text-slate-400">
+                      {Array.from(activeScanJobs.values()).some(j => j.sourceTab === "lightweight")
+                        ? "Select a scan from the list to view results."
+                        : "Start a lightweight scan to see results here."}
+                    </p>
                   </div>
-                ) : null}
-
-                {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").map(job => {
+                ) : (() => {
+                  const job = activeScanJobs.get(selectedLightweightJobId);
+                  if (!job) return null;
                   const lwDetails = job.details as (typeof job.details & { results?: ScanResultResponse[] }) | null;
-                  const lwResults = lwDetails?.results;
+                  const lwResults = lightweightTabResults;
                   const isRunning = job.status === "pending" || job.status === "running";
                   const isFailed = job.status === "failed";
                   const isCompleted = job.status === "completed";
                   return (
-                    <div key={job.jobId} className="space-y-3">
+                    <div className="space-y-3">
                       {/* Status block */}
                       <div className={`rounded-xl border p-4 ${
                         isFailed ? "border-rose-400/40 bg-rose-500/10"
@@ -3934,7 +3971,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       ) : null}
                     </div>
                   );
-                })}
+                })()}
               </div>
             </div>
           </div>
