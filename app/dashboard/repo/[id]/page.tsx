@@ -647,6 +647,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedDynamicJobId, setSelectedDynamicJobId] = useState<string | null>(null);
   const [selectedLightweightJobId, setSelectedLightweightJobId] = useState<string | null>(null);
   const [graphDetailNode, setGraphDetailNode] = useState<{ label: string; features: Record<string, number> | null; scanEntry: ScanResultMapEntry | null } | null>(null);
+  const [graphNodePkgDetails, setGraphNodePkgDetails] = useState<PackageDetailsResponse | null>(null);
+  const [graphNodePkgDetailsLoading, setGraphNodePkgDetailsLoading] = useState(false);
   // Lightweight scan tab
   const [lightweightScope, setLightweightScope] = useState<"partial" | "full">("partial");
   const [lightweightSelectedPackages, setLightweightSelectedPackages] = useState<string[]>([]);
@@ -668,6 +670,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   // Scan mode
   const [activeScanMode, setActiveScanMode] = useState<ScanMode>("full");
   const [forceRescan, setForceRescan] = useState(false);
+  const [graphScanPackageSearch, setGraphScanPackageSearch] = useState("");
   const isMountedRef = useRef(true);
   const scanPollTimersRef = useRef<Map<string, number>>(new Map());
   const elapsedTickersRef = useRef<Map<string, number>>(new Map());
@@ -1349,7 +1352,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         selected_packages: isPartialScan && selectedScanPackages.length > 0
           ? selectedScanPackages
           : undefined,
-        force_rescan: forceRescan || undefined,
+        force_rescan: (isPartialScan || forceRescan) || undefined,
       });
 
       if (!triggerPayload.job_id) {
@@ -1760,6 +1763,36 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDetailsPackage, repositoryEcosystem]);
 
+  useEffect(() => {
+    if (!graphDetailNode || !repositoryEcosystem || !API_BASE_URL) {
+      setGraphNodePkgDetails(null);
+      return;
+    }
+    const label = graphDetailNode.label;
+    const lastAt = label.lastIndexOf("@");
+    const pkgName = lastAt > 0 ? label.slice(0, lastAt) : label;
+    const pkgVersion = lastAt > 0 ? label.slice(lastAt + 1) : undefined;
+
+    setGraphNodePkgDetailsLoading(true);
+    setGraphNodePkgDetails(null);
+    let cancelled = false;
+
+    const doFetch = async () => {
+      try {
+        const token = clientSessionStorage.readToken();
+        const authHeaders: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {};
+        const depContext = { baseUrl: API_BASE_URL!, authHeaders };
+        const details = await fetchPackageDetails(depContext, repositoryEcosystem, pkgName, pkgVersion);
+        if (!cancelled) setGraphNodePkgDetails(details);
+      } catch { /* silent */ } finally {
+        if (!cancelled) setGraphNodePkgDetailsLoading(false);
+      }
+    };
+    void doFetch();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graphDetailNode?.label, repositoryEcosystem]);
+
   return (
     <section className="relative flex h-[100dvh] w-full overflow-hidden bg-black">
       <div
@@ -1925,16 +1958,89 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                             </button>
                           ))}
                         </div>
-                        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-400">
-                          <input
-                            type="checkbox"
-                            checked={forceRescan}
-                            onChange={(e) => setForceRescan(e.target.checked)}
+                        <div className="flex flex-wrap gap-2">
+                          {(["full", "partial"] as const).map((scope) => (
+                            <button
+                              key={scope}
+                              type="button"
+                              disabled={isScanRunning}
+                              onClick={() => {
+                                setScanScope(scope);
+                                if (scope === "full") setSelectedScanPackages([]);
+                              }}
+                              className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
+                                scanScope === scope
+                                  ? "border-cyan-300/70 bg-cyan-500/20 text-cyan-50"
+                                  : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
+                              } disabled:cursor-not-allowed disabled:opacity-50`}
+                            >
+                              {scope === "full" ? "Full Scan" : "Partial Scan"}
+                            </button>
+                          ))}
+                        </div>
+                        {!isPartialScan ? (
+                          <button
+                            type="button"
                             disabled={isScanRunning}
-                            className="h-3.5 w-3.5 accent-cyan-400"
-                          />
-                          Force full rescan
-                        </label>
+                            onClick={() => setForceRescan((prev) => !prev)}
+                            className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
+                              forceRescan
+                                ? "border-amber-300/70 bg-amber-500/20 text-amber-50"
+                                : "border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500"
+                            } disabled:cursor-not-allowed disabled:opacity-50`}
+                          >
+                            Force Rescan
+                          </button>
+                        ) : null}
+                        {isPartialScan ? (
+                          <div className="space-y-2">
+                            <p className="text-[10px] text-slate-400">Select packages below, or click nodes on the graph.</p>
+                            <input
+                              type="text"
+                              placeholder="Search packages..."
+                              value={graphScanPackageSearch}
+                              onChange={(e) => setGraphScanPackageSearch(e.target.value)}
+                              disabled={isScanRunning}
+                              className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60 disabled:opacity-50"
+                            />
+                            {selectedScanPackages.length > 0 ? (
+                              <div className="flex flex-wrap gap-1.5">
+                                {selectedScanPackages.map((pkg) => (
+                                  <span key={pkg} className="inline-flex items-center gap-1 rounded-full border border-cyan-400/50 bg-cyan-500/20 px-2 py-0.5 text-[10px] text-cyan-100">
+                                    <span className="max-w-[12rem] truncate font-mono">{pkg}</span>
+                                    <button
+                                      type="button"
+                                      disabled={isScanRunning}
+                                      onClick={() => toggleSelectedScanPackage(pkg)}
+                                      className="ml-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full transition hover:bg-cyan-400/30 disabled:opacity-50"
+                                    >
+                                      ✕
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            ) : null}
+                            <div className="max-h-32 overflow-auto rounded border border-slate-800 bg-slate-950/60 p-1.5">
+                              {availablePackagesForAnalysis
+                                .filter((p) => !graphScanPackageSearch || p.toLowerCase().includes(graphScanPackageSearch.toLowerCase()))
+                                .map((pkg) => (
+                                  <button
+                                    key={pkg}
+                                    type="button"
+                                    disabled={isScanRunning}
+                                    onClick={() => toggleSelectedScanPackage(pkg)}
+                                    className={`block w-full rounded px-2 py-1 text-left font-mono text-[10px] transition ${
+                                      selectedScanPackages.includes(pkg)
+                                        ? "bg-cyan-500/20 text-cyan-100"
+                                        : "text-slate-400 hover:bg-slate-800"
+                                    } disabled:opacity-50`}
+                                  >
+                                    {pkg}
+                                  </button>
+                                ))}
+                            </div>
+                          </div>
+                        ) : null}
                         {graphTabJobs.length > 1 ? (
                           <div className="mt-2 space-y-1">
                             {graphTabJobs.map(job => (
@@ -2033,11 +2139,10 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 </div>
 
                 {graphDetailNode ? (
-                  <div className="absolute bottom-4 right-4 top-4 z-20 flex w-[22rem] flex-col overflow-hidden rounded-2xl border border-slate-600 bg-slate-950/98 shadow-2xl backdrop-blur-sm">
+                  <div className="absolute bottom-4 right-4 top-4 z-20 flex w-[30rem] flex-col overflow-hidden rounded-2xl border border-slate-600 bg-slate-950/98 shadow-2xl backdrop-blur-sm">
                     <div className="flex shrink-0 items-start justify-between gap-3 border-b border-slate-700/60 px-5 py-4">
                       <div className="min-w-0">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-indigo-400">Package Analysis</p>
-                        <p className="mt-1.5 break-all text-base font-bold text-slate-100 leading-snug">{graphDetailNode.label}</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-indigo-400">Package Details</p>
                       </div>
                       <button
                         type="button"
@@ -2048,6 +2153,139 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       </button>
                     </div>
                     <div className="flex-1 overflow-y-auto space-y-4 px-5 py-4">
+                      {/* Package identity + metadata */}
+                      {(() => {
+                        const label = graphDetailNode.label;
+                        const lastAt = label.lastIndexOf("@");
+                        const pkgName = lastAt > 0 ? label.slice(0, lastAt) : label;
+                        const pkgVersion = lastAt > 0 ? label.slice(lastAt + 1) : null;
+                        const scanEntry = graphDetailNode.scanEntry;
+                        const verdict = scanEntry?.risk_overall_status ?? scanEntry?.malware_status;
+                        const verdictCls = verdict === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-100"
+                          : verdict === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-100"
+                          : verdict === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
+                          : "border-slate-400/50 bg-slate-500/15 text-slate-300";
+                        return (
+                          <>
+                            {/* Identity header */}
+                            <div className="flex flex-wrap items-start justify-between gap-2">
+                              <div>
+                                <p className="text-base font-bold leading-snug text-slate-100">{pkgName}</p>
+                                {pkgVersion ? <p className="mt-0.5 font-mono text-sm text-teal-300">v{pkgVersion}</p> : null}
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {graphNodePkgDetails?.ecosystem ? (
+                                  <span className="rounded border border-slate-600 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-400">
+                                    {graphNodePkgDetails.ecosystem}
+                                  </span>
+                                ) : null}
+                                {graphNodePkgDetails?.license ? (
+                                  <span className="rounded border border-slate-600 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-300">
+                                    {graphNodePkgDetails.license}
+                                  </span>
+                                ) : null}
+                                {verdict && verdict !== "unknown" ? (
+                                  <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${verdictCls}`}>
+                                    {verdict}
+                                  </span>
+                                ) : null}
+                              </div>
+                            </div>
+
+                            {/* Loading skeleton */}
+                            {graphNodePkgDetailsLoading ? (
+                              <div className="space-y-2">
+                                <div className="h-4 w-full animate-pulse rounded bg-slate-800/80" />
+                                <div className="h-4 w-3/4 animate-pulse rounded bg-slate-800/80" />
+                              </div>
+                            ) : (
+                              <>
+                                {/* Description */}
+                                {graphNodePkgDetails?.description ? (
+                                  <p className="text-xs leading-relaxed text-slate-300">{graphNodePkgDetails.description}</p>
+                                ) : null}
+
+                                {/* Links */}
+                                {graphNodePkgDetails?.homepage || graphNodePkgDetails?.registry_url ? (
+                                  <div className="flex flex-wrap gap-2">
+                                    {graphNodePkgDetails.homepage ? (
+                                      <a href={graphNodePkgDetails.homepage} target="_blank" rel="noreferrer"
+                                        className="inline-flex items-center gap-1 rounded-lg border border-teal-400/30 bg-teal-500/10 px-2.5 py-1 text-[11px] font-medium text-teal-300 transition hover:bg-teal-500/20">
+                                        Homepage ↗
+                                      </a>
+                                    ) : null}
+                                    {graphNodePkgDetails.registry_url ? (
+                                      <a href={graphNodePkgDetails.registry_url} target="_blank" rel="noreferrer"
+                                        className="inline-flex items-center gap-1 rounded-lg border border-slate-600 bg-slate-800/60 px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:bg-slate-700/60">
+                                        {graphNodePkgDetails.ecosystem === "npm" ? "npmjs.com" : graphNodePkgDetails.ecosystem === "pypi" ? "PyPI" : "Registry"} ↗
+                                      </a>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+
+                                {/* Latest version */}
+                                {graphNodePkgDetails?.latest_version ? (
+                                  <p className="text-xs text-slate-400">
+                                    Latest: <span className="font-mono text-teal-300">{graphNodePkgDetails.latest_version}</span>
+                                  </p>
+                                ) : null}
+
+                                {/* Libraries.io metadata grid */}
+                                {(() => {
+                                  const d = graphNodePkgDetails;
+                                  const metrics: [string, string][] = ([
+                                    ["Monthly DL", d?.monthly_downloads != null
+                                      ? d.monthly_downloads >= 1_000_000 ? `${(d.monthly_downloads / 1_000_000).toFixed(1)}M`
+                                      : d.monthly_downloads >= 1_000 ? `${(d.monthly_downloads / 1_000).toFixed(0)}K`
+                                      : String(d.monthly_downloads)
+                                      : null],
+                                    ["Stars", d?.stars != null ? String(d.stars) : null],
+                                    ["Forks", d?.forks != null ? String(d.forks) : null],
+                                    ["Contributors", d?.contributors_count != null ? String(d.contributors_count) : null],
+                                    ["Dependents", d?.dependents_count != null ? String(d.dependents_count) : null],
+                                    ["SourceRank", d?.source_rank != null ? String(d.source_rank) : null],
+                                    ["Maintainers", d?.maintainer_count != null ? String(d.maintainer_count) : null],
+                                    ["Age (days)", d?.package_age_days != null ? String(d.package_age_days) : null],
+                                    ["Direct Deps", d?.direct_dependencies_count != null ? String(d.direct_dependencies_count) : null],
+                                    ["Repository", d?.has_repository != null ? (d.has_repository ? "Yes" : "No") : null],
+                                  ] as [string, string | null][]).filter(([, v]) => v !== null) as [string, string][];
+                                  if (metrics.length === 0) return null;
+                                  return (
+                                    <div>
+                                      <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Package Metadata</p>
+                                      <div className="grid grid-cols-3 gap-1.5">
+                                        {metrics.map(([label, value]) => (
+                                          <div key={label} className="rounded border border-slate-800 bg-slate-900/50 px-2 py-1.5">
+                                            <p className="text-[9px] uppercase tracking-[0.08em] text-slate-500">{label}</p>
+                                            <p className="mt-0.5 font-mono text-[11px] font-semibold text-slate-200">{value}</p>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+
+                                {/* Keywords */}
+                                {graphNodePkgDetails?.keywords && graphNodePkgDetails.keywords.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1">
+                                    {graphNodePkgDetails.keywords.map((kw) => (
+                                      <span key={kw} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{kw}</span>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </>
+                            )}
+                          </>
+                        );
+                      })()}
+
+                      {/* Divider before scan results */}
+                      {(graphDetailNode.scanEntry || graphDetailNode.features) ? (
+                        <div className="border-t border-slate-700/60 pt-1">
+                          <p className="mb-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">Scan Results</p>
+                        </div>
+                      ) : null}
+
                       {/* Verdict */}
                       {((graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) && (graphDetailNode.scanEntry?.risk_overall_status ?? graphDetailNode.scanEntry?.malware_status) !== "unknown") ? (
                         <div>
@@ -2181,12 +2419,13 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         </div>
                       ) : null}
 
-                      {/* Empty state */}
+                      {/* Empty state — only if no scan data exists and not loading */}
                       {!graphDetailNode.scanEntry?.malware_status &&
                         !(graphDetailNode.scanEntry?.vulnerability_details?.length) &&
                         !(graphDetailNode.scanEntry?.reputation_metadata && Object.keys(graphDetailNode.scanEntry.reputation_metadata).length > 0) &&
-                        !graphDetailNode.features ? (
-                        <p className="text-sm text-slate-500">No scan data available for this package.</p>
+                        !graphDetailNode.features &&
+                        !graphNodePkgDetailsLoading ? (
+                        <p className="text-xs text-slate-500">No scan data available for this package yet.</p>
                       ) : null}
                     </div>
                   </div>
