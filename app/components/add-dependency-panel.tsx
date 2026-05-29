@@ -12,6 +12,7 @@ import {
   type CreateDependencyPrRequest,
   type CreateDependencyPrResponse,
   type DependencyDraft,
+  type PackagePrescanResult,
   type PackageSearchResult,
   searchPackages as searchPackagesApi,
 } from "@/app/lib/api/dependency-pr";
@@ -250,6 +251,8 @@ export function AddDependencyPanel({
   const [submitLoading, setSubmitLoading] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitSuccess, setSubmitSuccess] = useState<CreateDependencyPrResponse | null>(null);
+  const [showScanResults, setShowScanResults] = useState(false);
+  const [expandedScanResultId, setExpandedScanResultId] = useState<string | null>(null);
   const [compatibilityResult, setCompatibilityResult] = useState<CompatibilityCheckResponse | null>(null);
   const [isCheckingCompat, setIsCheckingCompat] = useState(false);
 
@@ -435,8 +438,7 @@ export function AddDependencyPanel({
         requestMoreResults();
       },
       {
-        root,
-        rootMargin: "160px 0px 160px 0px",
+        rootMargin: "400px 0px 400px 0px",
         threshold: 0.1,
       },
     );
@@ -694,12 +696,12 @@ export function AddDependencyPanel({
   const canRenderLoadingPanel = searchLoading && results.length === 0;
 
   return (
-    <div className={`flex h-full min-h-0 flex-col gap-4 ${className ?? ""}`}>
+    <div className={`flex flex-col gap-4 ${className ?? ""}`}>
       <section className="rounded-2xl border border-slate-800 bg-slate-950/90 p-5 shadow-[0_24px_80px_rgba(2,6,23,0.45)]">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Add dependency</p>
-            <h2 className="mt-2 text-2xl font-semibold text-slate-50">Search, compare, and add packages</h2>
+            <h2 className="mt-2 text-2xl font-semibold text-slate-50">Search and add packages</h2>
             <p className="mt-2 max-w-2xl text-sm text-slate-400">
               Search the registry, inspect versions, and create a dependency PR directly from the repo.
             </p>
@@ -757,8 +759,8 @@ export function AddDependencyPanel({
         {submitError ? <p className="mt-3 rounded-lg border border-rose-400/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">{submitError}</p> : null}
       </section>
 
-      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(360px,0.85fr)]">
-        <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/90 p-5">
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(360px,0.85fr)]">
+        <section className="flex flex-col rounded-2xl border border-slate-800 bg-slate-950/90 p-5">
           <div className="flex items-center justify-between gap-3">
             <div>
               <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Registry results</p>
@@ -783,11 +785,11 @@ export function AddDependencyPanel({
           {canRenderLoadingPanel ? <SearchLoadingPanel compact={false} /> : null}
 
           {results.length > 0 ? (
-            <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden">
+            <div className="mt-4">
               <div
                 ref={resultsListRef}
                 data-testid="dependency-search-results"
-                className="h-full min-h-0 overflow-y-auto pr-1"
+                className="pr-1"
               >
                 <div className="grid gap-3">
                   {results.map((item) => {
@@ -795,6 +797,23 @@ export function AddDependencyPanel({
                     const suspected = item.typosquat.is_suspected;
                     const severity = getTyposquatSeverity(item.typosquat.confidence);
                     const didYouMean = suspected ? findDidYouMeanCandidate(item, query.trim(), results) : null;
+                    const didYouMeanName = didYouMean?.name ?? (suspected ? (item.typosquat.matched_popular_package ?? null) : null);
+                    const normalizedQuery = query.trim().toLowerCase().replace(/^@/, "");
+                    const qLen = normalizedQuery.length;
+                    let warnLevel: "red" | "yellow" | null = null;
+                    if (qLen >= 4) {
+                      const normDist = (item.query_distance ?? 0) / qLen;
+                      const hasGoodDownloads = (item.monthly_downloads ?? 0) > 100_000;
+                      const hasGoodScore = (item.score ?? 0) > 0.5;
+                      const hasDescription = Boolean(item.description?.trim());
+                      if (hasGoodDownloads || hasGoodScore) {
+                        warnLevel = null;
+                      } else if (normDist >= 2.0) {
+                        warnLevel = "red";
+                      } else if (normDist >= 1.2 && !hasDescription) {
+                        warnLevel = "yellow";
+                      }
+                    }
 
                     return (
                       <article key={`${item.name}:${item.version ?? "latest"}`} className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
@@ -802,6 +821,15 @@ export function AddDependencyPanel({
                           <div>
                             <p className="text-sm font-semibold text-slate-100">{item.name}</p>
                             <p className="text-xs uppercase tracking-[0.12em] text-cyan-200">{formatPackageVersion(item.version)}</p>
+                            {warnLevel === "red" ? (
+                              <span className="mt-1 inline-block rounded border border-rose-500/50 bg-rose-600/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-rose-300">
+                                Name unrelated to query
+                              </span>
+                            ) : warnLevel === "yellow" ? (
+                              <span className="mt-1 inline-block rounded border border-amber-600/50 bg-amber-700/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-amber-300">
+                                Low name relevance
+                              </span>
+                            ) : null}
                           </div>
                           <button
                             type="button"
@@ -850,17 +878,26 @@ export function AddDependencyPanel({
                               {item.typosquat.reasons[0] ?? "Package name resembles another known package. Check carefully."}
                             </p>
 
-                            {didYouMean ? (
+                            {didYouMeanName ? (
                               <p className="mt-2 text-xs text-cyan-100">
-                                Did you mean {didYouMean.name}
-                                {didYouMean.version ? `@${didYouMean.version}` : ""}?
-                                <button
-                                  type="button"
-                                  onClick={() => addPackageToSelection(didYouMean)}
-                                  className="ml-2 text-cyan-200 underline decoration-cyan-400/50 underline-offset-2"
-                                >
-                                  Select safer package
-                                </button>
+                                Did you mean <strong>{didYouMeanName}</strong>?
+                                {didYouMean ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => addPackageToSelection(didYouMean)}
+                                    className="ml-2 text-cyan-200 underline decoration-cyan-400/50 underline-offset-2"
+                                  >
+                                    Select safer package
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSuggestionSearch(didYouMeanName)}
+                                    className="ml-2 text-cyan-200 underline decoration-cyan-400/50 underline-offset-2"
+                                  >
+                                    Search {didYouMeanName}
+                                  </button>
+                                )}
                               </p>
                             ) : (
                               <p className="mt-2 text-xs text-amber-100/90">This name is 1 edit away from your query. Check carefully before continuing.</p>
@@ -918,7 +955,7 @@ export function AddDependencyPanel({
           )}
         </section>
 
-        <section className="flex min-h-0 flex-col rounded-2xl border border-slate-800 bg-slate-950/90 p-5">
+        <section className="flex flex-col rounded-2xl border border-slate-800 bg-slate-950/90 p-5">
           <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Selection & PR</p>
           <h3 className="mt-2 text-lg font-semibold text-slate-100">Selected dependencies</h3>
 
@@ -1032,8 +1069,109 @@ export function AddDependencyPanel({
               ) : null}
               {submitSuccess.status ? <p className="mt-1">Status: {submitSuccess.status}</p> : null}
               {submitSuccess.message ? <p className="mt-1">{submitSuccess.message}</p> : null}
-              {submitSuccess.scan_job_id ? (
-                <p className="mt-2 font-mono text-emerald-200/80">Security scan enqueued (job: {submitSuccess.scan_job_id})</p>
+              {submitSuccess.prescan_results && submitSuccess.prescan_results.length > 0 ? (
+                <div className="mt-3">
+                  <button
+                    type="button"
+                    onClick={() => setShowScanResults((v) => !v)}
+                    className="flex w-full items-center justify-between gap-2 rounded-lg border border-slate-600/60 bg-slate-800/50 px-3 py-2 text-left text-xs transition hover:bg-slate-700/50"
+                  >
+                    <span className="font-semibold uppercase tracking-[0.12em] text-slate-300">Security Scan Results</span>
+                    <span className="text-slate-500">{showScanResults ? "▲" : "▼"}</span>
+                  </button>
+                  {showScanResults ? (
+                    <div className="mt-2 space-y-1.5">
+                      {submitSuccess.prescan_results.map((result: PackagePrescanResult) => {
+                        const resultId = `${result.package_name}@${result.package_version}`;
+                        const isExpanded = expandedScanResultId === resultId;
+                        const verdict = result.overall_status;
+                        const verdictCls =
+                          verdict === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                          : verdict === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                          : verdict === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                          : "border-slate-600/50 bg-slate-800/30 text-slate-400";
+                        return (
+                          <div key={resultId} className="rounded-lg border border-slate-700 bg-slate-900/60 text-xs">
+                            <button
+                              type="button"
+                              onClick={() => setExpandedScanResultId(isExpanded ? null : resultId)}
+                              className="w-full p-2.5 text-left"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-mono text-slate-200">
+                                  {result.package_name}
+                                  <span className="text-slate-500">@{result.package_version}</span>
+                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase ${verdictCls}`}>
+                                    {verdict}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
+                                </div>
+                              </div>
+                              {(result.overall_score != null || result.cve_count > 0) ? (
+                                <p className="mt-0.5 text-[10px] text-slate-500">
+                                  {result.overall_score != null ? `Risk: ${(result.overall_score * 100).toFixed(1)}%` : ""}
+                                  {result.overall_score != null && result.cve_count > 0 ? " · " : ""}
+                                  {result.cve_count > 0 ? `${result.cve_count} CVE(s)` : ""}
+                                </p>
+                              ) : null}
+                            </button>
+                            {isExpanded ? (
+                              <div className="space-y-2 border-t border-slate-700/60 px-2.5 pb-2.5 pt-2">
+                                {result.advisory_references.length > 0 ? (
+                                  <div>
+                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE / Advisory References</p>
+                                    <div className="flex flex-wrap gap-1">
+                                      {result.advisory_references.map((ref) => (
+                                        <span key={ref} className="rounded border border-amber-400/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">{ref}</span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ) : null}
+                                {result.static_features && Object.keys(result.static_features).length > 0 ? (
+                                  <div>
+                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Static Features</p>
+                                    <div className="grid grid-cols-2 gap-1">
+                                      {Object.entries(result.static_features).slice(0, 6).map(([k, v]) => (
+                                        <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1">
+                                          <p className="text-[9px] uppercase tracking-wide text-slate-500">{k.replace(/_/g, " ")}</p>
+                                          <p className="mt-0.5 font-mono text-[10px] text-slate-200">
+                                            {v >= 0 && v <= 1 ? `${(v * 100).toFixed(1)}%` : String(v)}
+                                          </p>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ) : null}
+                                {result.dynamic_status && result.dynamic_status !== "skipped" ? (
+                                  <div>
+                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Dynamic Analysis</p>
+                                    <div className="grid grid-cols-2 gap-1">
+                                      {([
+                                        ["Status", result.dynamic_status],
+                                        ["Risk Score", result.dynamic_risk_score != null ? `${(result.dynamic_risk_score * 100).toFixed(1)}%` : null],
+                                        ["VM Evasion", result.vm_evasion_observed != null ? (result.vm_evasion_observed ? "Detected" : "None") : null],
+                                        ["IOC Hit", result.ioc_hit != null ? (result.ioc_hit ? "Yes" : "None") : null],
+                                      ] as [string, string | null][])
+                                        .filter(([, v]) => v !== null)
+                                        .map(([label, value]) => (
+                                          <div key={label} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1">
+                                            <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                            <p className={`mt-0.5 font-mono text-[10px] ${(label === "VM Evasion" || label === "IOC Hit") && value !== "None" ? "text-rose-300" : "text-slate-200"}`}>{value}</p>
+                                          </div>
+                                        ))}
+                                    </div>
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
               {submitSuccess.typosquat_warnings && submitSuccess.typosquat_warnings.length > 0 ? (
                 <div className="mt-3 rounded-md border border-amber-300/35 bg-amber-500/10 px-3 py-2">

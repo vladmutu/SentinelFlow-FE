@@ -4396,7 +4396,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           ) : null}
 
           {activeSection === "add" ? (
-            <div className="h-full overflow-hidden px-4 pb-6 pt-4">
+            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
               <AddDependencyPanel
                 apiBaseUrl={API_BASE_URL}
                 initialEcosystem={addDependencyEcosystems[0] ?? repositoryEcosystem ?? "npm"}

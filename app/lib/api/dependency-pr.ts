@@ -7,6 +7,7 @@ export interface TyposquatInfo {
   edit_distance: number | null;
   normalized_conflict: boolean;
   reasons: string[];
+  matched_popular_package?: string | null;
 }
 
 export interface PackageSearchResult {
@@ -97,6 +98,20 @@ export interface CreateDependencyPrRequest {
   generate_lockfile_server_side?: boolean;
 }
 
+export type PackagePrescanResult = {
+  package_name: string;
+  package_version: string;
+  overall_status: string;
+  overall_score: number | null;
+  advisory_references: string[];
+  cve_count: number;
+  static_features: Record<string, number> | null;
+  dynamic_status: string | null;
+  dynamic_risk_score: number | null;
+  vm_evasion_observed: boolean | null;
+  ioc_hit: boolean | null;
+};
+
 export interface CreateDependencyPrResponse {
   pr_url?: string;
   pr_number?: number;
@@ -104,7 +119,7 @@ export interface CreateDependencyPrResponse {
   status?: string;
   message?: string;
   typosquat_warnings?: TyposquatWarning[];
-  scan_job_id?: string | null;
+  prescan_results?: PackagePrescanResult[];
 }
 
 export interface DependencyApiContext {
@@ -142,6 +157,7 @@ function normalizeTyposquat(payload: unknown): TyposquatInfo {
         : null,
     normalized_conflict: record.normalized_conflict === true,
     reasons,
+    matched_popular_package: typeof record.matched_popular_package === "string" ? record.matched_popular_package : null,
   };
 }
 
@@ -530,6 +546,6 @@ export async function createDependencyPr(
     status: typeof record.status === "string" ? record.status : undefined,
     message: typeof record.message === "string" ? record.message : undefined,
     typosquat_warnings: typosquatWarnings.length > 0 ? typosquatWarnings : undefined,
-    scan_job_id: typeof record.scan_job_id === "string" ? record.scan_job_id : null,
+    prescan_results: Array.isArray(record.prescan_results) ? (record.prescan_results as PackagePrescanResult[]) : undefined,
   };
 }
