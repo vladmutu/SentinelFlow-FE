@@ -63,6 +63,8 @@ type ScanResultRow = {
   advisoryRefs: string[];
   errorMessage: string | null;
   scanTimestamp: string | null;
+  staticFeatures: Record<string, number> | null;
+  dynamicFindings: DynamicFinding | null;
 };
 
 type LatestScanSummary = {
@@ -235,6 +237,12 @@ function normalizeResultRow(input: unknown, index: number): ScanResultRow {
     coerceString(record.error_message) ?? coerceString(record.error) ?? coerceString(record.failure_reason);
   const scanTimestamp = coerceString(record.scan_timestamp);
   const analysisStatus = coerceString(record.analysis_status);
+  const staticFeatures = record.static_features && typeof record.static_features === "object"
+    ? (record.static_features as Record<string, number>)
+    : null;
+  const dynamicFindings = record.dynamic_findings && typeof record.dynamic_findings === "object"
+    ? (record.dynamic_findings as DynamicFinding)
+    : null;
 
   return {
     id: coerceString(record.id) ?? `${packageName}@${version}:${index}`,
@@ -249,6 +257,8 @@ function normalizeResultRow(input: unknown, index: number): ScanResultRow {
     advisoryRefs,
     errorMessage,
     scanTimestamp,
+    staticFeatures,
+    dynamicFindings,
   };
 }
 
@@ -308,6 +318,8 @@ function normalizeScanResultsPayload(payload: unknown): {
             : [],
           errorMessage: null,
           scanTimestamp: coerceString(entryRecord.scan_timestamp),
+          staticFeatures: null,
+          dynamicFindings: null,
         });
       });
 
@@ -2361,7 +2373,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               : row.riskStatus === "clean"
                                 ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
                                 : "border-slate-600 bg-slate-800/60 text-slate-400";
-                        const entryFeatures = scanResultsMap[row.packageName]?.static_features ?? null;
+                        const entryFeatures = row.staticFeatures;
 
                         return (
                           <div
@@ -2478,7 +2490,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
           {activeSection === "dynamic-analysis" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
-              <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Dynamic Analysis</p>
@@ -2602,145 +2614,242 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 </div>
 
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">
-                      {selectedDynamicJobId ? "Selected scan results" : "Package Results"}
-                    </p>
-                    {dynamicTabResults.length > 0 ? (
-                      <p className="mt-2 text-xs text-slate-400">
-                        Rows: {dynamicTabResults.length} · Failed rows: {dynamicTabResults.filter(r => r.errorMessage !== null || r.status === "failed").length}
-                      </p>
-                    ) : (
-                      <p className="mt-2 text-xs text-slate-400">
-                        {selectedDynamicJobId ? "No results yet for selected scan." : "Select a scan above to view results."}
-                      </p>
-                    )}
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Scan Results</p>
+                    {selectedDynamicJobId ? (
+                      <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                        {activeScanJobs.get(selectedDynamicJobId)?.status ?? "—"}
+                      </span>
+                    ) : null}
                   </div>
 
                   {dynamicTabResults.length > 0 ? (
-                    <div className="max-h-[52vh] overflow-auto rounded-lg border border-slate-800">
-                      <table className="w-full text-left text-xs text-slate-200">
-                        <thead className="sticky top-0 bg-slate-900/95 text-slate-400">
-                          <tr>
-                            <th className="px-3 py-2 font-medium">Package</th>
-                            <th className="px-3 py-2 font-medium">Version</th>
-                            <th className="px-3 py-2 font-medium">Verdict</th>
-                            <th className="px-3 py-2 font-medium">Score</th>
-                            <th className="px-3 py-2 font-medium w-6"></th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {dynamicTabResults.map((row) => {
-                            const isErrorRow = row.errorMessage !== null || row.status === "failed";
-                            const isExpanded = expandedDynamicRowId === row.id;
-                            const verdictStatus = row.riskStatus ?? row.malwareStatus;
-                            const verdictClass = verdictStatus === "malicious"
-                              ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
-                              : verdictStatus === "suspicious"
-                                ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
-                                : verdictStatus === "clean"
-                                  ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
-                                  : "border-slate-600 bg-slate-800/60 text-slate-400";
-                            const entryFeatures = scanResultsMap[row.packageName]?.static_features ?? null;
+                    <div className="space-y-2">
+                      {dynamicTabResults.map((row) => {
+                        const isErrorRow = row.errorMessage !== null || row.status === "failed";
+                        const isExpanded = expandedDynamicRowId === row.id;
+                        const verdictStatus = row.riskStatus ?? row.malwareStatus;
+                        const verdictBadgeClass = verdictStatus === "malicious"
+                          ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                          : verdictStatus === "suspicious"
+                            ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                            : verdictStatus === "clean"
+                              ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                              : "border-slate-600 bg-slate-800/60 text-slate-400";
 
-                            return (
-                              <React.Fragment key={row.id}>
-                                <tr
-                                  className={`cursor-pointer transition ${isErrorRow ? "border-t border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20" : "border-t border-slate-800 hover:bg-slate-800/40"}`}
-                                  onClick={() => setExpandedDynamicRowId(isExpanded ? null : row.id)}
-                                >
-                                  <td className="px-3 py-2 font-medium">{row.packageName}</td>
-                                  <td className="px-3 py-2 text-slate-400">{row.version}</td>
-                                  <td className="px-3 py-2">
-                                    {verdictStatus ? (
-                                      <span className={`rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${verdictClass}`}>
-                                        {verdictStatus}
-                                      </span>
-                                    ) : <span className="text-slate-600">—</span>}
-                                  </td>
-                                  <td className="px-3 py-2 font-mono">
-                                    {(row.riskScore ?? row.malwareScore) !== null ? `${((row.riskScore ?? row.malwareScore)! * 100).toFixed(1)}%` : "-"}
-                                  </td>
-                                  <td className="px-3 py-2 text-center text-slate-500">{isExpanded ? "▲" : "▼"}</td>
-                                </tr>
-                                {isExpanded ? (
-                                  <tr className="border-t border-slate-700/50 bg-slate-900/60">
-                                    <td colSpan={5} className="px-3 pb-3 pt-2">
-                                      <div className="space-y-3">
-                                        {/* Scores row */}
-                                        <div className="flex flex-wrap gap-4 text-xs">
-                                          <div>
-                                            <p className="text-[10px] uppercase tracking-wide text-slate-500">Analysis Status</p>
-                                            <p className="mt-0.5 font-medium uppercase text-slate-200">{row.analysisStatus ?? row.malwareStatus ?? "—"}</p>
-                                            {(!row.analysisStatus || ["skipped", "not_malicious", "mode_excluded"].includes(row.analysisStatus)) ? (
-                                              <p className="mt-0.5 text-[10px] text-slate-500">Dynamic analysis not run — check MicroVMService</p>
-                                            ) : null}
-                                          </div>
-                                          {row.malwareScore !== null ? (
-                                            <div>
-                                              <p className="text-[10px] uppercase tracking-wide text-slate-500">Classifier Score</p>
-                                              <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.malwareScore * 100).toFixed(2)}%</p>
-                                            </div>
+                        return (
+                          <div
+                            key={row.id}
+                            className={`rounded-lg border text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => setExpandedDynamicRowId(isExpanded ? null : row.id)}
+                              className="w-full p-3 text-left"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <p className="font-medium">
+                                  {row.packageName} <span className="text-slate-400">@</span> {row.version}
+                                </p>
+                                <div className="flex items-center gap-2">
+                                  {verdictStatus ? (
+                                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${verdictBadgeClass}`}>
+                                      {formatVerdict(verdictStatus)}
+                                    </span>
+                                  ) : null}
+                                  <span className="text-[11px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
+                                </div>
+                              </div>
+                              <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
+                                <span>Classifier: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : row.malwareStatus ?? "-"}</span>
+                                {row.riskScore !== null ? (
+                                  <span>Risk: {(row.riskScore * 100).toFixed(1)}%</span>
+                                ) : null}
+                              </div>
+                              {row.advisoryRefs.length > 0 ? (
+                                <div className="mt-2 flex flex-wrap gap-1.5">
+                                  {row.advisoryRefs.map((ref) => {
+                                    const isCve = ref.toUpperCase().startsWith("CVE-");
+                                    const isGhsa = ref.toUpperCase().startsWith("GHSA-");
+                                    const href = isCve
+                                      ? `https://nvd.nist.gov/vuln/detail/${ref}`
+                                      : isGhsa ? `https://github.com/advisories/${ref}` : null;
+                                    return href ? (
+                                      <a
+                                        key={ref}
+                                        href={href}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
+                                      >
+                                        {ref}
+                                      </a>
+                                    ) : (
+                                      <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{ref}</span>
+                                    );
+                                  })}
+                                </div>
+                              ) : null}
+                              {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
+                            </button>
+                            {isExpanded ? (
+                              <div className="border-t border-slate-700/60 px-3 pb-3 pt-2 space-y-3">
+                                <div className="flex flex-wrap gap-3 text-xs">
+                                  <div>
+                                    <p className="text-[10px] uppercase tracking-wide text-slate-500">Analysis Status</p>
+                                    <p className="mt-0.5 font-medium uppercase text-slate-200">{row.analysisStatus ?? row.malwareStatus ?? "—"}</p>
+                                  </div>
+                                  {row.malwareScore !== null ? (
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-500">Classifier Score</p>
+                                      <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.malwareScore * 100).toFixed(2)}%</p>
+                                    </div>
+                                  ) : null}
+                                  {row.riskScore !== null ? (
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-500">Risk Score</p>
+                                      <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.riskScore * 100).toFixed(2)}%</p>
+                                    </div>
+                                  ) : null}
+                                  {row.scanTimestamp ? (
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-500">Scanned At</p>
+                                      <p className="mt-0.5 text-slate-300">{formatTimestampForDisplay(row.scanTimestamp)}</p>
+                                    </div>
+                                  ) : null}
+                                </div>
+                                {/* Dynamic findings */}
+                                {row.dynamicFindings ? (
+                                  <div className="space-y-2.5">
+                                    <p className="text-[10px] uppercase tracking-wide text-slate-500">Dynamic Findings</p>
+                                    <div className="flex flex-wrap gap-2">
+                                      {row.dynamicFindings.sandbox_provider ? (
+                                        <span className="rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-300">
+                                          Sandbox: {row.dynamicFindings.sandbox_provider}
+                                        </span>
+                                      ) : null}
+                                      {row.dynamicFindings.coverage ? (
+                                        <span className="rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-300 uppercase">
+                                          Coverage: {row.dynamicFindings.coverage}
+                                        </span>
+                                      ) : null}
+                                      {row.dynamicFindings.ioc_hit !== undefined ? (
+                                        <span className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase ${row.dynamicFindings.ioc_hit ? "border-rose-400/50 bg-rose-500/15 text-rose-200" : "border-slate-700 bg-slate-800/60 text-slate-400"}`}>
+                                          IOC: {row.dynamicFindings.ioc_hit ? "HIT" : "clean"}
+                                        </span>
+                                      ) : null}
+                                      {row.dynamicFindings.sandbox_timed_out ? (
+                                        <span className="rounded border border-amber-400/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300">Timed Out</span>
+                                      ) : null}
+                                      {row.dynamicFindings.vm_evasion_observed ? (
+                                        <span className="rounded border border-rose-400/40 bg-rose-500/10 px-2 py-0.5 text-[10px] text-rose-300">VM Evasion</span>
+                                      ) : null}
+                                      {row.dynamicFindings.risk_score != null ? (
+                                        <span className="rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 font-mono text-[10px] text-slate-300">
+                                          Dynamic Risk: {(row.dynamicFindings.risk_score * 100).toFixed(1)}%
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    {row.dynamicFindings.syscall_trace ? (
+                                      <div className="rounded border border-slate-700/60 bg-slate-900/60 px-3 py-2">
+                                        <p className="mb-1 text-[9px] uppercase tracking-wide text-slate-500">Syscall Trace</p>
+                                        <div className="flex flex-wrap gap-4 text-[10px]">
+                                          {row.dynamicFindings.syscall_trace.suspicious_count != null ? (
+                                            <span className="text-slate-300">Suspicious: <span className="font-mono text-amber-300">{row.dynamicFindings.syscall_trace.suspicious_count}</span></span>
                                           ) : null}
-                                          {row.riskScore !== null ? (
-                                            <div>
-                                              <p className="text-[10px] uppercase tracking-wide text-slate-500">Risk Score</p>
-                                              <p className="mt-0.5 font-mono font-medium text-slate-200">{(row.riskScore * 100).toFixed(2)}%</p>
-                                            </div>
-                                          ) : null}
-                                          {row.scanTimestamp ? (
-                                            <div>
-                                              <p className="text-[10px] uppercase tracking-wide text-slate-500">Scanned At</p>
-                                              <p className="mt-0.5 text-slate-300">{formatTimestampForDisplay(row.scanTimestamp)}</p>
-                                            </div>
+                                          {row.dynamicFindings.syscall_trace.categories && row.dynamicFindings.syscall_trace.categories.length > 0 ? (
+                                            <span className="text-slate-300">Categories: {row.dynamicFindings.syscall_trace.categories.map(c => (
+                                              <span key={c} className="ml-1 rounded bg-slate-800 px-1 py-0.5 text-slate-300">{c}</span>
+                                            ))}</span>
                                           ) : null}
                                         </div>
-                                        {/* Advisory refs */}
-                                        {row.advisoryRefs.length > 0 ? (
-                                          <div>
-                                            <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Advisories</p>
-                                            <div className="flex flex-wrap gap-1.5">
-                                              {row.advisoryRefs.map((ref) => {
-                                                const isCve = ref.toUpperCase().startsWith("CVE-");
-                                                const isGhsa = ref.toUpperCase().startsWith("GHSA-");
-                                                const href = isCve
-                                                  ? `https://nvd.nist.gov/vuln/detail/${ref}`
-                                                  : isGhsa ? `https://github.com/advisories/${ref}` : null;
-                                                return href ? (
-                                                  <a key={ref} href={href} target="_blank" rel="noopener noreferrer"
-                                                    className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition">
-                                                    {ref}
-                                                  </a>
-                                                ) : (
-                                                  <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{ref}</span>
-                                                );
-                                              })}
-                                            </div>
-                                          </div>
+                                      </div>
+                                    ) : null}
+                                    {row.dynamicFindings.network_activity ? (
+                                      <div className="rounded border border-slate-700/60 bg-slate-900/60 px-3 py-2">
+                                        <p className="mb-1 text-[9px] uppercase tracking-wide text-slate-500">Network Activity</p>
+                                        {row.dynamicFindings.network_activity.outbound_connections != null ? (
+                                          <p className="text-[10px] text-slate-300">Outbound connections: <span className="font-mono text-slate-200">{row.dynamicFindings.network_activity.outbound_connections}</span></p>
                                         ) : null}
-                                        {/* Error */}
-                                        {row.errorMessage ? (
-                                          <p className="text-xs text-rose-200">{row.errorMessage}</p>
-                                        ) : null}
-                                        {/* Static features */}
-                                        {entryFeatures && Object.keys(entryFeatures).length > 0 ? (
-                                          <div>
-                                            <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Static Features</p>
-                                            <FeatureGrid features={entryFeatures} />
+                                        {row.dynamicFindings.network_activity.destinations && row.dynamicFindings.network_activity.destinations.length > 0 ? (
+                                          <div className="mt-1 flex flex-wrap gap-1">
+                                            {row.dynamicFindings.network_activity.destinations.map((d, i) => (
+                                              <span key={i} className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[9px] text-slate-300">{d}</span>
+                                            ))}
                                           </div>
                                         ) : null}
                                       </div>
-                                    </td>
-                                  </tr>
-                                ) : null}
-                              </React.Fragment>
-                            );
-                          })}
-                        </tbody>
-                      </table>
+                                    ) : null}
+                                    {row.dynamicFindings.filesystem_changes ? (
+                                      <div className="rounded border border-slate-700/60 bg-slate-900/60 px-3 py-2">
+                                        <p className="mb-1 text-[9px] uppercase tracking-wide text-slate-500">Filesystem Changes</p>
+                                        {row.dynamicFindings.filesystem_changes.sensitive_path_writes != null ? (
+                                          <p className="text-[10px] text-slate-300">Sensitive path writes: <span className={`font-mono ${row.dynamicFindings.filesystem_changes.sensitive_path_writes > 0 ? "text-rose-300" : "text-slate-200"}`}>{row.dynamicFindings.filesystem_changes.sensitive_path_writes}</span></p>
+                                        ) : null}
+                                        {row.dynamicFindings.filesystem_changes.paths && row.dynamicFindings.filesystem_changes.paths.length > 0 ? (
+                                          <div className="mt-1 flex flex-wrap gap-1">
+                                            {row.dynamicFindings.filesystem_changes.paths.map((p, i) => (
+                                              <span key={i} className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[9px] text-slate-300">{p}</span>
+                                            ))}
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    ) : null}
+                                    {row.dynamicFindings.ioc_detail ? (
+                                      <div className="rounded border border-slate-700/60 bg-slate-900/60 px-3 py-2 space-y-1.5">
+                                        <p className="text-[9px] uppercase tracking-wide text-slate-500">IOC Details</p>
+                                        <div className="flex flex-wrap gap-3 text-[10px]">
+                                          {row.dynamicFindings.ioc_detail.verdict ? (
+                                            <span className="text-slate-300">Verdict: <span className="font-semibold uppercase text-slate-200">{row.dynamicFindings.ioc_detail.verdict}</span></span>
+                                          ) : null}
+                                          {row.dynamicFindings.ioc_detail.raw_line_count != null ? (
+                                            <span className="text-slate-300">Log lines: <span className="font-mono text-slate-200">{row.dynamicFindings.ioc_detail.raw_line_count}</span></span>
+                                          ) : null}
+                                        </div>
+                                        {(["network_iocs", "process_iocs", "file_iocs", "dns_iocs", "crypto_iocs"] as const).map((field) => {
+                                          const items = row.dynamicFindings!.ioc_detail?.[field];
+                                          if (!items || items.length === 0) return null;
+                                          const label = field.replace("_iocs", "").replace("_", " ").toUpperCase();
+                                          return (
+                                            <div key={field}>
+                                              <p className="mb-0.5 text-[9px] uppercase tracking-wide text-slate-500">{label} IOCs ({items.length})</p>
+                                              <div className="flex flex-wrap gap-1">
+                                                {items.map((item, i) => (
+                                                  <span key={i} className="rounded bg-rose-950/60 border border-rose-700/40 px-1.5 py-0.5 font-mono text-[9px] text-rose-300">{item}</span>
+                                                ))}
+                                              </div>
+                                            </div>
+                                          );
+                                        })}
+                                        {row.dynamicFindings.ioc_detail.flagged_lines && row.dynamicFindings.ioc_detail.flagged_lines.length > 0 ? (
+                                          <div>
+                                            <p className="mb-0.5 text-[9px] uppercase tracking-wide text-slate-500">Flagged Lines ({row.dynamicFindings.ioc_detail.flagged_lines.length})</p>
+                                            <div className="max-h-24 overflow-auto rounded bg-slate-950 p-1.5">
+                                              {row.dynamicFindings.ioc_detail.flagged_lines.map((line, i) => (
+                                                <p key={i} className="font-mono text-[9px] text-slate-300">{line}</p>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ) : (
+                                  <p className="text-[10px] text-slate-500">
+                                    {(!row.analysisStatus || ["skipped", "not_malicious", "mode_excluded"].includes(row.analysisStatus))
+                                      ? "Dynamic analysis not run for this package."
+                                      : "No dynamic findings available."}
+                                  </p>
+                                )}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
                     </div>
                   ) : (
-                    <p className="text-sm text-slate-300">
+                    <p className="text-sm text-slate-400">
                       {selectedDynamicJobId ? "No results yet for selected scan." : "Select a scan above to view results."}
                     </p>
                   )}
@@ -3566,9 +3675,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 </p>
               </div>
 
-              <div className="flex min-h-0 flex-1 gap-4">
+              <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
               {/* Left pane — configuration */}
-              <div className="w-80 flex-shrink-0 space-y-4 overflow-y-auto">
+              <div className="space-y-4 overflow-y-auto">
 
                 {/* Scope selector */}
                 <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
@@ -3774,7 +3883,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
               </div>
               {/* Right pane — selected-job progress + results */}
-              <div className="flex flex-1 flex-col gap-4 overflow-y-auto">
+              <div className="flex flex-col gap-4 overflow-y-auto">
                 {!selectedLightweightJobId ? (
                   <div className="rounded-xl border border-slate-700/60 bg-slate-900/40 p-6 text-center">
                     <p className="text-sm text-slate-400">
@@ -3834,141 +3943,170 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         ) : null}
                       </div>
 
-                      {/* Results table */}
-                      {isCompleted && lwResults && lwResults.length > 0 ? (
-                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/40">
-                          <div className="border-b border-slate-800 px-4 py-2">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
-                              Results — {lwResults.length} package{lwResults.length === 1 ? "" : "s"}
-                            </p>
-                          </div>
-                          <div className="overflow-auto">
-                            <table className="w-full text-left text-[11px] text-slate-300">
-                              <thead className="sticky top-0 bg-slate-900/80 text-slate-500">
-                                <tr>
-                                  <th className="px-3 py-2">Package</th>
-                                  <th className="px-3 py-2">Risk</th>
-                                  <th className="px-3 py-2">CVEs</th>
-                                  <th className="px-3 py-2">CVE Source</th>
-                                  <th className="px-3 py-2">Libraries.io</th>
-                                  <th className="px-3 py-2">Details</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {lwResults.map((result) => {
-                                  const cveCount = Math.max(
-                                    result.advisory_references.length,
-                                    result.vulnerability_details?.length ?? 0,
-                                  );
-                                  const cveStatus = result.lookup_status?.cve;
-                                  const libStatus = result.lookup_status?.librariesio;
-                                  const isExpRow = lightweightExpandedId === result.id;
-                                  const hasDetails =
-                                    (result.vulnerability_details && result.vulnerability_details.length > 0) ||
-                                    (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0);
-                                  return (
-                                    <React.Fragment key={result.id}>
-                                      <tr className="border-t border-slate-800/60">
-                                        <td className="px-3 py-1.5 font-mono">{result.package_name}@{result.package_version}</td>
-                                        <td className="px-3 py-1.5">
-                                          <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${
-                                            result.risk_overall_status === "malicious"
-                                              ? "border-rose-400/40 bg-rose-500/10 text-rose-200"
-                                              : result.risk_overall_status === "suspicious"
-                                                ? "border-amber-400/40 bg-amber-500/10 text-amber-200"
-                                                : "border-emerald-400/40 bg-emerald-500/10 text-emerald-200"
-                                          }`}>
-                                            {(result.risk_overall_score * 100).toFixed(0)}% {result.risk_overall_status}
-                                          </span>
-                                        </td>
-                                        <td className="px-3 py-1.5">{cveCount > 0 ? cveCount : "—"}</td>
-                                        <td className="px-3 py-1.5">
-                                          {cveStatus ? (
-                                            <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(cveStatus)}`}>
-                                              {lookupStatusLabel("cve", cveStatus)}
-                                            </span>
-                                          ) : <span className="text-slate-600">—</span>}
-                                        </td>
-                                        <td className="px-3 py-1.5">
-                                          {libStatus ? (
-                                            <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(libStatus)}`}>
-                                              {lookupStatusLabel("librariesio", libStatus)}
-                                            </span>
-                                          ) : <span className="text-slate-600">—</span>}
-                                        </td>
-                                        <td className="px-3 py-1.5">
-                                          {hasDetails ? (
-                                            <button
-                                              type="button"
-                                              onClick={() => setLightweightExpandedId(isExpRow ? null : result.id)}
-                                              className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
-                                            >
-                                              {isExpRow ? "hide" : "view"}
-                                            </button>
-                                          ) : <span className="text-slate-600">—</span>}
-                                        </td>
-                                      </tr>
-                                      {isExpRow ? (
-                                        <tr key={`${result.id}-lw-detail`} className="bg-slate-900/40">
-                                          <td colSpan={6} className="px-3 pb-4 pt-2">
-                                            <div className="space-y-4">
-                                              {result.vulnerability_details && result.vulnerability_details.length > 0 ? (
-                                                <div>
-                                                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE Findings ({result.vulnerability_details.length})</p>
-                                                  <table className="w-full text-[10px]">
-                                                    <thead><tr className="text-slate-500"><th className="pb-1 pr-3 text-left">Advisory</th><th className="pb-1 pr-3 text-left">Source</th><th className="pb-1 pr-3 text-left">CVSS</th><th className="pb-1 text-left">Description</th></tr></thead>
-                                                    <tbody>
-                                                      {result.vulnerability_details.map((v, i) => {
-                                                        const href = v.advisory_id.startsWith("CVE-")
-                                                          ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
-                                                          : v.advisory_id.startsWith("GHSA-")
-                                                            ? `https://github.com/advisories/${v.advisory_id}`
-                                                            : null;
-                                                        return (
-                                                          <tr key={i} className="border-t border-slate-800/40">
-                                                            <td className="py-1 pr-3 font-mono text-indigo-300">
-                                                              {href ? <a href={href} target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-100">{v.advisory_id}</a> : v.advisory_id}
-                                                            </td>
-                                                            <td className="py-1 pr-3 uppercase text-slate-400">{v.source}</td>
-                                                            <td className="py-1 pr-3 text-slate-300">{v.value != null ? v.value.toFixed(1) : "—"}</td>
-                                                            <td className="py-1 text-slate-400 max-w-xs truncate">{v.details ?? "—"}</td>
-                                                          </tr>
-                                                        );
-                                                      })}
-                                                    </tbody>
-                                                  </table>
-                                                </div>
-                                              ) : null}
-                                              {result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0 ? (
-                                                <div>
-                                                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Reputation (Libraries.io)</p>
-                                                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                                                    {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score", "package_age_days", "maintainer_count"] as const).map((k) => {
-                                                      const val = result.reputation_metadata?.[k];
-                                                      if (val == null) return null;
-                                                      const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k === "package_age_days" ? "Age (days)" : k === "maintainer_count" ? "Maintainers" : k.replace(/_/g, " ");
-                                                      return (
-                                                        <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
-                                                          <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
-                                                          <p className="mt-0.5 font-mono text-[11px] text-slate-200">{k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}</p>
-                                                        </div>
-                                                      );
-                                                    })}
-                                                  </div>
-                                                </div>
-                                              ) : null}
-                                            </div>
-                                          </td>
-                                        </tr>
-                                      ) : null}
-                                    </React.Fragment>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                          </div>
+                      {/* Results panel */}
+                      <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Scan Results</p>
+                          <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                            {job.status}
+                          </span>
                         </div>
-                      ) : null}
+                        {isCompleted && lwResults && lwResults.length > 0 ? (
+                          <div className="space-y-2">
+                            {lwResults.map((result) => {
+                              const cveCount = Math.max(
+                                result.advisory_references.length,
+                                result.vulnerability_details?.length ?? 0,
+                              );
+                              const cveStatus = result.lookup_status?.cve;
+                              const libStatus = result.lookup_status?.librariesio;
+                              const isExpRow = lightweightExpandedId === result.id;
+                              const isErrorRow = !!result.error_message;
+                              const riskBadgeClass = result.risk_overall_status === "malicious"
+                                ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                                : result.risk_overall_status === "suspicious"
+                                  ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                                  : result.risk_overall_status === "clean"
+                                    ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                                    : "border-slate-600 bg-slate-800/60 text-slate-400";
+                              return (
+                                <div
+                                  key={result.id}
+                                  className={`rounded-lg border text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => setLightweightExpandedId(isExpRow ? null : result.id)}
+                                    className="w-full p-3 text-left"
+                                  >
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <p className="font-medium">
+                                        {result.package_name} <span className="text-slate-400">@</span> {result.package_version}
+                                      </p>
+                                      <div className="flex items-center gap-2">
+                                        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${riskBadgeClass}`}>
+                                          {formatVerdict(result.risk_overall_status)}
+                                        </span>
+                                        <span className="text-[11px] text-slate-500">{isExpRow ? "▲" : "▼"}</span>
+                                      </div>
+                                    </div>
+                                    <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
+                                      <span>Risk: {(result.risk_overall_score * 100).toFixed(1)}%</span>
+                                      {cveCount > 0 ? <span>CVEs: {cveCount}</span> : null}
+                                      {cveStatus ? (
+                                        <span>CVE src: <span className={`rounded border px-1 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(cveStatus)}`}>{lookupStatusLabel("cve", cveStatus)}</span></span>
+                                      ) : null}
+                                      {libStatus ? (
+                                        <span>Libraries.io: <span className={`rounded border px-1 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(libStatus)}`}>{lookupStatusLabel("librariesio", libStatus)}</span></span>
+                                      ) : null}
+                                    </div>
+                                    {result.advisory_references.length > 0 ? (
+                                      <div className="mt-2 flex flex-wrap gap-1.5">
+                                        {result.advisory_references.map((ref) => {
+                                          const isCve = ref.toUpperCase().startsWith("CVE-");
+                                          const isGhsa = ref.toUpperCase().startsWith("GHSA-");
+                                          const href = isCve
+                                            ? `https://nvd.nist.gov/vuln/detail/${ref}`
+                                            : isGhsa ? `https://github.com/advisories/${ref}` : null;
+                                          return href ? (
+                                            <a
+                                              key={ref}
+                                              href={href}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              onClick={(e) => e.stopPropagation()}
+                                              className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
+                                            >
+                                              {ref}
+                                            </a>
+                                          ) : (
+                                            <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{ref}</span>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : null}
+                                    {result.error_message ? <p className="mt-1 text-xs text-rose-200">{result.error_message}</p> : null}
+                                  </button>
+                                  {isExpRow ? (
+                                    <div className="border-t border-slate-700/60 px-3 pb-3 pt-2 space-y-3">
+                                      <div className="flex flex-wrap gap-3 text-xs">
+                                        <div>
+                                          <p className="text-[10px] uppercase tracking-wide text-slate-500">Risk Status</p>
+                                          <p className="mt-0.5 font-medium uppercase text-slate-200">{result.risk_overall_status ?? "—"}</p>
+                                        </div>
+                                        <div>
+                                          <p className="text-[10px] uppercase tracking-wide text-slate-500">Risk Score</p>
+                                          <p className="mt-0.5 font-mono font-medium text-slate-200">{(result.risk_overall_score * 100).toFixed(2)}%</p>
+                                        </div>
+                                        {result.scan_timestamp ? (
+                                          <div>
+                                            <p className="text-[10px] uppercase tracking-wide text-slate-500">Scanned At</p>
+                                            <p className="mt-0.5 text-slate-300">{formatTimestampForDisplay(result.scan_timestamp)}</p>
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                      {result.vulnerability_details && result.vulnerability_details.length > 0 ? (
+                                        <div>
+                                          <p className="mb-1.5 text-[10px] uppercase tracking-wide text-slate-500">CVE Findings ({result.vulnerability_details.length})</p>
+                                          <table className="w-full text-[10px]">
+                                            <thead>
+                                              <tr className="text-slate-500">
+                                                <th className="pb-1 pr-3 text-left font-medium">Advisory</th>
+                                                <th className="pb-1 pr-3 text-left font-medium">Source</th>
+                                                <th className="pb-1 pr-3 text-left font-medium">CVSS</th>
+                                                <th className="pb-1 text-left font-medium">Description</th>
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {result.vulnerability_details.map((v, i) => {
+                                                const href = v.advisory_id.startsWith("CVE-")
+                                                  ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
+                                                  : v.advisory_id.startsWith("GHSA-")
+                                                    ? `https://github.com/advisories/${v.advisory_id}`
+                                                    : null;
+                                                return (
+                                                  <tr key={i} className="border-t border-slate-800/40">
+                                                    <td className="py-1 pr-3 font-mono text-indigo-300">
+                                                      {href ? <a href={href} target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-100">{v.advisory_id}</a> : v.advisory_id}
+                                                    </td>
+                                                    <td className="py-1 pr-3 uppercase text-slate-400">{v.source}</td>
+                                                    <td className="py-1 pr-3 text-slate-300">{v.value != null ? v.value.toFixed(1) : "—"}</td>
+                                                    <td className="py-1 text-slate-400 max-w-xs truncate">{v.details ?? "—"}</td>
+                                                  </tr>
+                                                );
+                                              })}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      ) : null}
+                                      {result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0 ? (
+                                        <div>
+                                          <p className="mb-1.5 text-[10px] uppercase tracking-wide text-slate-500">Reputation (Libraries.io)</p>
+                                          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                                            {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score", "package_age_days", "maintainer_count"] as const).map((k) => {
+                                              const val = result.reputation_metadata?.[k];
+                                              if (val == null) return null;
+                                              const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k === "package_age_days" ? "Age (days)" : k === "maintainer_count" ? "Maintainers" : k.replace(/_/g, " ");
+                                              return (
+                                                <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
+                                                  <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                                  <p className="mt-0.5 font-mono text-[11px] text-slate-200">{k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}</p>
+                                                </div>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : isCompleted ? (
+                          <p className="text-sm text-slate-400">No results returned for this scan.</p>
+                        ) : null}
+                      </div>
                     </div>
                   );
                 })()}
