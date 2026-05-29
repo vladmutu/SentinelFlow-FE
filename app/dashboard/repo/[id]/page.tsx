@@ -626,6 +626,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [scanScope, setScanScope] = useState<ScanScope>("full");
   const [selectedScanPackages, setSelectedScanPackages] = useState<string[]>([]);
   const [isAgentChatOpen, setIsAgentChatOpen] = useState(true);
+  const [agentChatWidth, setAgentChatWidth] = useState(320);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [analysisPackageSearch, setAnalysisPackageSearch] = useState("");
   const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
   const [detailsPackageSearch, setDetailsPackageSearch] = useState("");
@@ -1793,12 +1795,34 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graphDetailNode?.label, repositoryEcosystem]);
 
+  function handleSidebarResizeMouseDown(e: React.MouseEvent) {
+    e.preventDefault();
+    setIsResizingSidebar(true);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onMouseMove = (ev: MouseEvent) => {
+      const newWidth = Math.max(260, Math.min(540, window.innerWidth - ev.clientX));
+      setAgentChatWidth(newWidth);
+    };
+
+    const onMouseUp = () => {
+      setIsResizingSidebar(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  }
+
   return (
     <section className="relative flex h-[100dvh] w-full overflow-hidden bg-black">
       <div
-        className={`flex h-full min-w-0 flex-1 flex-col transition-[padding-right] duration-300 ${
-          isAgentChatOpen ? "pr-80" : "pr-0"
-        }`}
+        className={`flex h-full min-w-0 flex-1 flex-col ${isResizingSidebar ? "" : "transition-[padding-right] duration-300"}`}
+        style={{ paddingRight: isAgentChatOpen ? agentChatWidth : 0 }}
       >
         <header className="border-b border-gray-800 bg-gray-950 px-6 py-4">
           <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Repository</p>
@@ -4538,10 +4562,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         ) : null}
 
         <aside
-          className={`pointer-events-auto absolute inset-y-0 right-0 flex h-full w-80 flex-col border-l-4 border-cyan-400/20 bg-gray-950/90 shadow-[0_28px_72px_-34px_rgba(2,6,23,0.95)] transition-transform duration-300 ${
+          className={`pointer-events-auto absolute inset-y-0 right-0 flex h-full flex-col border-l-4 border-cyan-400/20 bg-gray-950/90 shadow-[0_28px_72px_-34px_rgba(2,6,23,0.95)] transition-transform duration-300 ${
             isAgentChatOpen ? "translate-x-0" : "translate-x-full"
           }`}
+          style={{ width: agentChatWidth }}
         >
+          <div
+            className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize transition-colors hover:bg-cyan-400/30 active:bg-cyan-400/50"
+            onMouseDown={handleSidebarResizeMouseDown}
+          />
           <div className="flex items-start justify-between gap-3 border-b border-gray-800 p-4">
             <div>
               <p className="text-sm font-semibold text-slate-100">SentinelFlow Agent</p>
