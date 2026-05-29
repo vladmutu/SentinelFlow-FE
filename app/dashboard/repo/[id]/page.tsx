@@ -2876,6 +2876,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         </div>
                       ) : (
                         <>
+                          {/* Identity header */}
                           <div className="flex flex-wrap items-start justify-between gap-3">
                             <div>
                               <h3 className="text-2xl font-bold text-slate-100">
@@ -2885,77 +2886,117 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                 v{selectedDetailsPackage.slice(selectedDetailsPackage.lastIndexOf("@") + 1) || "unknown"}
                               </p>
                             </div>
-                            {(() => {
-                              const entry = scanResultsMap[selectedDetailsPackage] as { malware_status?: string } | undefined;
-                              const status = packageDetailsScanEntry?.risk_overall_status ?? entry?.malware_status;
-                              if (!status) return null;
-                              const cls = status === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-100"
-                                : status === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-100"
-                                : status === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
-                                : "border-slate-400/50 bg-slate-500/15 text-slate-300";
-                              return (
-                                <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] ${cls}`}>
-                                  {status}
+                            <div className="flex flex-wrap items-center gap-2">
+                              {packageDetailsData?.ecosystem ? (
+                                <span className="rounded border border-slate-600 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-400">
+                                  {packageDetailsData.ecosystem}
                                 </span>
-                              );
-                            })()}
+                              ) : null}
+                              {packageDetailsData?.license ? (
+                                <span className="rounded border border-slate-600 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-300">
+                                  {packageDetailsData.license}
+                                </span>
+                              ) : null}
+                              {(() => {
+                                const entry = scanResultsMap[selectedDetailsPackage] as { malware_status?: string } | undefined;
+                                const status = packageDetailsScanEntry?.risk_overall_status ?? entry?.malware_status;
+                                if (!status) return null;
+                                const cls = status === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-100"
+                                  : status === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-100"
+                                  : status === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
+                                  : "border-slate-400/50 bg-slate-500/15 text-slate-300";
+                                return (
+                                  <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] ${cls}`}>
+                                    {status}
+                                  </span>
+                                );
+                              })()}
+                            </div>
                           </div>
 
+                          {/* Description */}
                           {packageDetailsData?.description ? (
                             <p className="text-sm leading-relaxed text-slate-300">{packageDetailsData.description}</p>
                           ) : null}
 
-                          <div className="grid grid-cols-2 gap-3">
-                            {packageDetailsData?.monthly_downloads != null ? (
-                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-                                <p className="text-xs uppercase tracking-[0.1em] text-slate-400">Monthly downloads</p>
-                                <p className="mt-1.5 text-lg font-semibold text-slate-100">
-                                  {packageDetailsData.monthly_downloads >= 1_000_000
-                                    ? `${(packageDetailsData.monthly_downloads / 1_000_000).toFixed(1)}M`
-                                    : packageDetailsData.monthly_downloads >= 1_000
-                                      ? `${(packageDetailsData.monthly_downloads / 1_000).toFixed(0)}K`
-                                      : String(packageDetailsData.monthly_downloads)}
-                                </p>
-                              </div>
-                            ) : null}
-                            {packageDetailsScanEntry?.risk_overall_score != null ? (
-                              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-                                <p className="text-xs uppercase tracking-[0.1em] text-slate-400">Risk score</p>
-                                <div className="mt-2">
-                                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-700">
-                                    <div
-                                      className={`h-full rounded-full ${packageDetailsScanEntry.risk_overall_score > 0.5 ? "bg-rose-400" : packageDetailsScanEntry.risk_overall_score > 0.2 ? "bg-amber-400" : "bg-emerald-400"}`}
-                                      style={{ width: `${(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%` }}
-                                    />
-                                  </div>
-                                  <p className="mt-1.5 text-base font-semibold text-slate-200">{(packageDetailsScanEntry.risk_overall_score * 100).toFixed(0)}%</p>
-                                </div>
-                              </div>
-                            ) : null}
-                          </div>
-
+                          {/* Links */}
                           {packageDetailsData?.homepage || packageDetailsData?.registry_url ? (
                             <div className="flex flex-wrap gap-4">
                               {packageDetailsData.homepage ? (
-                                <a href={packageDetailsData.homepage} target="_blank" rel="noreferrer" className="text-sm text-teal-300 underline decoration-teal-400/50 underline-offset-2 hover:text-teal-200">
+                                <a href={packageDetailsData.homepage} target="_blank" rel="noreferrer"
+                                  className="inline-flex items-center gap-1.5 rounded-lg border border-teal-400/30 bg-teal-500/10 px-3 py-1.5 text-xs font-medium text-teal-300 transition hover:bg-teal-500/20">
                                   Homepage ↗
                                 </a>
                               ) : null}
                               {packageDetailsData.registry_url ? (
-                                <a href={packageDetailsData.registry_url} target="_blank" rel="noreferrer" className="text-sm text-teal-300 underline decoration-teal-400/50 underline-offset-2 hover:text-teal-200">
-                                  Registry ↗
+                                <a href={packageDetailsData.registry_url} target="_blank" rel="noreferrer"
+                                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600 bg-slate-800/60 px-3 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-slate-700/60">
+                                  {packageDetailsData.ecosystem === "npm" ? "npmjs.com" : packageDetailsData.ecosystem === "pypi" ? "PyPI" : "Registry"} ↗
                                 </a>
                               ) : null}
                             </div>
                           ) : null}
 
+                          {/* Version comparison */}
                           {packageDetailsLatestVersion ? (
-                            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-                              <p className="text-xs uppercase tracking-[0.1em] text-slate-400">Latest version</p>
-                              <p className="mt-1.5 font-mono text-base text-teal-200">{packageDetailsLatestVersion}</p>
+                            <div className="flex flex-wrap items-center gap-4 text-sm">
+                              <span className="text-slate-400">
+                                Installed: <span className="font-mono text-slate-200">{selectedDetailsPackage.slice(selectedDetailsPackage.lastIndexOf("@") + 1) || "unknown"}</span>
+                              </span>
+                              <span className="text-slate-700">·</span>
+                              <span className="text-slate-400">
+                                Latest: <span className="font-mono text-teal-300">{packageDetailsLatestVersion}</span>
+                              </span>
                               {packageDetailsVersions.length > 1 ? (
-                                <p className="mt-1 text-sm text-slate-500">{packageDetailsVersions.length} versions available</p>
+                                <span className="text-xs text-slate-500">{packageDetailsVersions.length} versions available</span>
                               ) : null}
+                            </div>
+                          ) : null}
+
+                          {/* Libraries.io metadata grid */}
+                          {(() => {
+                            const d = packageDetailsData;
+                            const metrics: [string, string | null][] = [
+                              ["Monthly Downloads", d?.monthly_downloads != null
+                                ? d.monthly_downloads >= 1_000_000 ? `${(d.monthly_downloads / 1_000_000).toFixed(1)}M`
+                                : d.monthly_downloads >= 1_000 ? `${(d.monthly_downloads / 1_000).toFixed(0)}K`
+                                : String(d.monthly_downloads)
+                                : null],
+                              ["Stars", d?.stars != null ? String(d.stars) : null],
+                              ["Forks", d?.forks != null ? String(d.forks) : null],
+                              ["Contributors", d?.contributors_count != null ? String(d.contributors_count) : null],
+                              ["Dependents", d?.dependents_count != null ? String(d.dependents_count) : null],
+                              ["SourceRank", d?.source_rank != null ? String(d.source_rank) : null],
+                              ["Maintainers", d?.maintainer_count != null ? String(d.maintainer_count) : null],
+                              ["Age (days)", d?.package_age_days != null ? String(d.package_age_days) : null],
+                              ["Direct Deps", d?.direct_dependencies_count != null ? String(d.direct_dependencies_count) : null],
+                              ["Repository", d?.has_repository != null ? (d.has_repository ? "Yes" : "No") : null],
+                            ].filter(([, v]) => v !== null) as [string, string][];
+                            if (metrics.length === 0) return null;
+                            return (
+                              <div>
+                                <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Package Metadata</p>
+                                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                                  {metrics.map(([label, value]) => (
+                                    <div key={label} className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2.5">
+                                      <p className="text-[10px] uppercase tracking-[0.08em] text-slate-500">{label}</p>
+                                      <p className="mt-1 font-mono text-sm font-semibold text-slate-200">{value}</p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {/* Keywords */}
+                          {packageDetailsData?.keywords && packageDetailsData.keywords.length > 0 ? (
+                            <div>
+                              <p className="mb-2 text-[11px] uppercase tracking-[0.14em] text-slate-500">Keywords</p>
+                              <div className="flex flex-wrap gap-1.5">
+                                {packageDetailsData.keywords.map((kw) => (
+                                  <span key={kw} className="rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[11px] text-slate-400">{kw}</span>
+                                ))}
+                              </div>
                             </div>
                           ) : null}
 
