@@ -3828,7 +3828,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                     const hasDetails =
                                                       (result.static_features && Object.keys(result.static_features).length > 0) ||
                                                       (result.vulnerability_details && result.vulnerability_details.length > 0) ||
-                                                      (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0);
+                                                      (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0) ||
+                                                      !!(result.dynamic_findings && result.analyzed_by?.includes("dynamic"));
                                                     const isExpRow = expandedResultId === result.id;
                                                     return (
                                                       <React.Fragment key={result.id}>
@@ -3916,6 +3917,115 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                                     </div>
                                                                   </div>
                                                                 ) : null}
+                                                                {result.dynamic_findings && result.analyzed_by?.includes("dynamic") ? (() => {
+                                                                  const dyn = result.dynamic_findings as DynamicFinding;
+                                                                  if (!dyn.status || dyn.status === "skipped") return null;
+                                                                  return (
+                                                                    <div>
+                                                                      <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Dynamic Analysis</p>
+                                                                      {/* Summary row */}
+                                                                      <div className="mb-2 flex flex-wrap items-center gap-2">
+                                                                        {dyn.status ? (
+                                                                          <span className={`inline-flex rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] ${dyn.status === "completed" ? "border-emerald-400/30 bg-emerald-500/15 text-emerald-200" : dyn.status === "partial" ? "border-amber-400/30 bg-amber-500/15 text-amber-200" : "border-rose-400/30 bg-rose-500/15 text-rose-200"}`}>
+                                                                            {dyn.status}
+                                                                          </span>
+                                                                        ) : null}
+                                                                        {dyn.coverage ? (
+                                                                          <span className={`inline-flex rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] ${dyn.coverage === "full" ? "border-teal-400/30 bg-teal-500/15 text-teal-200" : "border-slate-600 bg-slate-800 text-slate-400"}`}>
+                                                                            Coverage: {dyn.coverage}
+                                                                          </span>
+                                                                        ) : null}
+                                                                        {dyn.ioc_hit !== undefined ? (
+                                                                          <span className={`inline-flex rounded border px-2 py-0.5 text-[10px] font-semibold uppercase ${dyn.ioc_hit ? "border-rose-400/50 bg-rose-500/15 text-rose-200" : "border-slate-700 bg-slate-800/60 text-slate-400"}`}>
+                                                                            IOC: {dyn.ioc_hit ? "HIT" : "clean"}
+                                                                          </span>
+                                                                        ) : null}
+                                                                        {dyn.vm_evasion_observed ? (
+                                                                          <span className="inline-flex rounded border border-amber-400/50 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase text-amber-300">VM Evasion</span>
+                                                                        ) : null}
+                                                                        {dyn.sandbox_timed_out ? (
+                                                                          <span className="inline-flex rounded border border-slate-600 bg-slate-800/60 px-2 py-0.5 text-[10px] uppercase text-slate-400">Timed out</span>
+                                                                        ) : null}
+                                                                        {dyn.risk_score != null ? (
+                                                                          <span className="text-[10px] text-slate-400">Dynamic Risk: <span className="font-mono text-slate-200">{(dyn.risk_score * 100).toFixed(1)}%</span></span>
+                                                                        ) : null}
+                                                                        {dyn.sandbox_provider ? (
+                                                                          <span className="text-[10px] text-slate-500">Sandbox: <span className="text-slate-400">{dyn.sandbox_provider}</span></span>
+                                                                        ) : null}
+                                                                      </div>
+                                                                      {/* IOC detail */}
+                                                                      {dyn.ioc_detail ? (
+                                                                        <div className="mb-2 rounded border border-slate-700/60 bg-slate-950/40 p-2">
+                                                                          <p className="mb-1.5 text-[9px] uppercase tracking-wide text-slate-500">IOC Detail</p>
+                                                                          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px]">
+                                                                            {dyn.ioc_detail.verdict ? <span className="text-slate-300">Verdict: <span className="font-semibold uppercase text-slate-200">{dyn.ioc_detail.verdict}</span></span> : null}
+                                                                            {dyn.ioc_detail.raw_line_count != null ? <span className="text-slate-300">Log lines: <span className="font-mono text-slate-200">{dyn.ioc_detail.raw_line_count}</span></span> : null}
+                                                                          </div>
+                                                                          {(["network_iocs", "process_iocs", "file_iocs", "dns_iocs", "crypto_iocs"] as const).map((field) => {
+                                                                            const items = dyn.ioc_detail?.[field];
+                                                                            if (!Array.isArray(items) || items.length === 0) return null;
+                                                                            return (
+                                                                              <div key={field} className="mt-1.5">
+                                                                                <p className="text-[9px] uppercase tracking-wide text-slate-500">{field.replace("_iocs", "").replace("_", " ")} IOCs ({items.length})</p>
+                                                                                <div className="mt-0.5 flex flex-wrap gap-1">
+                                                                                  {items.slice(0, 8).map((item, i) => <span key={i} className="rounded border border-slate-700 bg-slate-900/80 px-1.5 py-0.5 font-mono text-[9px] text-slate-300">{item}</span>)}
+                                                                                  {items.length > 8 ? <span className="text-[9px] text-slate-500">+{items.length - 8} more</span> : null}
+                                                                                </div>
+                                                                              </div>
+                                                                            );
+                                                                          })}
+                                                                          {dyn.ioc_detail.flagged_lines && dyn.ioc_detail.flagged_lines.length > 0 ? (
+                                                                            <div className="mt-1.5">
+                                                                              <p className="text-[9px] uppercase tracking-wide text-slate-500">Flagged Lines ({dyn.ioc_detail.flagged_lines.length})</p>
+                                                                              <div className="mt-0.5 space-y-0.5">
+                                                                                {dyn.ioc_detail.flagged_lines.slice(0, 5).map((line, i) => <p key={i} className="rounded bg-slate-950/60 px-2 py-0.5 font-mono text-[9px] text-slate-400">{line}</p>)}
+                                                                                {dyn.ioc_detail.flagged_lines.length > 5 ? <p className="text-[9px] text-slate-500">+{dyn.ioc_detail.flagged_lines.length - 5} more lines</p> : null}
+                                                                              </div>
+                                                                            </div>
+                                                                          ) : null}
+                                                                        </div>
+                                                                      ) : null}
+                                                                      {/* Syscall trace */}
+                                                                      {dyn.syscall_trace ? (
+                                                                        <div className="mb-2 rounded border border-slate-700/60 bg-slate-950/40 p-2">
+                                                                          <p className="mb-1 text-[9px] uppercase tracking-wide text-slate-500">Syscall Trace</p>
+                                                                          <p className="text-[10px] text-slate-300"><span className="font-mono text-slate-200">{dyn.syscall_trace.suspicious_count ?? 0}</span> suspicious calls</p>
+                                                                          {dyn.syscall_trace.categories && dyn.syscall_trace.categories.length > 0 ? (
+                                                                            <div className="mt-1 flex flex-wrap gap-1">
+                                                                              {dyn.syscall_trace.categories.map((c, i) => <span key={i} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[9px] text-slate-300">{c}</span>)}
+                                                                            </div>
+                                                                          ) : null}
+                                                                        </div>
+                                                                      ) : null}
+                                                                      {/* Network activity */}
+                                                                      {dyn.network_activity ? (
+                                                                        <div className="mb-2 rounded border border-slate-700/60 bg-slate-950/40 p-2">
+                                                                          <p className="mb-1 text-[9px] uppercase tracking-wide text-slate-500">Network Activity</p>
+                                                                          <p className="text-[10px] text-slate-300"><span className="font-mono text-slate-200">{dyn.network_activity.outbound_connections ?? 0}</span> outbound connection{(dyn.network_activity.outbound_connections ?? 0) !== 1 ? "s" : ""}</p>
+                                                                          {dyn.network_activity.destinations && dyn.network_activity.destinations.length > 0 ? (
+                                                                            <div className="mt-1 flex flex-wrap gap-1">
+                                                                              {dyn.network_activity.destinations.map((d, i) => <span key={i} className="rounded border border-slate-700 bg-slate-950/60 px-1.5 py-0.5 font-mono text-[9px] text-slate-300">{d}</span>)}
+                                                                            </div>
+                                                                          ) : null}
+                                                                        </div>
+                                                                      ) : null}
+                                                                      {/* Filesystem changes */}
+                                                                      {dyn.filesystem_changes ? (
+                                                                        <div className="rounded border border-slate-700/60 bg-slate-950/40 p-2">
+                                                                          <p className="mb-1 text-[9px] uppercase tracking-wide text-slate-500">Filesystem Changes</p>
+                                                                          <p className={`text-[10px] ${(dyn.filesystem_changes.sensitive_path_writes ?? 0) > 0 ? "text-rose-300" : "text-slate-300"}`}>
+                                                                            <span className="font-mono">{dyn.filesystem_changes.sensitive_path_writes ?? 0}</span> sensitive path write{(dyn.filesystem_changes.sensitive_path_writes ?? 0) !== 1 ? "s" : ""}
+                                                                          </p>
+                                                                          {dyn.filesystem_changes.paths && dyn.filesystem_changes.paths.length > 0 ? (
+                                                                            <div className="mt-1 flex flex-wrap gap-1">
+                                                                              {dyn.filesystem_changes.paths.map((p, i) => <span key={i} className="rounded border border-slate-700 bg-slate-950/60 px-1.5 py-0.5 font-mono text-[9px] text-slate-300">{p}</span>)}
+                                                                            </div>
+                                                                          ) : null}
+                                                                        </div>
+                                                                      ) : null}
+                                                                    </div>
+                                                                  );
+                                                                })() : null}
                                                               </div>
                                                             </td>
                                                           </tr>
