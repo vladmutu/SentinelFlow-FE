@@ -6,7 +6,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanApiError, ScanJobResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -74,6 +74,17 @@ type LatestScanSummary = {
 
 type ScanScope = "full" | "partial";
 type ScanHistoryStatusFilter = "all" | ScanHistoryItem["status"];
+
+type ActiveScanJob = {
+  jobId: string;
+  scanMode: ScanMode;
+  status: string;
+  progress: number;
+  details: InternalScanJobResponse | null;
+  error: string | null;
+  elapsedSeconds: number;
+  sourceTab: "graph" | "static-analysis" | "dynamic-analysis" | "lightweight";
+};
 
 type RepoCoordinates = {
   owner: string;
@@ -594,20 +605,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [repositoryLanguage, setRepositoryLanguage] = useState("");
   const [repositoryEcosystem, setRepositoryEcosystem] = useState<Ecosystem | null>(null);
   const [isLoadingTree, setIsLoadingTree] = useState(false);
-  const [isScanRunning, setIsScanRunning] = useState(false);
+  const [activeScanJobs, setActiveScanJobs] = useState<Map<string, ActiveScanJob>>(new Map());
+  const [isCancellingScan, setIsCancellingScan] = useState(false);
   const [hasScanned, setHasScanned] = useState(false);
-  const [scanJobId, setScanJobId] = useState<string | null>(null);
-  const [scanProgress, setScanProgress] = useState(0);
-  const [scanStatus, setScanStatus] = useState("Waiting to start malware scan.");
-  const [scanDetails, setScanDetails] = useState<InternalScanJobResponse | null>(null);
   const [activeSection, setActiveSection] = useState("graph");
   const [graphScanView, setGraphScanView] = useState<"progress" | "results">("progress");
   const [isHydrated, setIsHydrated] = useState(false);
   const [scanScope, setScanScope] = useState<ScanScope>("full");
   const [selectedScanPackages, setSelectedScanPackages] = useState<string[]>([]);
   const [isAgentChatOpen, setIsAgentChatOpen] = useState(true);
-  const [isCancellingScan, setIsCancellingScan] = useState(false);
-  const [liveElapsedSeconds, setLiveElapsedSeconds] = useState(0);
   const [analysisPackageSearch, setAnalysisPackageSearch] = useState("");
   const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
   const [detailsPackageSearch, setDetailsPackageSearch] = useState("");
@@ -631,12 +637,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [lightweightSelectedPackages, setLightweightSelectedPackages] = useState<string[]>([]);
   const [lightweightPackageSearch, setLightweightPackageSearch] = useState("");
   const [lightweightSources, setLightweightSources] = useState({ cve: true, librariesio: true });
-  const [lightweightJob, setLightweightJob] = useState<ScanJobResponse | null>(null);
-  const [isLightweightRunning, setIsLightweightRunning] = useState(false);
-  const [lightweightError, setLightweightError] = useState<string | null>(null);
-  const [isLightweightCancelling, setIsLightweightCancelling] = useState(false);
   const [lightweightExpandedId, setLightweightExpandedId] = useState<string | null>(null);
-  const lightweightPollTimerRef = useRef<number | null>(null);
   const historyScrollRef = useRef<HTMLDivElement | null>(null);
   // SBOM
   const [sbomDocument, setSbomDocument] = useState<SbomDocument | null>(null);
@@ -653,12 +654,31 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [activeScanMode, setActiveScanMode] = useState<ScanMode>("full");
   const [forceRescan, setForceRescan] = useState(false);
   const isMountedRef = useRef(true);
-  const scanPollTimerRef = useRef<number | null>(null);
-  const elapsedTickerRef = useRef<number | null>(null);
-  const scanRetryAttemptRef = useRef(0);
+  const scanPollTimersRef = useRef<Map<string, number>>(new Map());
+  const elapsedTickersRef = useRef<Map<string, number>>(new Map());
+  const scanRetryAttemptsRef = useRef<Map<string, number>>(new Map());
   const liveResultKeysRef = useRef<Set<string>>(new Set());
   const repoContextRef = useRef<RepoContext | null>(null);
   const repoContextPromiseRef = useRef<Promise<RepoContext> | null>(null);
+
+  // Graph-tab-scoped: only jobs that originated from the dependency graph tab
+  const graphTabJobs = Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "graph");
+  const isGraphTabScanRunning = graphTabJobs.some(j => j.status === "pending" || j.status === "running");
+
+  // isScanRunning kept for legacy progress displays that show the graph-tab primary job
+  const isScanRunning = isGraphTabScanRunning;
+
+  // Primary job = most recently started graph-tab job; used for backward-compatible single-job displays
+  const primaryJob: ActiveScanJob | null = graphTabJobs.length > 0
+    ? graphTabJobs.at(-1) ?? null
+    : null;
+
+  const scanJobId = primaryJob?.jobId ?? null;
+  const scanProgress = primaryJob?.progress ?? 0;
+  const scanStatus = primaryJob?.status ?? "Waiting to start malware scan.";
+  const scanDetails = primaryJob?.details ?? null;
+  const liveElapsedSeconds = primaryJob?.elapsedSeconds ?? 0;
+
   const scanDisplay = useMemo(
     () => deriveScanDisplay(scanDetails as ScanJobResponse | null, scanProgress, isScanRunning, scanError),
     [scanDetails, scanProgress, isScanRunning, scanError],
@@ -669,7 +689,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     () => scanResultRows.filter((row) => row.errorMessage !== null || row.status === "failed").length,
     [scanResultRows],
   );
-  const canCancelScan = scanJobId !== null && (scanDisplay.phase === "pending" || scanDisplay.phase === "running");
+  const canCancelScan = primaryJob !== null &&
+    (primaryJob.status === "pending" || primaryJob.status === "running");
   const canShowGraphScanResults = scanDisplay.phase === "completed" || hasScanned;
   const addDependencyEcosystems = useMemo(() => {
     const nodeEcosystems = Array.from(
@@ -687,7 +708,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     return repositoryEcosystem ? [repositoryEcosystem] : [];
   }, [nodes, repositoryEcosystem]);
   const isPartialScan = scanScope === "partial";
-  const canStartScan = !isScanRunning && (scanScope === "full" || selectedScanPackages.length > 0);
+  const canStartScan = !isGraphTabScanRunning && (scanScope === "full" || selectedScanPackages.length > 0);
   const availablePackagesForAnalysis = useMemo(() => {
     const labels = new Set<string>();
     const walk = (node: DependencyNode) => {
@@ -702,7 +723,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     if (!query) return availablePackagesForAnalysis;
     return availablePackagesForAnalysis.filter((pkg) => pkg.toLowerCase().includes(query));
   }, [availablePackagesForAnalysis, analysisPackageSearch]);
-  const canStartPartialAnalysisScan = !isScanRunning && selectedAnalysisPackages.length > 0;
+  const canStartPartialAnalysisScan = selectedAnalysisPackages.length > 0;
   const toggleSelectedScanPackage = useCallback((packageLabel: string) => {
     setSelectedScanPackages((current) =>
       current.includes(packageLabel) ? current.filter((item) => item !== packageLabel) : [...current, packageLabel],
@@ -713,7 +734,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       current.includes(packageLabel) ? current.filter((item) => item !== packageLabel) : [...current, packageLabel],
     );
   }, []);
-  const scanStartLabel = isScanRunning ? "Scanning packages..." : isPartialScan ? "Start Partial Scan" : "Start Scan";
+  const scanStartLabel = graphTabJobs.some(
+    j => j.scanMode === activeScanMode && (j.status === "pending" || j.status === "running")
+  ) ? `${activeScanMode} running...` : isPartialScan ? "Start Partial Scan" : "Start Scan";
   const runtimeElapsedLabel = useMemo(() => {
     if (scanDisplay.phase === "pending" || scanDisplay.phase === "running") {
       return `Elapsed ${formatDuration(liveElapsedSeconds)}`;
@@ -738,15 +761,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
     return () => {
       isMountedRef.current = false;
-      if (scanPollTimerRef.current !== null) {
-        window.clearTimeout(scanPollTimerRef.current);
-      }
-      if (elapsedTickerRef.current !== null) {
-        window.clearInterval(elapsedTickerRef.current);
-      }
-      if (lightweightPollTimerRef.current !== null) {
-        window.clearTimeout(lightweightPollTimerRef.current);
-      }
+      scanPollTimersRef.current.forEach(timer => window.clearTimeout(timer));
+      elapsedTickersRef.current.forEach(timer => window.clearInterval(timer));
     };
   }, []);
 
@@ -763,15 +779,10 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     setTreeError(null);
     setScanError(null);
     setIsLoadingTree(true);
-    setIsScanRunning(false);
-    setScanJobId(null);
-    setScanProgress(0);
-    setScanDetails(null);
-    setScanStatus("Waiting to start malware scan.");
+    setActiveScanJobs(new Map());
     setHasScanned(false);
     setScanScope("full");
     setSelectedScanPackages([]);
-    setLiveElapsedSeconds(0);
     setScanHistoryJobs([]);
     setIsScanHistoryLoading(false);
     setScanHistoryTotal(0);
@@ -791,46 +802,45 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     liveResultKeysRef.current = new Set();
     repoContextRef.current = null;
     repoContextPromiseRef.current = null;
-    if (scanPollTimerRef.current !== null) {
-      window.clearTimeout(scanPollTimerRef.current);
-      scanPollTimerRef.current = null;
-    }
-    if (elapsedTickerRef.current !== null) {
-      window.clearInterval(elapsedTickerRef.current);
-      elapsedTickerRef.current = null;
-    }
-    scanRetryAttemptRef.current = 0;
+    scanPollTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    scanPollTimersRef.current.clear();
+    elapsedTickersRef.current.forEach(timer => window.clearInterval(timer));
+    elapsedTickersRef.current.clear();
+    scanRetryAttemptsRef.current.clear();
   }, [decodedId]);
 
   useEffect(() => {
-    if (!isScanRunning) {
-      if (elapsedTickerRef.current !== null) {
-        window.clearInterval(elapsedTickerRef.current);
-        elapsedTickerRef.current = null;
+    // Start/stop per-job elapsed tickers based on active jobs
+    activeScanJobs.forEach((job, jobId) => {
+      if (job.status !== "pending" && job.status !== "running") {
+        const timer = elapsedTickersRef.current.get(jobId);
+        if (timer !== undefined) {
+          window.clearInterval(timer);
+          elapsedTickersRef.current.delete(jobId);
+        }
+        return;
       }
-      return;
-    }
-
-    // Sync to server-reported elapsed time whenever started_at is available.
-    if (scanDetails?.started_at) {
-      setLiveElapsedSeconds(normalizeLiveElapsedSeconds(scanDetails as ScanJobResponse));
-    }
-
-    if (elapsedTickerRef.current !== null) {
-      window.clearInterval(elapsedTickerRef.current);
-    }
-
-    elapsedTickerRef.current = window.setInterval(() => {
-      setLiveElapsedSeconds((current) => current + 1);
-    }, 1000);
-
-    return () => {
-      if (elapsedTickerRef.current !== null) {
-        window.clearInterval(elapsedTickerRef.current);
-        elapsedTickerRef.current = null;
+      if (!elapsedTickersRef.current.has(jobId)) {
+        const timer = window.setInterval(() => {
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const j = next.get(jobId);
+            if (j) next.set(jobId, { ...j, elapsedSeconds: j.elapsedSeconds + 1 });
+            return next;
+          });
+        }, 1000);
+        elapsedTickersRef.current.set(jobId, timer);
       }
-    };
-  }, [isScanRunning, scanDetails?.started_at]);
+    });
+
+    // Clean up tickers for jobs that are no longer in the map
+    elapsedTickersRef.current.forEach((timer, jobId) => {
+      if (!activeScanJobs.has(jobId)) {
+        window.clearInterval(timer);
+        elapsedTickersRef.current.delete(jobId);
+      }
+    });
+  }, [activeScanJobs]);
 
   const appendLiveResultRows = useCallback((incomingRows: ScanResultRow[]) => {
     if (incomingRows.length === 0) {
@@ -1146,24 +1156,31 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         const statusValue = normalizeStatusValue(payload.status);
         const phase = normalizeScanPhase(statusValue, true, false);
 
-        if (!isMountedRef.current) {
-          return;
-        }
+        if (!isMountedRef.current) return;
 
-        setScanError(null);
-        setScanDetails(payload);
-        setScanStatus(statusValue);
-        setScanProgress(computeScanProgress(payload, phase, 0));
-        if (payload.started_at) {
-          setLiveElapsedSeconds(normalizeLiveElapsedSeconds(payload));
-        }
+        scanRetryAttemptsRef.current.set(jobId, 0);
+
+        setActiveScanJobs(current => {
+          const next = new Map(current);
+          const job = next.get(jobId);
+          if (!job) return current;
+          next.set(jobId, {
+            ...job,
+            status: statusValue,
+            progress: computeScanProgress(payload, phase, job.progress),
+            details: payload,
+            error: null,
+            elapsedSeconds: payload.started_at
+              ? normalizeLiveElapsedSeconds(payload)
+              : job.elapsedSeconds,
+          });
+          return next;
+        });
 
         if (Array.isArray(payload.results)) {
           const liveResults = normalizeScanResultsPayload({ results: payload.results });
           appendLiveResultRows(liveResults.rows);
         }
-
-        scanRetryAttemptRef.current = 0;
 
         if (SCAN_TERMINAL_DONE.has(statusValue)) {
           if (Array.isArray(payload.results) && payload.results.length > 0) {
@@ -1172,94 +1189,99 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
             setScanResultsMap(prev => ({ ...prev, ...finalNormalized.map }));
             liveResultKeysRef.current = new Set(finalNormalized.rows.map(buildResultDedupKey));
           }
-          setIsScanRunning(false);
-          setScanStatus("Scan completed. Applying latest highlights.");
-          setScanProgress(100);
+          // Keep completed job in activeScanJobs so per-tab panels can display results
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const job = next.get(jobId);
+            if (job) next.set(jobId, { ...job, status: statusValue, progress: 100, details: payload });
+            return next;
+          });
           setHasScanned(true);
           await loadLatestScanResults();
-          setScanStatus("Latest malware scan results loaded.");
           if (isMountedRef.current) { void loadScanHistory(); }
           return;
         }
 
         if (SCAN_TERMINAL_CANCELLED.has(statusValue)) {
-          setIsScanRunning(false);
-          setScanStatus("Scan cancelled by user.");
+          // Keep cancelled job in activeScanJobs for display
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const job = next.get(jobId);
+            if (job) next.set(jobId, { ...job, status: statusValue });
+            return next;
+          });
           if (isMountedRef.current) { void loadScanHistory(); }
           return;
         }
 
         if (SCAN_TERMINAL_FAILED.has(statusValue)) {
-          setIsScanRunning(false);
-          setScanError(`Package scan failed with status: ${statusValue}`);
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const job = next.get(jobId);
+            if (job) next.set(jobId, { ...job, status: statusValue, error: `Scan failed: ${statusValue}`, details: payload });
+            return next;
+          });
           await loadLatestScanResults();
           if (isMountedRef.current) { void loadScanHistory(); }
           return;
         }
 
-        // Always continue polling for any non-terminal status.
-        // Removing the isPollingStatus guard ensures an unexpected or "unknown"
-        // status value never silently kills the polling chain.
-        if (scanPollTimerRef.current !== null) {
-          window.clearTimeout(scanPollTimerRef.current);
-        }
-
-        scanPollTimerRef.current = window.setTimeout(() => {
+        // Schedule next poll for any non-terminal status
+        const timer = window.setTimeout(() => {
           void pollScanJob(owner, repoName, jobId, headers);
         }, SCAN_POLL_INTERVAL_MS);
+        scanPollTimersRef.current.set(jobId, timer);
+
       } catch (pollError) {
-        if (!isMountedRef.current) {
-          return;
-        }
+        if (!isMountedRef.current) return;
 
         const errorMeta = resolvePollErrorMeta(pollError);
-        const timestamp = new Date().toISOString();
-        console.error(`[${timestamp}] scan polling error`, {
-          kind: errorMeta.kind,
-          status: errorMeta.status,
-          message: errorMeta.message,
-          error: pollError,
-        });
 
         if (errorMeta.kind === "auth") {
-          setScanError(errorMeta.message);
-          setIsScanRunning(false);
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const job = next.get(jobId);
+            if (job) next.set(jobId, { ...job, error: errorMeta.message });
+            return next;
+          });
           window.location.href = "/login";
           return;
         }
 
         if (errorMeta.kind === "not-found") {
-          setScanError(errorMeta.message);
-          setIsScanRunning(false);
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const job = next.get(jobId);
+            if (job) next.set(jobId, { ...job, error: errorMeta.message });
+            return next;
+          });
           return;
         }
 
-        scanRetryAttemptRef.current += 1;
-        const retryAttempt = scanRetryAttemptRef.current;
+        const attempt = (scanRetryAttemptsRef.current.get(jobId) ?? 0) + 1;
+        scanRetryAttemptsRef.current.set(jobId, attempt);
 
-        if (retryAttempt > POLL_RETRY_SILENT_ATTEMPTS || errorMeta.kind === "other") {
-          setScanError(`${errorMeta.message} Retrying shortly...`);
+        if (attempt > POLL_RETRY_SILENT_ATTEMPTS) {
+          setActiveScanJobs(current => {
+            const next = new Map(current);
+            const job = next.get(jobId);
+            if (job) next.set(jobId, { ...job, error: `${errorMeta.message} Retrying...` });
+            return next;
+          });
         }
 
-        if (scanPollTimerRef.current !== null) {
-          window.clearTimeout(scanPollTimerRef.current);
-        }
-
-        const backoffMultiplier = Math.max(0, retryAttempt - POLL_RETRY_SILENT_ATTEMPTS);
-        const exponentialDelay = Math.min(
+        const backoff = Math.min(
           SCAN_RETRY_MAX_DELAY_MS,
-          SCAN_POLL_INTERVAL_MS * Math.max(1, 2 ** backoffMultiplier),
+          SCAN_POLL_INTERVAL_MS * Math.max(1, 2 ** Math.max(0, attempt - POLL_RETRY_SILENT_ATTEMPTS)),
         );
-        const retryDelay =
-          errorMeta.kind === "other"
-            ? Math.max(POLL_ERROR_VISIBLE_RETRY_DELAY_MS, exponentialDelay)
-            : retryAttempt > POLL_RETRY_SILENT_ATTEMPTS
-              ? Math.max(POLL_ERROR_VISIBLE_RETRY_DELAY_MS, exponentialDelay)
-              : SCAN_POLL_INTERVAL_MS;
+        const delay = attempt > POLL_RETRY_SILENT_ATTEMPTS
+          ? Math.max(POLL_ERROR_VISIBLE_RETRY_DELAY_MS, backoff)
+          : SCAN_POLL_INTERVAL_MS;
 
-        scanPollTimerRef.current = window.setTimeout(() => {
+        const timer = window.setTimeout(() => {
           void pollScanJob(owner, repoName, jobId, headers);
-        }, retryDelay);
+        }, delay);
+        scanPollTimersRef.current.set(jobId, timer);
       }
     },
     // loadScanHistory is declared after pollScanJob — omitted from deps intentionally
@@ -1268,32 +1290,17 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   );
 
   const triggerPackageScan = useCallback(async (overrideScanMode?: ScanMode) => {
+    const scanMode: ScanMode = overrideScanMode ?? activeScanMode;
+
     setScanError(null);
-    setIsScanRunning(true);
-    setScanStatus("pending");
-    setScanProgress(0);
-    setLiveElapsedSeconds(0);
-    // Clear any previous job details immediately so the timer doesn't inherit
-    // the previous job's `started_at` while we resolve repository coordinates.
-    setScanDetails(null);
-    setScanResultRows([]);
-    setScanResultsMap({});
     setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
-    scanRetryAttemptRef.current = 0;
+    scanRetryAttemptsRef.current.set("pending-" + scanMode, 0);
 
     try {
       const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
       const token = clientSessionStorage.readToken();
       const scanResultsCacheKey = token ? buildScanResultsCacheKey(token, owner, repoName) : null;
-      const selectedPackagesPayload = isPartialScan ? selectedScanPackages : undefined;
-      const scanMode: ScanMode = overrideScanMode ?? activeScanMode;
-      const triggerBody: Record<string, unknown> = { ecosystem, scan_mode: scanMode };
-
-      if (selectedPackagesPayload && selectedPackagesPayload.length > 0) {
-        triggerBody.selected_packages = selectedPackagesPayload;
-      }
-
       if (scanResultsCacheKey) {
         setCachedValue(scanResultsCacheKey, {}, {
           ttlMs: SCAN_RESULTS_CACHE_TTL_MS,
@@ -1306,7 +1313,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       const triggerPayload = await triggerScan(scanContext, {
         ecosystem,
         scan_mode: scanMode,
-        selected_packages: isPartialScan && selectedScanPackages.length > 0 ? selectedScanPackages : undefined,
+        selected_packages: isPartialScan && selectedScanPackages.length > 0
+          ? selectedScanPackages
+          : undefined,
         force_rescan: forceRescan || undefined,
       });
 
@@ -1314,53 +1323,51 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         throw new Error("Scan trigger did not return a job id.");
       }
 
+      const jobId = String(triggerPayload.job_id);
+      const newJob: ActiveScanJob = {
+        jobId,
+        scanMode,
+        status: "pending",
+        progress: 0,
+        details: { status: "pending", scanned_packages: 0, total_unique_packages: 0, progress_percent: 0 },
+        error: null,
+        elapsedSeconds: 0,
+        sourceTab: "graph",
+      };
+
+      setActiveScanJobs(current => new Map(current).set(jobId, newJob));
       setHasScanned(true);
-      setScanJobId(triggerPayload.job_id);
-      setScanStatus("pending");
-      setScanDetails({ status: "pending", scanned_packages: 0, total_unique_packages: 0, progress_percent: 0 });
+      setScanResultRows([]);
+      setScanResultsMap({});
 
-      if (scanPollTimerRef.current !== null) {
-        window.clearTimeout(scanPollTimerRef.current);
-      }
-
-      scanPollTimerRef.current = window.setTimeout(() => {
-        void pollScanJob(owner, repoName, triggerPayload.job_id, headers);
+      const timer = window.setTimeout(() => {
+        void pollScanJob(owner, repoName, jobId, headers);
       }, SCAN_POLL_INTERVAL_MS);
+      scanPollTimersRef.current.set(jobId, timer);
 
-    } catch (scanError) {
-      const is409 = scanError instanceof ScanApiError && scanError.status === 409;
+    } catch (err) {
+      const is409 = err instanceof ScanApiError && err.status === 409;
       const message = is409
-        ? "A scan is already in progress for this repository. Please wait or cancel it first."
-        : scanError instanceof Error
-          ? scanError.message
-          : "Unexpected error while running package scan.";
+        ? `A '${scanMode}' scan is already in progress. Please wait or cancel it first.`
+        : err instanceof Error ? err.message : "Unexpected error while starting scan.";
       setScanError(message);
-      setScanStatus("failed");
       setHasScanned(false);
-    } finally {
-      if (!scanPollTimerRef.current) {
-        setIsScanRunning(false);
-      }
     }
-  }, [isPartialScan, pollScanJob, resolveRepoCoordinates, selectedScanPackages, activeScanMode, forceRescan]);
+  }, [
+    activeScanJobs, activeScanMode, forceRescan, isPartialScan,
+    pollScanJob, resolveRepoCoordinates, selectedScanPackages,
+  ]);
 
-  const triggerPartialAnalysisScan = useCallback(async (scanMode: ScanMode = "static") => {
-    if (selectedAnalysisPackages.length === 0 || isScanRunning) {
+  const triggerPartialAnalysisScan = useCallback(async (
+    scanMode: ScanMode = "static",
+    sourceTab: "static-analysis" | "dynamic-analysis" = scanMode === "dynamic" ? "dynamic-analysis" : "static-analysis",
+  ) => {
+    if (selectedAnalysisPackages.length === 0) {
       return;
     }
     setScanError(null);
-    setIsScanRunning(true);
-    setScanStatus("pending");
-    setScanProgress(0);
-    setLiveElapsedSeconds(0);
-    // Clear previous scan details immediately to avoid showing stale elapsed time
-    // from a prior job before the new job's metadata is available.
-    setScanDetails(null);
-    setScanResultRows([]);
-    setScanResultsMap({});
-    setGraphScanView("progress");
     liveResultKeysRef.current = new Set();
-    scanRetryAttemptRef.current = 0;
+    scanRetryAttemptsRef.current.set("pending-" + scanMode, 0);
 
     try {
       const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
@@ -1387,53 +1394,44 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         throw new Error("Scan trigger did not return a job id.");
       }
 
+      const jobId = String(triggerPayload.job_id);
+      const newJob: ActiveScanJob = {
+        jobId,
+        scanMode,
+        status: "pending",
+        progress: 0,
+        details: { status: "pending", scanned_packages: 0, total_unique_packages: 0, progress_percent: 0 },
+        error: null,
+        elapsedSeconds: 0,
+        sourceTab,
+      };
+
+      setActiveScanJobs(current => new Map(current).set(jobId, newJob));
       setHasScanned(true);
-      setScanJobId(triggerPayload.job_id);
-      setScanStatus("pending");
-      setScanDetails({ status: "pending", scanned_packages: 0, total_unique_packages: 0, progress_percent: 0 });
 
-      if (scanPollTimerRef.current !== null) {
-        window.clearTimeout(scanPollTimerRef.current);
-      }
-
-      scanPollTimerRef.current = window.setTimeout(() => {
-        void pollScanJob(owner, repoName, triggerPayload.job_id, headers);
+      const timer = window.setTimeout(() => {
+        void pollScanJob(owner, repoName, jobId, headers);
       }, SCAN_POLL_INTERVAL_MS);
+      scanPollTimersRef.current.set(jobId, timer);
 
     } catch (scanError) {
-      const is409 = scanError instanceof ScanApiError && scanError.status === 409;
-      const message = is409
-        ? "A scan is already in progress for this repository. Please wait or cancel it first."
-        : scanError instanceof Error
-          ? scanError.message
-          : "Unexpected error while running package scan.";
+      const message = scanError instanceof Error
+        ? scanError.message
+        : "Unexpected error while running package scan.";
       setScanError(message);
-      setScanStatus("failed");
-      setHasScanned(false);
-    } finally {
-      if (!scanPollTimerRef.current) {
-        setIsScanRunning(false);
-      }
     }
-  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages, isScanRunning]);
+  }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages]);
 
   const triggerLightweightScan = useCallback(async () => {
-    setLightweightError(null);
-    setLightweightJob(null);
-    setIsLightweightRunning(true);
-    if (lightweightPollTimerRef.current !== null) {
-      window.clearTimeout(lightweightPollTimerRef.current);
-    }
+    setScanError(null);
 
     try {
       const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
       const scanCtx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
 
-      const lwScanMode: ScanMode = "lightweight";
-
       const triggerPayload = await triggerScan(scanCtx, {
         ecosystem,
-        scan_mode: lwScanMode,
+        scan_mode: "lightweight",
         selected_packages:
           lightweightScope === "partial" && lightweightSelectedPackages.length > 0
             ? lightweightSelectedPackages
@@ -1444,55 +1442,33 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         throw new Error("Scan trigger did not return a job id.");
       }
 
-      const poll = async () => {
-        try {
-          const job = await apiPollScanJob(scanCtx, triggerPayload.job_id);
-          if (!isMountedRef.current) return;
-          setLightweightJob(job);
-          if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
-            setIsLightweightRunning(false);
-            // loadScanHistory is declared after triggerLightweightScan — safe to call directly
-            void loadScanHistory();
-          } else {
-            lightweightPollTimerRef.current = window.setTimeout(() => { void poll(); }, 800);
-          }
-        } catch (err) {
-          if (!isMountedRef.current) return;
-          setLightweightError(err instanceof Error ? err.message : "Polling failed.");
-          setIsLightweightRunning(false);
-        }
+      const jobId = String(triggerPayload.job_id);
+      const newJob: ActiveScanJob = {
+        jobId,
+        scanMode: "lightweight",
+        status: "pending",
+        progress: 0,
+        details: { status: "pending", scanned_packages: 0, total_unique_packages: 0, progress_percent: 0 },
+        error: null,
+        elapsedSeconds: 0,
+        sourceTab: "lightweight",
       };
-      void poll();
+
+      setActiveScanJobs(current => new Map(current).set(jobId, newJob));
+
+      const timer = window.setTimeout(() => {
+        void pollScanJob(owner, repoName, jobId, headers);
+      }, SCAN_POLL_INTERVAL_MS);
+      scanPollTimersRef.current.set(jobId, timer);
+
     } catch (err) {
-      setLightweightError(err instanceof Error ? err.message : "Failed to start lightweight scan.");
-      setIsLightweightRunning(false);
+      setScanError(err instanceof Error ? err.message : "Failed to start lightweight scan.");
     }
-  }, [lightweightScope, lightweightSelectedPackages, lightweightSources, resolveRepoCoordinates]);
+  }, [lightweightScope, lightweightSelectedPackages, pollScanJob, resolveRepoCoordinates]);
 
-  const cancelLightweightScan = useCallback(async () => {
-    if (!lightweightJob?.id || isLightweightCancelling) return;
-    setIsLightweightCancelling(true);
-    if (lightweightPollTimerRef.current !== null) {
-      window.clearTimeout(lightweightPollTimerRef.current);
-      lightweightPollTimerRef.current = null;
-    }
-    try {
-      const { owner, repoName, headers } = await resolveRepoCoordinates();
-      const scanCtx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-      await apiCancelScan(scanCtx, lightweightJob.id);
-    } catch {
-      // ignore — local state is updated regardless
-    } finally {
-      setIsLightweightRunning(false);
-      setLightweightJob(prev => prev ? { ...prev, status: "cancelled" } : null);
-      setIsLightweightCancelling(false);
-    }
-  }, [isLightweightCancelling, lightweightJob, resolveRepoCoordinates]);
-
-  const cancelScanJob = useCallback(async () => {
-    if (!scanJobId || isCancellingScan) {
-      return;
-    }
+  const cancelScanJob = useCallback(async (targetJobId?: string) => {
+    const jobId = targetJobId ?? primaryJob?.jobId;
+    if (!jobId || isCancellingScan) return;
 
     setIsCancellingScan(true);
     setScanError(null);
@@ -1500,57 +1476,37 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-      const result = await apiCancelScan(scanContext, scanJobId);
-      const cancelledStatus = result.status;
+      await apiCancelScan(scanContext, jobId);
 
-      if (scanPollTimerRef.current !== null) {
-        window.clearTimeout(scanPollTimerRef.current);
-        scanPollTimerRef.current = null;
+      const pollTimer = scanPollTimersRef.current.get(jobId);
+      if (pollTimer !== undefined) {
+        window.clearTimeout(pollTimer);
+        scanPollTimersRef.current.delete(jobId);
+      }
+      const tickTimer = elapsedTickersRef.current.get(jobId);
+      if (tickTimer !== undefined) {
+        window.clearInterval(tickTimer);
+        elapsedTickersRef.current.delete(jobId);
       }
 
-      if (elapsedTickerRef.current !== null) {
-        window.clearInterval(elapsedTickerRef.current);
-        elapsedTickerRef.current = null;
-      }
-
-      setIsScanRunning(false);
-      setScanStatus(cancelledStatus === "cancelled" ? "Scan cancelled by user." : "Scan cancellation acknowledged.");
-      setScanDetails((current) => ({
-        ...(current ?? {}),
-        status: "cancelled",
-      }));
-      setScanError(null);
-      setGraphScanView("progress");
+      setActiveScanJobs(current => { const next = new Map(current); next.delete(jobId); return next; });
     } catch (cancelError) {
       const status =
-        typeof cancelError === "object" && cancelError !== null && "status" in cancelError && typeof (cancelError as { status?: unknown }).status === "number"
-          ? ((cancelError as { status: number }).status)
+        typeof cancelError === "object" && cancelError !== null && "status" in cancelError
+          ? (cancelError as { status: number }).status
           : null;
 
       if (status === 400) {
-        const detail = cancelError instanceof Error ? (cancelError as { detail?: string }).detail ?? cancelError.message : "";
-        const lower = detail.toLowerCase();
-        if (lower.includes("failed")) {
-          setScanError("Scan already failed.");
-          setIsScanRunning(false);
-        } else if (lower.includes("cancelled")) {
-          setScanStatus("Scan was already cancelled.");
-          setScanError(null);
-          setIsScanRunning(false);
-        } else {
-          // completed — silently stop local running state
-          setIsScanRunning(false);
-          setScanError(null);
-        }
+        setActiveScanJobs(current => { const next = new Map(current); next.delete(jobId); return next; });
       } else if (status === 404) {
         setScanError("Scan job not found.");
       } else {
-        setScanError(cancelError instanceof Error ? cancelError.message : "Unable to stop scan. Please try again.");
+        setScanError(cancelError instanceof Error ? cancelError.message : "Unable to stop scan.");
       }
     } finally {
       setIsCancellingScan(false);
     }
-  }, [isCancellingScan, resolveRepoCoordinates, scanJobId]);
+  }, [isCancellingScan, primaryJob?.jobId, resolveRepoCoordinates]);
 
   const loadScanHistory = useCallback(async () => {
     if (!API_BASE_URL) return;
@@ -1943,6 +1899,44 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           />
                           Force full rescan
                         </label>
+                        {graphTabJobs.length > 1 ? (
+                          <div className="mt-2 space-y-1">
+                            {graphTabJobs.map(job => (
+                              <div
+                                key={job.jobId}
+                                className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                              >
+                                <div className="flex items-center gap-2">
+                                  {(job.status === "pending" || job.status === "running") ? (
+                                    <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                                  ) : (
+                                    <span className={`h-2 w-2 rounded-full ${
+                                      SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                                      : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                                      : "bg-slate-500"
+                                    }`} />
+                                  )}
+                                  <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">
+                                    {job.scanMode}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500">
+                                    {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
+                                  </span>
+                                </div>
+                                {(job.status === "pending" || job.status === "running") ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => { void cancelScanJob(job.jobId); }}
+                                    disabled={isCancellingScan}
+                                    className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                                  >
+                                    Stop
+                                  </button>
+                                ) : null}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
                         <div className="flex flex-wrap gap-2">
                           <button
                             type="button"
@@ -2179,43 +2173,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
           {activeSection === "static-analysis" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
-              {/* Scan-in-progress / error banner */}
-              {(isScanRunning || scanError !== null || scanDetails?.status === "failed") ? (
-                <div className={`mb-4 rounded-xl border p-3 ${
-                  scanError !== null || scanDetails?.status === "failed"
-                    ? "border-rose-400/40 bg-rose-500/10"
-                    : "border-cyan-400/30 bg-cyan-500/10"
-                }`}>
-                  {isScanRunning ? (
-                    <>
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-300">
-                          Scan in progress — {scanDisplay.phase}
-                        </p>
-                        {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
-                          <span className="text-[11px] text-slate-400">
-                            {scanDetails.scanned_packages} / {scanDetails.total_unique_packages} ({scanProgress.toFixed(0)}%)
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
-                        {(scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 && scanProgress > 0) ? (
-                          <div className="h-full rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${scanProgress}%` }} />
-                        ) : (
-                          <div className="h-full w-full animate-pulse rounded-full bg-cyan-300/40" />
-                        )}
-                      </div>
-                      {runtimeElapsedLabel ? (
-                        <p className="mt-1 text-[11px] text-slate-500">{runtimeElapsedLabel}</p>
-                      ) : null}
-                    </>
-                  ) : (
-                    <p className="text-[11px] text-rose-300">
-                      Scan error: {scanError ?? scanDetails?.error_message ?? "Unknown error"}
-                    </p>
-                  )}
-                </div>
-              ) : null}
               <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
                 {/* Left column — controls only */}
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
@@ -2295,15 +2252,45 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         Run Analysis on {selectedAnalysisPackages.length} Package{selectedAnalysisPackages.length === 1 ? "" : "s"}
                       </button>
                     ) : null}
-                    {canCancelScan ? (
-                      <button
-                        type="button"
-                        onClick={() => { void cancelScanJob(); }}
-                        disabled={isCancellingScan}
-                        className="w-full rounded-md border border-rose-400/40 bg-rose-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {isCancellingScan ? "Stopping..." : "Stop Scan"}
-                      </button>
+                    {/* Active static-analysis jobs started from this tab */}
+                    {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "static-analysis").length > 0 ? (
+                      <div className="mt-1 space-y-1">
+                        {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "static-analysis").map(job => (
+                          <div
+                            key={job.jobId}
+                            className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                          >
+                            <div className="flex items-center gap-2">
+                              {(job.status === "pending" || job.status === "running") ? (
+                                <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                              ) : (
+                                <span className={`h-2 w-2 rounded-full ${
+                                  SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                                  : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                                  : "bg-slate-500"
+                                }`} />
+                              )}
+                              <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">{job.scanMode}</span>
+                              <span className="text-[10px] text-slate-500">
+                                {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
+                              </span>
+                              {job.elapsedSeconds > 0 ? (
+                                <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                              ) : null}
+                            </div>
+                            {(job.status === "pending" || job.status === "running") ? (
+                              <button
+                                type="button"
+                                onClick={() => { void cancelScanJob(job.jobId); }}
+                                disabled={isCancellingScan}
+                                className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                              >
+                                Stop
+                              </button>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
                     ) : null}
                   </div>
 
@@ -2459,10 +2446,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                     </p>
                   )}
 
-                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Job ID</p>
-                    <p className="mt-2 font-mono text-sm text-slate-300">{scanJobId ?? "—"}</p>
-                  </div>
                 </div>
               </div>
             </div>
@@ -2470,43 +2453,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
           {activeSection === "dynamic-analysis" ? (
             <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
-              {/* Scan-in-progress / error banner */}
-              {(isScanRunning || scanError !== null || scanDetails?.status === "failed") ? (
-                <div className={`mb-4 rounded-xl border p-3 ${
-                  scanError !== null || scanDetails?.status === "failed"
-                    ? "border-rose-400/40 bg-rose-500/10"
-                    : "border-cyan-400/30 bg-cyan-500/10"
-                }`}>
-                  {isScanRunning ? (
-                    <>
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-300">
-                          Scan in progress — {scanDisplay.phase}
-                        </p>
-                        {scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 ? (
-                          <span className="text-[11px] text-slate-400">
-                            {scanDetails.scanned_packages} / {scanDetails.total_unique_packages} ({scanProgress.toFixed(0)}%)
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
-                        {(scanDetails && (scanDetails.total_unique_packages ?? 0) > 0 && scanProgress > 0) ? (
-                          <div className="h-full rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${scanProgress}%` }} />
-                        ) : (
-                          <div className="h-full w-full animate-pulse rounded-full bg-cyan-300/40" />
-                        )}
-                      </div>
-                      {runtimeElapsedLabel ? (
-                        <p className="mt-1 text-[11px] text-slate-500">{runtimeElapsedLabel}</p>
-                      ) : null}
-                    </>
-                  ) : (
-                    <p className="text-[11px] text-rose-300">
-                      Scan error: {scanError ?? scanDetails?.error_message ?? "Unknown error"}
-                    </p>
-                  )}
-                </div>
-              ) : null}
               <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div>
@@ -2585,69 +2531,63 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                         Run Analysis on {selectedAnalysisPackages.length} Package{selectedAnalysisPackages.length === 1 ? "" : "s"}
                       </button>
                     ) : null}
-                    {canCancelScan ? (
-                      <button
-                        type="button"
-                        onClick={() => { void cancelScanJob(); }}
-                        disabled={isCancellingScan}
-                        className="w-full rounded-md border border-rose-400/40 bg-rose-500/15 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {isCancellingScan ? "Stopping..." : "Stop Scan"}
-                      </button>
+                    {/* Active dynamic-analysis jobs started from this tab */}
+                    {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "dynamic-analysis").length > 0 ? (
+                      <div className="mt-1 space-y-1">
+                        {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "dynamic-analysis").map(job => (
+                          <div
+                            key={job.jobId}
+                            className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                          >
+                            <div className="flex items-center gap-2">
+                              {(job.status === "pending" || job.status === "running") ? (
+                                <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                              ) : (
+                                <span className={`h-2 w-2 rounded-full ${
+                                  SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                                  : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                                  : "bg-slate-500"
+                                }`} />
+                              )}
+                              <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">{job.scanMode}</span>
+                              <span className="text-[10px] text-slate-500">
+                                {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
+                              </span>
+                              {job.elapsedSeconds > 0 ? (
+                                <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                              ) : null}
+                            </div>
+                            {(job.status === "pending" || job.status === "running") ? (
+                              <button
+                                type="button"
+                                onClick={() => { void cancelScanJob(job.jobId); }}
+                                disabled={isCancellingScan}
+                                className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                              >
+                                Stop
+                              </button>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
                     ) : null}
                   </div>
 
-                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current status</p>
-                    <p className="mt-2 text-sm text-slate-200">{shouldShowScanRuntime ? scanDisplay.statusLabel : "Ready to start"}</p>
-                    {scanJobId ? <p className="mt-1 text-xs text-slate-400">Job ID: {scanJobId}</p> : null}
-                  </div>
-
-                  <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-4">
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Progress</p>
-                    {shouldShowScanRuntime ? (
-                      <>
-                        <p className="mt-2 text-sm text-slate-200">{scanDisplay.primaryCountLabel}</p>
-                        <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                          {(scanDisplay.phase === "pending" || (scanDisplay.phase === "running" && scanDisplay.progressPercent === 0)) ? (
-                            <div className={`h-full w-full animate-pulse rounded-full ${scanError ? "bg-rose-400/40" : "bg-cyan-300/40"}`} />
-                          ) : (
-                            <div
-                              className={`h-full rounded-full transition-all duration-300 ${scanError ? "bg-rose-400" : "bg-cyan-400"}`}
-                              style={{ width: `${Math.max(2, Math.min(100, scanDisplay.progressPercent))}%` }}
-                            />
-                          )}
-                        </div>
-                        <p className="mt-2 text-xs text-slate-400">{scanDisplay.progressLabel}</p>
-                        <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-400">
-                          {scanDisplay.etaLabel ? <span>{scanDisplay.etaLabel}</span> : null}
-                          {scanDisplay.speedLabel ? <span>{scanDisplay.speedLabel}</span> : null}
-                          {runtimeElapsedLabel ? <span>{runtimeElapsedLabel}</span> : null}
-                        </div>
-                      </>
-                    ) : (
-                      <p className="mt-2 text-sm text-slate-300">Start a scan to stream dynamic results here.</p>
-                    )}
-                  </div>
                 </div>
 
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div>
-                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Current job package results</p>
-                    {scanJobId ? (
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Latest scan package results</p>
+                    {scanResultRows.length > 0 ? (
                       <p className="mt-2 text-xs text-slate-400">
                         Rows: {scanResultRows.length} · Failed rows: {liveFailedRowsCount}
                       </p>
                     ) : (
-                      <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows from /scan/{'{'}job_id{'}'}.</p>
+                      <p className="mt-2 text-xs text-slate-400">Start a scan to stream live package rows.</p>
                     )}
                   </div>
 
-                  {scanJobId && scanResultRows.length === 0 ? (
-                    <p className="text-xs text-slate-400">Waiting for first package rows from the current job...</p>
-                  ) : null}
-
-                  {scanJobId && scanResultRows.length > 0 ? (
+                  {scanResultRows.length > 0 ? (
                     <div className="max-h-[52vh] overflow-auto rounded-lg border border-slate-800">
                       <table className="w-full text-left text-xs text-slate-200">
                         <thead className="sticky top-0 bg-slate-900/95 text-slate-400">
@@ -3606,7 +3546,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <button
                         key={scope}
                         type="button"
-                        disabled={isLightweightRunning}
+                        disabled={false}
                         onClick={() => setLightweightScope(scope)}
                         className={`rounded-full border px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
                           lightweightScope === scope
@@ -3725,7 +3665,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           <input
                             type="checkbox"
                             checked={checked}
-                            disabled={isLightweightRunning}
+                            disabled={false}
                             onChange={() => setLightweightSources((prev) => ({ ...prev, [src]: !prev[src] }))}
                             className="accent-cyan-400 h-3.5 w-3.5"
                           />
@@ -3745,212 +3685,256 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                   <button
                     type="button"
                     disabled={
-                      isLightweightRunning ||
                       (!lightweightSources.cve && !lightweightSources.librariesio) ||
                       (lightweightScope === "partial" && lightweightSelectedPackages.length === 0)
                     }
                     onClick={() => { void triggerLightweightScan(); }}
                     className="inline-flex items-center rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200 transition hover:border-cyan-300 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {isLightweightRunning ? "Running…" : "Start Lightweight Scan"}
+                    Start Lightweight Scan
                   </button>
-                  {isLightweightRunning && lightweightJob?.id ? (
-                    <button
-                      type="button"
-                      onClick={() => { void cancelLightweightScan(); }}
-                      disabled={isLightweightCancelling}
-                      className="inline-flex items-center rounded-lg border border-rose-400/40 bg-rose-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-rose-100 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {isLightweightCancelling ? "Stopping..." : "Stop Scan"}
-                    </button>
-                  ) : null}
                 </div>
+                {/* Active lightweight jobs */}
+                {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").length > 0 ? (
+                  <div className="mt-1 space-y-1">
+                    {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").map(job => (
+                      <div
+                        key={job.jobId}
+                        className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-2 py-1.5"
+                      >
+                        <div className="flex items-center gap-2">
+                          {(job.status === "pending" || job.status === "running") ? (
+                            <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                          ) : (
+                            <span className={`h-2 w-2 rounded-full ${
+                              SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                              : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                              : "bg-slate-500"
+                            }`} />
+                          )}
+                          <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">
+                            {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
+                          </span>
+                          {(job.details as {total_unique_packages?: number} | null)?.total_unique_packages ? (
+                            <span className="text-[10px] text-slate-500">
+                              {(job.details as {scanned_packages?: number} | null)?.scanned_packages ?? 0} / {(job.details as {total_unique_packages?: number} | null)?.total_unique_packages}
+                            </span>
+                          ) : null}
+                          {job.elapsedSeconds > 0 ? (
+                            <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                          ) : null}
+                        </div>
+                        {(job.status === "pending" || job.status === "running") ? (
+                          <button
+                            type="button"
+                            onClick={() => { void cancelScanJob(job.jobId); }}
+                            disabled={isCancellingScan}
+                            className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                          >
+                            Stop
+                          </button>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
 
               </div>
-              {/* Right pane — progress + results */}
+              {/* Right pane — per-job progress + results */}
               <div className="flex flex-1 flex-col gap-4 overflow-y-auto">
+                {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").length === 0 ? (
+                  <div className="rounded-xl border border-slate-700/60 bg-slate-900/40 p-6 text-center">
+                    <p className="text-sm text-slate-400">Start a lightweight scan to see results here.</p>
+                  </div>
+                ) : null}
 
-                {/* Progress / status block — visible once a scan starts */}
-                {(isLightweightRunning || lightweightJob !== null || lightweightError !== null) ? (
-                  <div className={`rounded-xl border p-4 ${
-                    lightweightError || lightweightJob?.status === "failed"
-                      ? "border-rose-400/40 bg-rose-500/10"
-                      : lightweightJob?.status === "completed"
-                        ? "border-emerald-400/40 bg-emerald-500/10"
+                {Array.from(activeScanJobs.values()).filter(j => j.sourceTab === "lightweight").map(job => {
+                  const lwDetails = job.details as (typeof job.details & { results?: ScanResultResponse[] }) | null;
+                  const lwResults = lwDetails?.results;
+                  const isRunning = job.status === "pending" || job.status === "running";
+                  const isFailed = job.status === "failed";
+                  const isCompleted = job.status === "completed";
+                  return (
+                    <div key={job.jobId} className="space-y-3">
+                      {/* Status block */}
+                      <div className={`rounded-xl border p-4 ${
+                        isFailed ? "border-rose-400/40 bg-rose-500/10"
+                        : isCompleted ? "border-emerald-400/40 bg-emerald-500/10"
                         : "border-slate-700/60 bg-slate-900/60"
-                  }`}>
-                    <div className="flex items-center justify-between gap-4">
-                      <p className={`text-[11px] font-semibold uppercase tracking-[0.14em] ${
-                        lightweightError || lightweightJob?.status === "failed" ? "text-rose-300"
-                        : lightweightJob?.status === "completed" ? "text-emerald-300"
-                        : "text-cyan-300"
                       }`}>
-                        {lightweightError ? "Error"
-                          : lightweightJob?.status === "failed" ? "Scan failed"
-                          : lightweightJob?.status === "completed" ? `Completed — ${lightweightJob.results?.length ?? 0} package${(lightweightJob.results?.length ?? 0) === 1 ? "" : "s"}`
-                          : isLightweightRunning && lightweightJob?.status === "running" ? "Scanning…"
-                          : isLightweightRunning ? "Starting…"
-                          : "Pending"}
-                      </p>
-                      {isLightweightRunning && lightweightJob && lightweightJob.total_unique_packages > 0 ? (
-                        <span className="text-[11px] text-slate-400">
-                          {lightweightJob.scanned_packages} / {lightweightJob.total_unique_packages} ({lightweightJob.progress_percent.toFixed(0)}%)
-                        </span>
-                      ) : isLightweightRunning ? (
-                        <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400/40 border-t-cyan-400" />
+                        <div className="flex items-center justify-between gap-4">
+                          <p className={`text-[11px] font-semibold uppercase tracking-[0.14em] ${
+                            isFailed ? "text-rose-300"
+                            : isCompleted ? "text-emerald-300"
+                            : "text-cyan-300"
+                          }`}>
+                            {isFailed ? "Scan failed"
+                              : isCompleted ? `Completed — ${lwResults?.length ?? 0} package${(lwResults?.length ?? 0) === 1 ? "" : "s"}`
+                              : job.status === "running" ? "Scanning…"
+                              : "Starting…"}
+                          </p>
+                          {isRunning && (lwDetails?.total_unique_packages ?? 0) > 0 ? (
+                            <span className="text-[11px] text-slate-400">
+                              {lwDetails?.scanned_packages ?? 0} / {lwDetails?.total_unique_packages} ({job.progress.toFixed(0)}%)
+                            </span>
+                          ) : isRunning ? (
+                            <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400/40 border-t-cyan-400" />
+                          ) : null}
+                        </div>
+                        {(lwDetails?.total_unique_packages ?? 0) > 0 ? (
+                          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                            <div
+                              className={`h-full rounded-full transition-all duration-500 ${isCompleted ? "bg-emerald-500" : "bg-cyan-500"}`}
+                              style={{ width: `${job.progress}%` }}
+                            />
+                          </div>
+                        ) : null}
+                        {isFailed && lwDetails?.error_message ? (
+                          <p className="mt-1 text-[11px] text-rose-300">{lwDetails.error_message}</p>
+                        ) : null}
+                        {job.elapsedSeconds > 0 ? (
+                          <p className="mt-1 text-[10px] text-slate-500">Elapsed {formatDuration(job.elapsedSeconds)}</p>
+                        ) : null}
+                      </div>
+
+                      {/* Results table */}
+                      {isCompleted && lwResults && lwResults.length > 0 ? (
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/40">
+                          <div className="border-b border-slate-800 px-4 py-2">
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
+                              Results — {lwResults.length} package{lwResults.length === 1 ? "" : "s"}
+                            </p>
+                          </div>
+                          <div className="overflow-auto">
+                            <table className="w-full text-left text-[11px] text-slate-300">
+                              <thead className="sticky top-0 bg-slate-900/80 text-slate-500">
+                                <tr>
+                                  <th className="px-3 py-2">Package</th>
+                                  <th className="px-3 py-2">Risk</th>
+                                  <th className="px-3 py-2">CVEs</th>
+                                  <th className="px-3 py-2">CVE Source</th>
+                                  <th className="px-3 py-2">Libraries.io</th>
+                                  <th className="px-3 py-2">Details</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {lwResults.map((result) => {
+                                  const cveCount = Math.max(
+                                    result.advisory_references.length,
+                                    result.vulnerability_details?.length ?? 0,
+                                  );
+                                  const cveStatus = result.lookup_status?.cve;
+                                  const libStatus = result.lookup_status?.librariesio;
+                                  const isExpRow = lightweightExpandedId === result.id;
+                                  const hasDetails =
+                                    (result.vulnerability_details && result.vulnerability_details.length > 0) ||
+                                    (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0);
+                                  return (
+                                    <React.Fragment key={result.id}>
+                                      <tr className="border-t border-slate-800/60">
+                                        <td className="px-3 py-1.5 font-mono">{result.package_name}@{result.package_version}</td>
+                                        <td className="px-3 py-1.5">
+                                          <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${
+                                            result.risk_overall_status === "malicious"
+                                              ? "border-rose-400/40 bg-rose-500/10 text-rose-200"
+                                              : result.risk_overall_status === "suspicious"
+                                                ? "border-amber-400/40 bg-amber-500/10 text-amber-200"
+                                                : "border-emerald-400/40 bg-emerald-500/10 text-emerald-200"
+                                          }`}>
+                                            {(result.risk_overall_score * 100).toFixed(0)}% {result.risk_overall_status}
+                                          </span>
+                                        </td>
+                                        <td className="px-3 py-1.5">{cveCount > 0 ? cveCount : "—"}</td>
+                                        <td className="px-3 py-1.5">
+                                          {cveStatus ? (
+                                            <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(cveStatus)}`}>
+                                              {lookupStatusLabel("cve", cveStatus)}
+                                            </span>
+                                          ) : <span className="text-slate-600">—</span>}
+                                        </td>
+                                        <td className="px-3 py-1.5">
+                                          {libStatus ? (
+                                            <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(libStatus)}`}>
+                                              {lookupStatusLabel("librariesio", libStatus)}
+                                            </span>
+                                          ) : <span className="text-slate-600">—</span>}
+                                        </td>
+                                        <td className="px-3 py-1.5">
+                                          {hasDetails ? (
+                                            <button
+                                              type="button"
+                                              onClick={() => setLightweightExpandedId(isExpRow ? null : result.id)}
+                                              className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
+                                            >
+                                              {isExpRow ? "hide" : "view"}
+                                            </button>
+                                          ) : <span className="text-slate-600">—</span>}
+                                        </td>
+                                      </tr>
+                                      {isExpRow ? (
+                                        <tr key={`${result.id}-lw-detail`} className="bg-slate-900/40">
+                                          <td colSpan={6} className="px-3 pb-4 pt-2">
+                                            <div className="space-y-4">
+                                              {result.vulnerability_details && result.vulnerability_details.length > 0 ? (
+                                                <div>
+                                                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE Findings ({result.vulnerability_details.length})</p>
+                                                  <table className="w-full text-[10px]">
+                                                    <thead><tr className="text-slate-500"><th className="pb-1 pr-3 text-left">Advisory</th><th className="pb-1 pr-3 text-left">Source</th><th className="pb-1 pr-3 text-left">CVSS</th><th className="pb-1 text-left">Description</th></tr></thead>
+                                                    <tbody>
+                                                      {result.vulnerability_details.map((v, i) => {
+                                                        const href = v.advisory_id.startsWith("CVE-")
+                                                          ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
+                                                          : v.advisory_id.startsWith("GHSA-")
+                                                            ? `https://github.com/advisories/${v.advisory_id}`
+                                                            : null;
+                                                        return (
+                                                          <tr key={i} className="border-t border-slate-800/40">
+                                                            <td className="py-1 pr-3 font-mono text-indigo-300">
+                                                              {href ? <a href={href} target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-100">{v.advisory_id}</a> : v.advisory_id}
+                                                            </td>
+                                                            <td className="py-1 pr-3 uppercase text-slate-400">{v.source}</td>
+                                                            <td className="py-1 pr-3 text-slate-300">{v.value != null ? v.value.toFixed(1) : "—"}</td>
+                                                            <td className="py-1 text-slate-400 max-w-xs truncate">{v.details ?? "—"}</td>
+                                                          </tr>
+                                                        );
+                                                      })}
+                                                    </tbody>
+                                                  </table>
+                                                </div>
+                                              ) : null}
+                                              {result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0 ? (
+                                                <div>
+                                                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Reputation (Libraries.io)</p>
+                                                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                                                    {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score", "package_age_days", "maintainer_count"] as const).map((k) => {
+                                                      const val = result.reputation_metadata?.[k];
+                                                      if (val == null) return null;
+                                                      const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k === "package_age_days" ? "Age (days)" : k === "maintainer_count" ? "Maintainers" : k.replace(/_/g, " ");
+                                                      return (
+                                                        <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
+                                                          <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                                          <p className="mt-0.5 font-mono text-[11px] text-slate-200">{k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}</p>
+                                                        </div>
+                                                      );
+                                                    })}
+                                                  </div>
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          </td>
+                                        </tr>
+                                      ) : null}
+                                    </React.Fragment>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
                       ) : null}
                     </div>
-                    {lightweightJob && lightweightJob.total_unique_packages > 0 ? (
-                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
-                        <div
-                          className={`h-full rounded-full transition-all duration-500 ${lightweightJob.status === "completed" ? "bg-emerald-500" : "bg-cyan-500"}`}
-                          style={{ width: `${lightweightJob.progress_percent}%` }}
-                        />
-                      </div>
-                    ) : null}
-                    {lightweightError ? (
-                      <p className="mt-1 text-[11px] text-rose-300">{lightweightError}</p>
-                    ) : lightweightJob?.status === "failed" && lightweightJob.error_message ? (
-                      <p className="mt-1 text-[11px] text-rose-300">{lightweightJob.error_message}</p>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {/* Results */}
-                {lightweightJob?.status === "completed" && lightweightJob.results && lightweightJob.results.length > 0 ? (
-                  <div className="rounded-xl border border-slate-700/60 bg-slate-900/40">
-                    <div className="border-b border-slate-800 px-4 py-2">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
-                        Results — {lightweightJob.results.length} package{lightweightJob.results.length === 1 ? "" : "s"}
-                      </p>
-                    </div>
-                    <div className="overflow-auto">
-                      <table className="w-full text-left text-[11px] text-slate-300">
-                        <thead className="sticky top-0 bg-slate-900/80 text-slate-500">
-                          <tr>
-                            <th className="px-3 py-2">Package</th>
-                            <th className="px-3 py-2">Risk</th>
-                            <th className="px-3 py-2">CVEs</th>
-                            <th className="px-3 py-2">CVE Source</th>
-                            <th className="px-3 py-2">Libraries.io</th>
-                            <th className="px-3 py-2">Details</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {lightweightJob.results.map((result) => {
-                            const cveCount = Math.max(
-                              result.advisory_references.length,
-                              result.vulnerability_details?.length ?? 0,
-                            );
-                            const cveStatus = result.lookup_status?.cve;
-                            const libStatus = result.lookup_status?.librariesio;
-                            const isExpRow = lightweightExpandedId === result.id;
-                            const hasDetails =
-                              (result.vulnerability_details && result.vulnerability_details.length > 0) ||
-                              (result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0);
-                            return (
-                              <React.Fragment key={result.id}>
-                                <tr className="border-t border-slate-800/60">
-                                  <td className="px-3 py-1.5 font-mono">{result.package_name}@{result.package_version}</td>
-                                  <td className="px-3 py-1.5">
-                                    <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${
-                                      result.risk_overall_status === "malicious"
-                                        ? "border-rose-400/40 bg-rose-500/10 text-rose-200"
-                                        : result.risk_overall_status === "suspicious"
-                                          ? "border-amber-400/40 bg-amber-500/10 text-amber-200"
-                                          : "border-emerald-400/40 bg-emerald-500/10 text-emerald-200"
-                                    }`}>
-                                      {(result.risk_overall_score * 100).toFixed(0)}% {result.risk_overall_status}
-                                    </span>
-                                  </td>
-                                  <td className="px-3 py-1.5">{cveCount > 0 ? cveCount : "—"}</td>
-                                  <td className="px-3 py-1.5">
-                                    {cveStatus ? (
-                                      <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(cveStatus)}`}>
-                                        {lookupStatusLabel("cve", cveStatus)}
-                                      </span>
-                                    ) : <span className="text-slate-600">—</span>}
-                                  </td>
-                                  <td className="px-3 py-1.5">
-                                    {libStatus ? (
-                                      <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${lookupStatusChipClass(libStatus)}`}>
-                                        {lookupStatusLabel("librariesio", libStatus)}
-                                      </span>
-                                    ) : <span className="text-slate-600">—</span>}
-                                  </td>
-                                  <td className="px-3 py-1.5">
-                                    {hasDetails ? (
-                                      <button
-                                        type="button"
-                                        onClick={() => setLightweightExpandedId(isExpRow ? null : result.id)}
-                                        className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
-                                      >
-                                        {isExpRow ? "hide" : "view"}
-                                      </button>
-                                    ) : <span className="text-slate-600">—</span>}
-                                  </td>
-                                </tr>
-                                {isExpRow ? (
-                                  <tr key={`${result.id}-lw-detail`} className="bg-slate-900/40">
-                                    <td colSpan={6} className="px-3 pb-4 pt-2">
-                                      <div className="space-y-4">
-                                        {result.vulnerability_details && result.vulnerability_details.length > 0 ? (
-                                          <div>
-                                            <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE Findings ({result.vulnerability_details.length})</p>
-                                            <table className="w-full text-[10px]">
-                                              <thead><tr className="text-slate-500"><th className="pb-1 pr-3 text-left">Advisory</th><th className="pb-1 pr-3 text-left">Source</th><th className="pb-1 pr-3 text-left">CVSS</th><th className="pb-1 text-left">Description</th></tr></thead>
-                                              <tbody>
-                                                {result.vulnerability_details.map((v, i) => {
-                                                  const href = v.advisory_id.startsWith("CVE-")
-                                                    ? `https://nvd.nist.gov/vuln/detail/${v.advisory_id}`
-                                                    : v.advisory_id.startsWith("GHSA-")
-                                                      ? `https://github.com/advisories/${v.advisory_id}`
-                                                      : null;
-                                                  return (
-                                                    <tr key={i} className="border-t border-slate-800/40">
-                                                      <td className="py-1 pr-3 font-mono text-indigo-300">
-                                                        {href ? <a href={href} target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-100">{v.advisory_id}</a> : v.advisory_id}
-                                                      </td>
-                                                      <td className="py-1 pr-3 uppercase text-slate-400">{v.source}</td>
-                                                      <td className="py-1 pr-3 text-slate-300">{v.value != null ? v.value.toFixed(1) : "—"}</td>
-                                                      <td className="py-1 text-slate-400 max-w-xs truncate">{v.details ?? "—"}</td>
-                                                    </tr>
-                                                  );
-                                                })}
-                                              </tbody>
-                                            </table>
-                                          </div>
-                                        ) : null}
-                                        {result.reputation_metadata && Object.keys(result.reputation_metadata).length > 0 ? (
-                                          <div>
-                                            <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Reputation (Libraries.io)</p>
-                                            <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                                              {(["libraries_io_rank", "stars", "forks", "dependents_count", "monthly_downloads", "trust_score", "package_age_days", "maintainer_count"] as const).map((k) => {
-                                                const val = result.reputation_metadata?.[k];
-                                                if (val == null) return null;
-                                                const label = k === "libraries_io_rank" ? "SourceRank" : k === "monthly_downloads" ? "Monthly DL" : k === "dependents_count" ? "Dependents" : k === "trust_score" ? "Trust Score" : k === "package_age_days" ? "Age (days)" : k === "maintainer_count" ? "Maintainers" : k.replace(/_/g, " ");
-                                                return (
-                                                  <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1.5">
-                                                    <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
-                                                    <p className="mt-0.5 font-mono text-[11px] text-slate-200">{k === "trust_score" ? `${(Number(val) * 100).toFixed(0)}%` : String(val)}</p>
-                                                  </div>
-                                                );
-                                              })}
-                                            </div>
-                                          </div>
-                                        ) : null}
-                                      </div>
-                                    </td>
-                                  </tr>
-                                ) : null}
-                              </React.Fragment>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                ) : null}
+                  );
+                })}
               </div>
             </div>
           </div>
