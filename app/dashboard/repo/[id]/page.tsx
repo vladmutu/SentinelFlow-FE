@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import React, { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { AddDependencyPanel } from "@/app/components/add-dependency-panel";
 import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
@@ -1824,16 +1825,28 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         className={`flex h-full min-w-0 flex-1 flex-col ${isResizingSidebar ? "" : "transition-[padding-right] duration-300"}`}
         style={{ paddingRight: isAgentChatOpen ? agentChatWidth : 0 }}
       >
-        <header className="border-b border-gray-800 bg-gray-950 px-6 py-4">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Repository</p>
-          <h1 className="mt-1 line-clamp-1 text-2xl font-semibold text-slate-100">{decodedId}</h1>
-          {repositoryLanguage || repositoryEcosystem ? (
-            <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-400">
-              {repositoryLanguage}
-              {repositoryLanguage && repositoryEcosystem ? " · " : ""}
-              {repositoryEcosystem ? getEcosystemLabel(repositoryEcosystem) : ""}
-            </p>
-          ) : null}
+        <header className="flex items-stretch gap-3 border-b border-gray-800 bg-gray-950 px-6 py-4">
+          <Link
+            href="/dashboard"
+            aria-label="Back to repositories"
+            title="Back to repositories"
+            className="grid w-8 shrink-0 place-items-center rounded-md border border-slate-700 bg-slate-800/60 text-slate-400 transition hover:border-cyan-400/50 hover:bg-slate-800 hover:text-cyan-300"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M10 12L6 8l4-4" />
+            </svg>
+          </Link>
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Repository</p>
+            <h1 className="mt-1 line-clamp-1 text-2xl font-semibold text-slate-100">{decodedId}</h1>
+            {repositoryLanguage || repositoryEcosystem ? (
+              <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-400">
+                {repositoryLanguage}
+                {repositoryLanguage && repositoryEcosystem ? " · " : ""}
+                {repositoryEcosystem ? getEcosystemLabel(repositoryEcosystem) : ""}
+              </p>
+            ) : null}
+          </div>
         </header>
 
         <div className="flex flex-row items-center space-x-6 border-b border-gray-800 bg-gray-950 px-6 py-3">
