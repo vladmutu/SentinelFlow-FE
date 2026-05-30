@@ -879,3 +879,64 @@ export function downloadSbom(data: Record<string, unknown>, filename: string): v
 
   URL.revokeObjectURL(url);
 }
+
+// ============================================================================
+// TYPES - AI Explainability
+// ============================================================================
+
+export interface ExplainPackageRequest {
+  package_name: string;
+  package_version: string;
+  ecosystem?: string | null;
+  malware_status?: string | null;
+  malware_score?: number | null;
+  risk_status?: string | null;
+  risk_score?: number | null;
+  static_features?: Record<string, number> | null;
+  vulnerability_details?: VulnerabilityDetail[] | null;
+  dynamic_findings?: DynamicFinding | null;
+  reputation_metadata?: Record<string, unknown> | null;
+}
+
+export interface ExplainPackageResponse {
+  explanation: string;
+  model: string;
+  package_name: string;
+  package_version: string;
+}
+
+export async function explainPackage(
+  context: ScanApiContext,
+  payload: ExplainPackageRequest,
+  options?: { signal?: AbortSignal },
+): Promise<ExplainPackageResponse> {
+  const url = `${context.baseUrl}/api/explain/package`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(context.authHeaders as Record<string, string> | undefined),
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+    signal: options?.signal,
+  });
+
+  const raw = await parseJsonSafe(response);
+
+  if (!response.ok) {
+    throw new ScanApiError(
+      response.status,
+      toErrorMessage(raw, `Explain request failed (${response.status}).`),
+    );
+  }
+
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    explanation: typeof record.explanation === "string" ? record.explanation : "",
+    model: typeof record.model === "string" ? record.model : "mistral",
+    package_name: typeof record.package_name === "string" ? record.package_name : "",
+    package_version: typeof record.package_version === "string" ? record.package_version : "",
+  };
+}

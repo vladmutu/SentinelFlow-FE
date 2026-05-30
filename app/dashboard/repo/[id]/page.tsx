@@ -7,7 +7,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, explainPackage, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -628,6 +628,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedScanPackages, setSelectedScanPackages] = useState<string[]>([]);
   const [isAgentChatOpen, setIsAgentChatOpen] = useState(true);
   const [agentChatWidth, setAgentChatWidth] = useState(320);
+  const [explainState, setExplainState] = useState<Map<string, { status: "loading" | "done" | "error"; text: string }>>(new Map());
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [analysisPackageSearch, setAnalysisPackageSearch] = useState("");
   const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
@@ -1796,6 +1797,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graphDetailNode?.label, repositoryEcosystem]);
 
+  async function handleExplain(rowId: string, payload: ExplainPackageRequest): Promise<void> {
+    setExplainState((prev) => { const next = new Map(prev); next.set(rowId, { status: "loading", text: "" }); return next; });
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const result = await explainPackage(context, payload);
+      setExplainState((prev) => { const next = new Map(prev); next.set(rowId, { status: "done", text: result.explanation }); return next; });
+    } catch (err) {
+      const msg = err instanceof ScanApiError ? err.detail : err instanceof Error ? err.message : "AI explanation failed.";
+      setExplainState((prev) => { const next = new Map(prev); next.set(rowId, { status: "error", text: msg }); return next; });
+    }
+  }
+
   function handleSidebarResizeMouseDown(e: React.MouseEvent) {
     e.preventDefault();
     setIsResizingSidebar(true);
@@ -2656,61 +2670,74 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                             key={row.id}
                             className={`rounded-lg border text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
                           >
-                            <button
-                              type="button"
-                              onClick={() => setExpandedStaticResultId(isExpanded ? null : row.id)}
-                              className="w-full p-3 text-left"
-                            >
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <p className="font-medium">
-                                  {row.packageName} <span className="text-slate-400">@</span> {row.version}
-                                </p>
-                                <div className="flex items-center gap-2">
-                                  {row.riskStatus ? (
-                                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${riskBadgeClass}`}>
-                                      {formatVerdict(row.riskStatus)}
-                                    </span>
-                                  ) : null}
-                                  <span className="text-[11px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
-                                </div>
-                              </div>
-                              <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
-                                <span>Classifier: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : row.malwareStatus ?? "-"}</span>
-                                {row.riskScore !== null ? (
-                                  <span>Risk: {(row.riskScore * 100).toFixed(1)}%</span>
-                                ) : null}
-                              </div>
-                              {row.advisoryRefs.length > 0 ? (
-                                <div className="mt-2 flex flex-wrap gap-1.5">
-                                  {row.advisoryRefs.map((ref) => {
-                                    const isCve = ref.toUpperCase().startsWith("CVE-");
-                                    const isGhsa = ref.toUpperCase().startsWith("GHSA-");
-                                    const href = isCve
-                                      ? `https://nvd.nist.gov/vuln/detail/${ref}`
-                                      : isGhsa
-                                        ? `https://github.com/advisories/${ref}`
-                                        : null;
-                                    return href ? (
-                                      <a
-                                        key={ref}
-                                        href={href}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        onClick={(e) => e.stopPropagation()}
-                                        className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
-                                      >
-                                        {ref}
-                                      </a>
-                                    ) : (
-                                      <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">
-                                        {ref}
+                            <div className="flex items-stretch">
+                              <button
+                                type="button"
+                                onClick={() => setExpandedStaticResultId(isExpanded ? null : row.id)}
+                                className="flex-1 p-3 text-left"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <p className="font-medium">
+                                    {row.packageName} <span className="text-slate-400">@</span> {row.version}
+                                  </p>
+                                  <div className="flex items-center gap-2">
+                                    {row.riskStatus ? (
+                                      <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${riskBadgeClass}`}>
+                                        {formatVerdict(row.riskStatus)}
                                       </span>
-                                    );
-                                  })}
+                                    ) : null}
+                                    <span className="text-[11px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
+                                  </div>
                                 </div>
-                              ) : null}
-                              {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
-                            </button>
+                                <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
+                                  <span>Classifier: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : row.malwareStatus ?? "-"}</span>
+                                  {row.riskScore !== null ? (
+                                    <span>Risk: {(row.riskScore * 100).toFixed(1)}%</span>
+                                  ) : null}
+                                </div>
+                                {row.advisoryRefs.length > 0 ? (
+                                  <div className="mt-2 flex flex-wrap gap-1.5">
+                                    {row.advisoryRefs.map((ref) => {
+                                      const isCve = ref.toUpperCase().startsWith("CVE-");
+                                      const isGhsa = ref.toUpperCase().startsWith("GHSA-");
+                                      const href = isCve
+                                        ? `https://nvd.nist.gov/vuln/detail/${ref}`
+                                        : isGhsa
+                                          ? `https://github.com/advisories/${ref}`
+                                          : null;
+                                      return href ? (
+                                        <a
+                                          key={ref}
+                                          href={href}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
+                                        >
+                                          {ref}
+                                        </a>
+                                      ) : (
+                                        <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">
+                                          {ref}
+                                        </span>
+                                      );
+                                    })}
+                                  </div>
+                                ) : null}
+                                {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
+                              </button>
+                              <button
+                                type="button"
+                                title="Explain with AI"
+                                disabled={explainState.get(row.id)?.status === "loading"}
+                                onClick={() => { if (!isExpanded) setExpandedStaticResultId(row.id); void handleExplain(row.id, { package_name: row.packageName, package_version: row.version, malware_status: row.malwareStatus, malware_score: row.malwareScore, risk_status: row.riskStatus, risk_score: row.riskScore, static_features: row.staticFeatures, dynamic_findings: row.dynamicFindings }); }}
+                                className="border-l border-slate-700 px-3 text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                              >
+                                <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                  <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
+                                </svg>
+                              </button>
+                            </div>
                             {isExpanded ? (
                               <div className="border-t border-slate-700/60 px-3 pb-3 pt-2 space-y-3">
                                 <div className="flex flex-wrap gap-3 text-xs">
@@ -2743,6 +2770,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   <div>
                                     <p className="mb-1.5 text-[10px] uppercase tracking-wide text-slate-500">Static Features</p>
                                     <FeatureGrid features={entryFeatures} />
+                                  </div>
+                                ) : null}
+                                {explainState.has(row.id) ? (
+                                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
+                                    <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
+                                    {explainState.get(row.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(row.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(row.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(row.id)?.text}</p>}
                                   </div>
                                 ) : null}
                               </div>
@@ -2918,57 +2951,70 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                             key={row.id}
                             className={`rounded-lg border text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
                           >
-                            <button
-                              type="button"
-                              onClick={() => setExpandedDynamicRowId(isExpanded ? null : row.id)}
-                              className="w-full p-3 text-left"
-                            >
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <p className="font-medium">
-                                  {row.packageName} <span className="text-slate-400">@</span> {row.version}
-                                </p>
-                                <div className="flex items-center gap-2">
-                                  {verdictStatus ? (
-                                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${verdictBadgeClass}`}>
-                                      {formatVerdict(verdictStatus)}
-                                    </span>
+                            <div className="flex items-stretch">
+                              <button
+                                type="button"
+                                onClick={() => setExpandedDynamicRowId(isExpanded ? null : row.id)}
+                                className="flex-1 p-3 text-left"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <p className="font-medium">
+                                    {row.packageName} <span className="text-slate-400">@</span> {row.version}
+                                  </p>
+                                  <div className="flex items-center gap-2">
+                                    {verdictStatus ? (
+                                      <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${verdictBadgeClass}`}>
+                                        {formatVerdict(verdictStatus)}
+                                      </span>
+                                    ) : null}
+                                    <span className="text-[11px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
+                                  </div>
+                                </div>
+                                <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
+                                  <span>Classifier: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : row.malwareStatus ?? "-"}</span>
+                                  {row.riskScore !== null ? (
+                                    <span>Risk: {(row.riskScore * 100).toFixed(1)}%</span>
                                   ) : null}
-                                  <span className="text-[11px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
                                 </div>
-                              </div>
-                              <div className="mt-1 flex flex-wrap gap-4 text-xs text-slate-400">
-                                <span>Classifier: {row.malwareScore !== null ? `${(row.malwareScore * 100).toFixed(1)}%` : row.malwareStatus ?? "-"}</span>
-                                {row.riskScore !== null ? (
-                                  <span>Risk: {(row.riskScore * 100).toFixed(1)}%</span>
+                                {row.advisoryRefs.length > 0 ? (
+                                  <div className="mt-2 flex flex-wrap gap-1.5">
+                                    {row.advisoryRefs.map((ref) => {
+                                      const isCve = ref.toUpperCase().startsWith("CVE-");
+                                      const isGhsa = ref.toUpperCase().startsWith("GHSA-");
+                                      const href = isCve
+                                        ? `https://nvd.nist.gov/vuln/detail/${ref}`
+                                        : isGhsa ? `https://github.com/advisories/${ref}` : null;
+                                      return href ? (
+                                        <a
+                                          key={ref}
+                                          href={href}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
+                                        >
+                                          {ref}
+                                        </a>
+                                      ) : (
+                                        <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{ref}</span>
+                                      );
+                                    })}
+                                  </div>
                                 ) : null}
-                              </div>
-                              {row.advisoryRefs.length > 0 ? (
-                                <div className="mt-2 flex flex-wrap gap-1.5">
-                                  {row.advisoryRefs.map((ref) => {
-                                    const isCve = ref.toUpperCase().startsWith("CVE-");
-                                    const isGhsa = ref.toUpperCase().startsWith("GHSA-");
-                                    const href = isCve
-                                      ? `https://nvd.nist.gov/vuln/detail/${ref}`
-                                      : isGhsa ? `https://github.com/advisories/${ref}` : null;
-                                    return href ? (
-                                      <a
-                                        key={ref}
-                                        href={href}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        onClick={(e) => e.stopPropagation()}
-                                        className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/20 transition"
-                                      >
-                                        {ref}
-                                      </a>
-                                    ) : (
-                                      <span key={ref} className="rounded border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-400">{ref}</span>
-                                    );
-                                  })}
-                                </div>
-                              ) : null}
-                              {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
-                            </button>
+                                {row.errorMessage ? <p className="mt-1 text-xs text-rose-200">{row.errorMessage}</p> : null}
+                              </button>
+                              <button
+                                type="button"
+                                title="Explain with AI"
+                                disabled={explainState.get(row.id)?.status === "loading"}
+                                onClick={() => { if (!isExpanded) setExpandedDynamicRowId(row.id); void handleExplain(row.id, { package_name: row.packageName, package_version: row.version, malware_status: row.malwareStatus, malware_score: row.malwareScore, risk_status: row.riskStatus, risk_score: row.riskScore, static_features: row.staticFeatures, dynamic_findings: row.dynamicFindings }); }}
+                                className="border-l border-slate-700 px-3 text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                              >
+                                <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                  <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
+                                </svg>
+                              </button>
+                            </div>
                             {isExpanded ? (
                               <div className="border-t border-slate-700/60 px-3 pb-3 pt-2 space-y-3">
                                 <div className="flex flex-wrap gap-3 text-xs">
@@ -3118,6 +3164,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                       : "No dynamic findings available."}
                                   </p>
                                 )}
+                                {explainState.has(row.id) ? (
+                                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
+                                    <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
+                                    {explainState.get(row.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(row.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(row.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(row.id)?.text}</p>}
+                                  </div>
+                                ) : null}
                               </div>
                             ) : null}
                           </div>
@@ -3888,15 +3940,28 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                             </div>
                                                           </td>
                                                           <td className="px-3 py-1.5">
-                                                            {hasDetails ? (
+                                                            <div className="flex items-center gap-2">
+                                                              {hasDetails ? (
+                                                                <button
+                                                                  type="button"
+                                                                  onClick={() => setExpandedResultId(isExpRow ? null : result.id)}
+                                                                  className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
+                                                                >
+                                                                  {isExpRow ? "hide" : "view"}
+                                                                </button>
+                                                              ) : <span className="text-slate-600">—</span>}
                                                               <button
                                                                 type="button"
-                                                                onClick={() => setExpandedResultId(isExpRow ? null : result.id)}
-                                                                className="text-[10px] text-indigo-300 underline hover:text-indigo-100"
+                                                                title="Explain with AI"
+                                                                disabled={explainState.get(result.id)?.status === "loading"}
+                                                                onClick={() => { if (!isExpRow) setExpandedResultId(result.id); void handleExplain(result.id, { package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, static_features: result.static_features ?? null, vulnerability_details: result.vulnerability_details ?? [], dynamic_findings: result.dynamic_findings ?? null, reputation_metadata: result.reputation_metadata ?? null }); }}
+                                                                className="text-violet-400 transition hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
                                                               >
-                                                                {isExpRow ? "hide" : "view"}
+                                                                <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                                                  <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
+                                                                </svg>
                                                               </button>
-                                                            ) : <span className="text-slate-600">—</span>}
+                                                            </div>
                                                           </td>
                                                         </tr>
                                                         {isExpRow ? (
@@ -4063,6 +4128,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                                     </div>
                                                                   );
                                                                 })() : null}
+                                                                {explainState.has(result.id) ? (
+                                                                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
+                                                                    <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
+                                                                    {explainState.get(result.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(result.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(result.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(result.id)?.text}</p>}
+                                                                  </div>
+                                                                ) : null}
                                                               </div>
                                                             </td>
                                                           </tr>
@@ -4401,10 +4472,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   key={result.id}
                                   className={`rounded-lg border text-sm ${isErrorRow ? "border-rose-400/30 bg-rose-500/10 text-rose-100" : "border-slate-700 bg-slate-950/60 text-slate-200"}`}
                                 >
+                                  <div className="flex items-stretch">
                                   <button
                                     type="button"
                                     onClick={() => setLightweightExpandedId(isExpRow ? null : result.id)}
-                                    className="w-full p-3 text-left"
+                                    className="flex-1 p-3 text-left"
                                   >
                                     <div className="flex flex-wrap items-center justify-between gap-2">
                                       <p className="font-medium">
@@ -4454,6 +4526,18 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     ) : null}
                                     {result.error_message ? <p className="mt-1 text-xs text-rose-200">{result.error_message}</p> : null}
                                   </button>
+                                  <button
+                                    type="button"
+                                    title="Explain with AI"
+                                    disabled={explainState.get(result.id)?.status === "loading"}
+                                    onClick={() => { if (!isExpRow) setLightweightExpandedId(result.id); void handleExplain(result.id, { package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, malware_score: result.malware_score, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, vulnerability_details: result.vulnerability_details ?? [], reputation_metadata: result.reputation_metadata ?? null }); }}
+                                    className="border-l border-slate-700 px-3 text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                                  >
+                                    <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                      <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
+                                    </svg>
+                                  </button>
+                                  </div>
                                   {isExpRow ? (
                                     <div className="border-t border-slate-700/60 px-3 pb-3 pt-2 space-y-3">
                                       <div className="flex flex-wrap gap-3 text-xs">
@@ -4522,6 +4606,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                               );
                                             })}
                                           </div>
+                                        </div>
+                                      ) : null}
+                                      {explainState.has(result.id) ? (
+                                        <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
+                                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
+                                          {explainState.get(result.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(result.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(result.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(result.id)?.text}</p>}
                                         </div>
                                       ) : null}
                                     </div>
