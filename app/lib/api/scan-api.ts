@@ -898,45 +898,115 @@ export interface ExplainPackageRequest {
   reputation_metadata?: Record<string, unknown> | null;
 }
 
-export interface ExplainPackageResponse {
-  explanation: string;
-  model: string;
-  package_name: string;
-  package_version: string;
+export interface StreamHandlers {
+  onToken: (token: string) => void;
+  onDone: () => void;
+  onError: (message: string) => void;
 }
 
-export async function explainPackage(
-  context: ScanApiContext,
-  payload: ExplainPackageRequest,
-  options?: { signal?: AbortSignal },
-): Promise<ExplainPackageResponse> {
-  const url = `${context.baseUrl}/api/explain/package`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(context.authHeaders as Record<string, string> | undefined),
-    },
-    credentials: "include",
-    body: JSON.stringify(payload),
-    signal: options?.signal,
-  });
-
-  const raw = await parseJsonSafe(response);
-
+async function _consumeSseStream(
+  response: Response,
+  handlers: StreamHandlers,
+): Promise<void> {
   if (!response.ok) {
-    throw new ScanApiError(
-      response.status,
-      toErrorMessage(raw, `Explain request failed (${response.status}).`),
-    );
+    const raw = await parseJsonSafe(response);
+    handlers.onError(toErrorMessage(raw, `Request failed (${response.status}).`));
+    return;
   }
 
-  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  return {
-    explanation: typeof record.explanation === "string" ? record.explanation : "",
-    model: typeof record.model === "string" ? record.model : "mistral",
-    package_name: typeof record.package_name === "string" ? record.package_name : "",
-    package_version: typeof record.package_version === "string" ? record.package_version : "",
-  };
+  const reader = response.body?.getReader();
+  if (!reader) {
+    handlers.onError("No response body.");
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data: ")) continue;
+        const raw = line.slice(6).trim();
+        if (raw === "[DONE]") {
+          handlers.onDone();
+          return;
+        }
+        try {
+          const parsed = JSON.parse(raw) as Record<string, string>;
+          if (parsed.error) {
+            handlers.onError(parsed.error);
+            return;
+          }
+          if (parsed.token) {
+            handlers.onToken(parsed.token);
+          }
+        } catch {
+          // malformed SSE line — skip
+        }
+      }
+    }
+    handlers.onDone();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function streamExplainPackage(
+  context: ScanApiContext,
+  payload: ExplainPackageRequest,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = `${context.baseUrl}/api/explain/package`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(context.authHeaders as Record<string, string> | undefined),
+      },
+      credentials: "include",
+      body: JSON.stringify(payload),
+      signal,
+    });
+  } catch (err) {
+    handlers.onError(err instanceof Error ? err.message : "Network error.");
+    return;
+  }
+  await _consumeSseStream(response, handlers);
+}
+
+export async function streamAgentChat(
+  context: ScanApiContext,
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  scanContext: Record<string, unknown> | null,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = `${context.baseUrl}/api/explain/chat`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(context.authHeaders as Record<string, string> | undefined),
+      },
+      credentials: "include",
+      body: JSON.stringify({ messages, scan_context: scanContext }),
+      signal,
+    });
+  } catch (err) {
+    handlers.onError(err instanceof Error ? err.message : "Network error.");
+    return;
+  }
+  await _consumeSseStream(response, handlers);
 }

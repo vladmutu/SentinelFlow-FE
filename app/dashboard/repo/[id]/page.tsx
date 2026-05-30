@@ -7,7 +7,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, explainPackage, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, streamExplainPackage, streamAgentChat, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -628,8 +628,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedScanPackages, setSelectedScanPackages] = useState<string[]>([]);
   const [isAgentChatOpen, setIsAgentChatOpen] = useState(true);
   const [agentChatWidth, setAgentChatWidth] = useState(320);
-  const [explainState, setExplainState] = useState<Map<string, { status: "loading" | "done" | "error"; text: string }>>(new Map());
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const [agentMessages, setAgentMessages] = useState<Array<{ id: string; role: "user" | "assistant"; content: string; streaming?: boolean }>>([]);
+  const [agentInput, setAgentInput] = useState("");
+  const [agentIsStreaming, setAgentIsStreaming] = useState(false);
+  const agentMessagesEndRef = React.useRef<HTMLDivElement>(null);
   const [analysisPackageSearch, setAnalysisPackageSearch] = useState("");
   const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
   const [detailsPackageSearch, setDetailsPackageSearch] = useState("");
@@ -1797,16 +1800,111 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graphDetailNode?.label, repositoryEcosystem]);
 
-  async function handleExplain(rowId: string, payload: ExplainPackageRequest): Promise<void> {
-    setExplainState((prev) => { const next = new Map(prev); next.set(rowId, { status: "loading", text: "" }); return next; });
+  useEffect(() => {
+    agentMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [agentMessages]);
+
+  function buildScanContextSummary(): Record<string, unknown> | null {
+    const rows = scanResultRows;
+    if (!rows || rows.length === 0) return null;
+    const sorted = [...rows].sort((a, b) => (b.riskScore ?? 0) - (a.riskScore ?? 0));
+    return {
+      repo_name: decodedId,
+      ecosystem: repositoryEcosystem ?? "unknown",
+      total_packages: rows.length,
+      packages: sorted.slice(0, 20).map((r) => ({
+        name: r.packageName,
+        version: r.version,
+        risk_status: r.riskStatus,
+        malware_status: r.malwareStatus,
+        risk_score: r.riskScore,
+      })),
+    };
+  }
+
+  async function handleExplain(payload: ExplainPackageRequest): Promise<void> {
+    setIsAgentChatOpen(true);
+    const assistantMsgId = crypto.randomUUID();
+    setAgentMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: "user", content: `Explain ${payload.package_name}@${payload.package_version}` },
+      { id: assistantMsgId, role: "assistant", content: "", streaming: true },
+    ]);
+    setAgentIsStreaming(true);
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-      const result = await explainPackage(context, payload);
-      setExplainState((prev) => { const next = new Map(prev); next.set(rowId, { status: "done", text: result.explanation }); return next; });
+      await streamExplainPackage(context, payload, {
+        onToken: (token) =>
+          setAgentMessages((prev) =>
+            prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
+          ),
+        onDone: () =>
+          setAgentMessages((prev) =>
+            prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m))
+          ),
+        onError: (msg) =>
+          setAgentMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
+            )
+          ),
+      });
     } catch (err) {
-      const msg = err instanceof ScanApiError ? err.detail : err instanceof Error ? err.message : "AI explanation failed.";
-      setExplainState((prev) => { const next = new Map(prev); next.set(rowId, { status: "error", text: msg }); return next; });
+      const msg = err instanceof Error ? err.message : "AI explanation failed.";
+      setAgentMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
+        )
+      );
+    } finally {
+      setAgentIsStreaming(false);
+    }
+  }
+
+  async function handleAgentSend(): Promise<void> {
+    const text = agentInput.trim();
+    if (!text || agentIsStreaming) return;
+    setAgentInput("");
+    const assistantMsgId = crypto.randomUUID();
+    const updatedMessages = [
+      ...agentMessages,
+      { id: crypto.randomUUID(), role: "user" as const, content: text },
+    ];
+    setAgentMessages([
+      ...updatedMessages,
+      { id: assistantMsgId, role: "assistant", content: "", streaming: true },
+    ]);
+    setAgentIsStreaming(true);
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const chatHistory = updatedMessages.map(({ role, content }) => ({ role, content }));
+      await streamAgentChat(context, chatHistory, buildScanContextSummary(), {
+        onToken: (token) =>
+          setAgentMessages((prev) =>
+            prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
+          ),
+        onDone: () =>
+          setAgentMessages((prev) =>
+            prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m))
+          ),
+        onError: (msg) =>
+          setAgentMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
+            )
+          ),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Chat failed.";
+      setAgentMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
+        )
+      );
+    } finally {
+      setAgentIsStreaming(false);
     }
   }
 
@@ -2240,6 +2338,30 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     {verdict}
                                   </span>
                                 ) : null}
+                                <button
+                                  type="button"
+                                  disabled={agentIsStreaming}
+                                  title="Ask AI to explain this package"
+                                  onClick={() => void handleExplain({
+                                    package_name: pkgName,
+                                    package_version: pkgVersion ?? "unknown",
+                                    ecosystem: graphNodePkgDetails?.ecosystem ?? repositoryEcosystem ?? undefined,
+                                    malware_status: scanEntry?.malware_status ?? null,
+                                    malware_score: scanEntry?.malware_score ?? null,
+                                    risk_status: scanEntry?.risk_overall_status ?? null,
+                                    risk_score: scanEntry?.risk_overall_score ?? null,
+                                    static_features: graphDetailNode.features,
+                                    vulnerability_details: (scanEntry?.vulnerability_details ?? []) as Array<Record<string, unknown>>,
+                                    dynamic_findings: scanEntry?.dynamic_findings ?? null,
+                                    reputation_metadata: scanEntry?.reputation_metadata ?? null,
+                                  })}
+                                  className="flex items-center gap-1 rounded-lg border border-violet-400/40 bg-violet-500/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-violet-300 transition hover:bg-violet-500/20 hover:text-violet-200 disabled:opacity-40"
+                                >
+                                  <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                    <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
+                                  </svg>
+                                  Ask AI
+                                </button>
                               </div>
                             </div>
 
@@ -2728,14 +2850,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               </button>
                               <button
                                 type="button"
-                                title="Explain with AI"
-                                disabled={explainState.get(row.id)?.status === "loading"}
-                                onClick={() => { if (!isExpanded) setExpandedStaticResultId(row.id); void handleExplain(row.id, { package_name: row.packageName, package_version: row.version, malware_status: row.malwareStatus, malware_score: row.malwareScore, risk_status: row.riskStatus, risk_score: row.riskScore, static_features: row.staticFeatures, dynamic_findings: row.dynamicFindings }); }}
-                                className="border-l border-slate-700 px-3 text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                                title="Ask AI to explain this package"
+                                disabled={agentIsStreaming}
+                                onClick={() => void handleExplain({ package_name: row.packageName, package_version: row.version, malware_status: row.malwareStatus, malware_score: row.malwareScore, risk_status: row.riskStatus, risk_score: row.riskScore, static_features: row.staticFeatures, dynamic_findings: row.dynamicFindings })}
+                                className="flex items-center gap-1 border-l border-slate-700 px-3 text-[10px] font-semibold uppercase tracking-wide text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
                               >
-                                <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
                                   <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
                                 </svg>
+                                Ask AI
                               </button>
                             </div>
                             {isExpanded ? (
@@ -2770,12 +2893,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   <div>
                                     <p className="mb-1.5 text-[10px] uppercase tracking-wide text-slate-500">Static Features</p>
                                     <FeatureGrid features={entryFeatures} />
-                                  </div>
-                                ) : null}
-                                {explainState.has(row.id) ? (
-                                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
-                                    <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
-                                    {explainState.get(row.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(row.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(row.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(row.id)?.text}</p>}
                                   </div>
                                 ) : null}
                               </div>
@@ -3005,14 +3122,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               </button>
                               <button
                                 type="button"
-                                title="Explain with AI"
-                                disabled={explainState.get(row.id)?.status === "loading"}
-                                onClick={() => { if (!isExpanded) setExpandedDynamicRowId(row.id); void handleExplain(row.id, { package_name: row.packageName, package_version: row.version, malware_status: row.malwareStatus, malware_score: row.malwareScore, risk_status: row.riskStatus, risk_score: row.riskScore, static_features: row.staticFeatures, dynamic_findings: row.dynamicFindings }); }}
-                                className="border-l border-slate-700 px-3 text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                                title="Ask AI to explain this package"
+                                disabled={agentIsStreaming}
+                                onClick={() => void handleExplain({ package_name: row.packageName, package_version: row.version, malware_status: row.malwareStatus, malware_score: row.malwareScore, risk_status: row.riskStatus, risk_score: row.riskScore, static_features: row.staticFeatures, dynamic_findings: row.dynamicFindings })}
+                                className="flex items-center gap-1 border-l border-slate-700 px-3 text-[10px] font-semibold uppercase tracking-wide text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
                               >
-                                <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
                                   <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
                                 </svg>
+                                Ask AI
                               </button>
                             </div>
                             {isExpanded ? (
@@ -3164,12 +3282,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                       : "No dynamic findings available."}
                                   </p>
                                 )}
-                                {explainState.has(row.id) ? (
-                                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
-                                    <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
-                                    {explainState.get(row.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(row.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(row.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(row.id)?.text}</p>}
-                                  </div>
-                                ) : null}
                               </div>
                             ) : null}
                           </div>
@@ -3808,7 +3920,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                   <div
                     ref={historyScrollRef}
                     onScroll={handleHistoryScroll}
-                    className="max-h-[62vh] overflow-y-auto rounded-2xl border border-slate-700 bg-slate-950/70"
+                    className="max-h-[78vh] overflow-y-auto rounded-2xl border border-slate-700 bg-slate-950/70"
                   >
                     <div className="overflow-x-auto">
                       <table className="w-full text-left text-xs text-slate-200">
@@ -3952,14 +4064,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                               ) : <span className="text-slate-600">—</span>}
                                                               <button
                                                                 type="button"
-                                                                title="Explain with AI"
-                                                                disabled={explainState.get(result.id)?.status === "loading"}
-                                                                onClick={() => { if (!isExpRow) setExpandedResultId(result.id); void handleExplain(result.id, { package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, static_features: result.static_features ?? null, vulnerability_details: result.vulnerability_details ?? [], dynamic_findings: result.dynamic_findings ?? null, reputation_metadata: result.reputation_metadata ?? null }); }}
-                                                                className="text-violet-400 transition hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                                                                title="Ask AI to explain this package"
+                                                                disabled={agentIsStreaming}
+                                                                onClick={() => void handleExplain({ package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, static_features: result.static_features ?? null, vulnerability_details: result.vulnerability_details ?? [], dynamic_findings: result.dynamic_findings ?? null, reputation_metadata: result.reputation_metadata ?? null })}
+                                                                className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide text-violet-400 transition hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
                                                               >
-                                                                <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                                                <svg viewBox="0 0 16 16" className="h-3 w-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
                                                                   <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
                                                                 </svg>
+                                                                Ask AI
                                                               </button>
                                                             </div>
                                                           </td>
@@ -4128,12 +4241,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                                     </div>
                                                                   );
                                                                 })() : null}
-                                                                {explainState.has(result.id) ? (
-                                                                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
-                                                                    <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
-                                                                    {explainState.get(result.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(result.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(result.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(result.id)?.text}</p>}
-                                                                  </div>
-                                                                ) : null}
                                                               </div>
                                                             </td>
                                                           </tr>
@@ -4528,14 +4635,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   </button>
                                   <button
                                     type="button"
-                                    title="Explain with AI"
-                                    disabled={explainState.get(result.id)?.status === "loading"}
-                                    onClick={() => { if (!isExpRow) setLightweightExpandedId(result.id); void handleExplain(result.id, { package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, malware_score: result.malware_score, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, vulnerability_details: result.vulnerability_details ?? [], reputation_metadata: result.reputation_metadata ?? null }); }}
-                                    className="border-l border-slate-700 px-3 text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
+                                    title="Ask AI to explain this package"
+                                    disabled={agentIsStreaming}
+                                    onClick={() => void handleExplain({ package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, malware_score: result.malware_score, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, vulnerability_details: result.vulnerability_details ?? [], reputation_metadata: result.reputation_metadata ?? null })}
+                                    className="flex items-center gap-1 border-l border-slate-700 px-3 text-[10px] font-semibold uppercase tracking-wide text-violet-400 transition hover:bg-violet-500/10 hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
                                   >
-                                    <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                    <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
                                       <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
                                     </svg>
+                                    Ask AI
                                   </button>
                                   </div>
                                   {isExpRow ? (
@@ -4606,12 +4714,6 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                               );
                                             })}
                                           </div>
-                                        </div>
-                                      ) : null}
-                                      {explainState.has(result.id) ? (
-                                        <div className="rounded-lg border border-violet-400/20 bg-violet-500/8 p-3">
-                                          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-violet-400">AI Explanation · Mistral</p>
-                                          {explainState.get(result.id)?.status === "loading" ? <p className="animate-pulse text-xs italic text-slate-400">Generating explanation…</p> : explainState.get(result.id)?.status === "error" ? <p className="text-xs text-rose-300">{explainState.get(result.id)?.text}</p> : <p className="text-xs leading-relaxed text-slate-200 whitespace-pre-wrap">{explainState.get(result.id)?.text}</p>}
                                         </div>
                                       ) : null}
                                     </div>
@@ -4690,27 +4792,58 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
             </button>
           </div>
 
-          <div className="flex-1 space-y-3 overflow-y-auto p-4">
-            <div className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 p-3 text-sm text-cyan-100">
-              Ask me about dependencies, risk signals, or what to patch first.
-            </div>
-            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3 text-sm text-slate-300">
-              Tip: &quot;Highlight outdated transitive packages with known CVEs.&quot;
-            </div>
+          <div className="flex-1 overflow-y-auto p-4">
+            {agentMessages.length === 0 ? (
+              <div className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 p-3 text-sm text-cyan-100">
+                Ask me about security risks, CVEs, how SentinelFlow works, or click <span className="font-semibold">Ask AI</span> on any package to get an explanation.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {agentMessages.map((msg) => (
+                  <div key={msg.id} className={msg.role === "user" ? "flex justify-end" : ""}>
+                    <div
+                      className={`max-w-[88%] rounded-xl p-3 text-sm leading-relaxed ${
+                        msg.role === "user"
+                          ? "border border-slate-700 bg-slate-800/70 text-slate-200"
+                          : "border border-cyan-400/15 bg-slate-900/60 text-slate-200"
+                      }`}
+                    >
+                      <span className="whitespace-pre-wrap">{msg.content}</span>
+                      {msg.streaming ? (
+                        <span className="ml-0.5 inline-block h-[0.85em] w-0.5 translate-y-[0.1em] animate-pulse bg-cyan-400" />
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+                <div ref={agentMessagesEndRef} />
+              </div>
+            )}
           </div>
 
-          <div className="border-t border-gray-800 p-4">
+          <div className="border-t border-gray-800 p-3">
             <div className="flex items-center gap-2">
               <input
                 type="text"
-                placeholder="Message SentinelFlow Agent..."
-                className="w-full rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60"
+                value={agentInput}
+                onChange={(e) => setAgentInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void handleAgentSend(); } }}
+                disabled={agentIsStreaming}
+                placeholder="Ask about packages, CVEs, or security…"
+                className="w-full rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60 disabled:opacity-50"
               />
               <button
                 type="button"
-                className="rounded-lg border border-cyan-400/60 bg-cyan-500/20 px-3 py-2 text-sm font-medium text-cyan-100 transition hover:bg-cyan-500/30"
+                onClick={() => void handleAgentSend()}
+                disabled={agentIsStreaming || !agentInput.trim()}
+                className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-cyan-400/60 bg-cyan-500/20 text-cyan-100 transition hover:bg-cyan-500/30 disabled:cursor-wait disabled:opacity-40"
               >
-                Send
+                {agentIsStreaming ? (
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" />
+                ) : (
+                  <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2L2 6.5l5 2L9.5 14 14 2z" />
+                  </svg>
+                )}
               </button>
             </div>
           </div>
