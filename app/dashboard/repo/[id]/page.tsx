@@ -7,7 +7,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, streamExplainPackage, streamAgentChat, createChatSession, listChatSessions, getChatSession, deleteChatSession, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest, ChatSessionSummary, ChatSessionDetail } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, streamExplainPackage, streamAgentChat, createChat, listChats, getChat, deleteChat, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest, Chat, ChatDetail } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -51,7 +51,7 @@ type ScanResultMapEntry = {
   dynamic_findings?: DynamicFinding | null;
 };
 
-type ChatConversation = ChatSessionSummary;
+type ChatConversation = Chat;
 
 type ScanResultRow = {
   id: string;
@@ -826,16 +826,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       try {
         const { owner, repoName, headers } = await resolveRepoCoordinates();
         const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-        const sessions = await listChatSessions(ctx, owner, repoName);
+        const sessions = await listChats(ctx, owner, repoName);
         if (cancelled) return;
         setChatConversations(sessions);
-        if (sessions.length > 0) {
-          const first = sessions[0];
-          setCurrentConvId(first.id);
-          const detail = await getChatSession(ctx, first.id);
-          if (cancelled) return;
-          setAgentMessages(detail.messages);
-        }
       } catch { /* ignore — chat is non-critical */ }
     }
     void loadSessions();
@@ -1867,10 +1860,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     if (!convId) {
       try {
         const title = `Explain ${payload.package_name}@${payload.package_version}`.slice(0, 45);
-        const session = await createChatSession(context, owner, repoName, title);
-        setChatConversations((prev) => [session, ...prev]);
-        setCurrentConvId(session.id);
-        convId = session.id;
+        const chat = await createChat(context, owner, repoName, title);
+        setCurrentConvId(chat.id);
+        convId = chat.id;
       } catch { /* ignore — continue without session */ }
     }
 
@@ -1885,14 +1877,14 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     const refreshSessions = () => {
       void (async () => {
         try {
-          const sessions = await listChatSessions(context, owner, repoName);
+          const sessions = await listChats(context, owner, repoName);
           setChatConversations(sessions);
         } catch { /* ignore */ }
       })();
     };
 
     try {
-      await streamExplainPackage(context, payload, {
+      await streamExplainPackage(context, { ...payload, ...(convId ? { session_id: convId } : {}) }, {
         onToken: (token) =>
           setAgentMessages((prev) =>
             prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
@@ -1923,35 +1915,32 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }
 
-  async function startNewChat(): Promise<void> {
-    try {
-      const { owner, repoName, headers } = await resolveRepoCoordinates();
-      const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-      const session = await createChatSession(ctx, owner, repoName, "New conversation");
-      setChatConversations((prev) => [session, ...prev]);
-      setCurrentConvId(session.id);
-      setAgentMessages([]);
-      setShowChatHistory(false);
-    } catch { /* ignore */ }
+  function startNewChat(): void {
+    setCurrentConvId(null);
+    setAgentMessages([]);
+    setShowChatHistory(false);
   }
 
   async function switchToConversation(conv: ChatConversation): Promise<void> {
     setCurrentConvId(conv.id);
     setShowChatHistory(false);
-    setAgentMessages([]);
+    // Don't clear agentMessages before loading — replace in one step so the
+    // scroll-to-bottom effect fires once with real content, not twice (first with []).
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-      const detail: ChatSessionDetail = await getChatSession(ctx, conv.id);
+      const detail: ChatDetail = await getChat(ctx, conv.id);
       setAgentMessages(detail.messages);
-    } catch { /* ignore */ }
+    } catch {
+      setAgentMessages([]);
+    }
   }
 
   async function deleteConversation(sessionId: string): Promise<void> {
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
-      await deleteChatSession(ctx, sessionId);
+      await deleteChat(ctx, sessionId);
       setChatConversations((prev) => prev.filter((s) => s.id !== sessionId));
       if (currentConvId === sessionId) {
         setCurrentConvId(null);
@@ -1972,12 +1961,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     let convId = currentConvId;
     if (!convId) {
       try {
-        const session = await createChatSession(context, owner, repoName, text.slice(0, 45));
-        setChatConversations((prev) => [session, ...prev]);
-        setCurrentConvId(session.id);
-        convId = session.id;
+        const chat = await createChat(context, owner, repoName, text.slice(0, 45));
+        setCurrentConvId(chat.id);
+        convId = chat.id;
       } catch {
-        // If session creation fails, continue in stateless mode
+        // If creation fails, continue in stateless mode
       }
     }
 
@@ -1996,7 +1984,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     const refreshSessions = () => {
       void (async () => {
         try {
-          const sessions = await listChatSessions(context, owner, repoName);
+          const sessions = await listChats(context, owner, repoName);
           setChatConversations(sessions);
         } catch { /* ignore */ }
       })();
@@ -5076,6 +5064,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
               ) : (
                 <ul className="divide-y divide-slate-800/60">
                   {[...chatConversations]
+                    .filter((c) => c.message_count > 0)
                     .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
                     .map((conv) => (
                       <li key={conv.id} className="flex items-stretch">
@@ -5090,7 +5079,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           <p className="mt-0.5 text-[10px] text-slate-500">
                             {new Date(conv.updated_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                             {" · "}
-                            {conv.message_count} msg{conv.message_count !== 1 ? "s" : ""}
+                            {Math.floor(conv.message_count / 2)} message{Math.floor(conv.message_count / 2) !== 1 ? "s" : ""}
                           </p>
                         </button>
                         <button

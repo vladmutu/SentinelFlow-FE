@@ -881,10 +881,10 @@ export function downloadSbom(data: Record<string, unknown>, filename: string): v
 }
 
 // ============================================================================
-// TYPES - AI Explainability & Chat Sessions
+// TYPES - AI Explainability & Chats
 // ============================================================================
 
-export interface ChatSessionSummary {
+export interface Chat {
   id: string;
   owner: string;
   repo_name: string;
@@ -894,15 +894,15 @@ export interface ChatSessionSummary {
   message_count: number;
 }
 
-export interface ChatMessageResponse {
+export interface ChatMessageItem {
   id: string;
   role: "user" | "assistant";
   content: string;
   created_at: string;
 }
 
-export interface ChatSessionDetail extends ChatSessionSummary {
-  messages: ChatMessageResponse[];
+export interface ChatDetail extends Chat {
+  messages: ChatMessageItem[];
 }
 
 export interface ExplainPackageRequest {
@@ -917,6 +917,7 @@ export interface ExplainPackageRequest {
   vulnerability_details?: VulnerabilityDetail[] | null;
   dynamic_findings?: DynamicFinding | null;
   reputation_metadata?: Record<string, unknown> | null;
+  session_id?: string;
 }
 
 export interface StreamHandlers {
@@ -1037,12 +1038,12 @@ export async function streamAgentChat(
   await _consumeSseStream(response, handlers);
 }
 
-export async function createChatSession(
+export async function createChat(
   context: ScanApiContext,
   owner: string,
   repoName: string,
   title?: string,
-): Promise<ChatSessionSummary> {
+): Promise<Chat> {
   const response = await fetch(`${context.baseUrl}/api/chat/sessions`, {
     method: "POST",
     headers: {
@@ -1053,36 +1054,36 @@ export async function createChatSession(
     body: JSON.stringify({ owner, repo_name: repoName, title }),
   });
   if (!response.ok) throw new Error(`Failed to create session (${response.status})`);
-  return response.json() as Promise<ChatSessionSummary>;
+  return response.json() as Promise<Chat>;
 }
 
-export async function listChatSessions(
+export async function listChats(
   context: ScanApiContext,
   owner: string,
   repoName: string,
-): Promise<ChatSessionSummary[]> {
+): Promise<Chat[]> {
   const params = new URLSearchParams({ owner, repo_name: repoName });
   const response = await fetch(`${context.baseUrl}/api/chat/sessions?${params}`, {
     headers: { ...(context.authHeaders as Record<string, string> | undefined) },
     credentials: "include",
   });
   if (!response.ok) throw new Error(`Failed to list sessions (${response.status})`);
-  return response.json() as Promise<ChatSessionSummary[]>;
+  return response.json() as Promise<Chat[]>;
 }
 
-export async function getChatSession(
+export async function getChat(
   context: ScanApiContext,
   sessionId: string,
-): Promise<ChatSessionDetail> {
+): Promise<ChatDetail> {
   const response = await fetch(`${context.baseUrl}/api/chat/sessions/${sessionId}`, {
     headers: { ...(context.authHeaders as Record<string, string> | undefined) },
     credentials: "include",
   });
   if (!response.ok) throw new Error(`Failed to get session (${response.status})`);
-  return response.json() as Promise<ChatSessionDetail>;
+  return response.json() as Promise<ChatDetail>;
 }
 
-export async function deleteChatSession(
+export async function deleteChat(
   context: ScanApiContext,
   sessionId: string,
 ): Promise<void> {
