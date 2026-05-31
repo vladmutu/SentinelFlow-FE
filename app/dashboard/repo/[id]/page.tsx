@@ -51,6 +51,14 @@ type ScanResultMapEntry = {
   dynamic_findings?: DynamicFinding | null;
 };
 
+type ChatConversation = {
+  id: string;
+  title: string;
+  messages: Array<{ id: string; role: "user" | "assistant"; content: string }>;
+  createdAt: number;
+  updatedAt: number;
+};
+
 type ScanResultRow = {
   id: string;
   packageName: string;
@@ -632,6 +640,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [agentMessages, setAgentMessages] = useState<Array<{ id: string; role: "user" | "assistant"; content: string; streaming?: boolean }>>([]);
   const [agentInput, setAgentInput] = useState("");
   const [agentIsStreaming, setAgentIsStreaming] = useState(false);
+  const [chatConversations, setChatConversations] = useState<ChatConversation[]>([]);
+  const [currentConvId, setCurrentConvId] = useState<string | null>(null);
+  const [showChatHistory, setShowChatHistory] = useState(false);
   const agentMessagesEndRef = React.useRef<HTMLDivElement>(null);
   const [analysisPackageSearch, setAnalysisPackageSearch] = useState("");
   const [selectedAnalysisPackages, setSelectedAnalysisPackages] = useState<string[]>([]);
@@ -648,6 +659,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<ScanJobResponse | null>(null);
   const [isHistoryJobLoading, setIsHistoryJobLoading] = useState(false);
   const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
+  const [historyResultSearch, setHistoryResultSearch] = useState("");
   const [expandedStaticResultId, setExpandedStaticResultId] = useState<string | null>(null);
   const [expandedDynamicRowId, setExpandedDynamicRowId] = useState<string | null>(null);
   const [selectedStaticJobId, setSelectedStaticJobId] = useState<string | null>(null);
@@ -800,14 +812,43 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   ] as const;
 
   useEffect(() => {
+    isMountedRef.current = true;
     setIsHydrated(true);
+
+    try {
+      const storedConvs = localStorage.getItem(`sf_chat_convs_${decodedId}`);
+      const storedActiveId = localStorage.getItem(`sf_chat_active_${decodedId}`);
+      if (storedConvs) {
+        const parsed: ChatConversation[] = JSON.parse(storedConvs);
+        setChatConversations(parsed);
+        const activeId =
+          storedActiveId && parsed.find((c) => c.id === storedActiveId)
+            ? storedActiveId
+            : (parsed[0]?.id ?? null);
+        setCurrentConvId(activeId);
+        const active = parsed.find((c) => c.id === activeId);
+        if (active) setAgentMessages(active.messages);
+      }
+    } catch {
+      // ignore malformed localStorage data
+    }
 
     return () => {
       isMountedRef.current = false;
       scanPollTimersRef.current.forEach(timer => window.clearTimeout(timer));
       elapsedTickersRef.current.forEach(timer => window.clearInterval(timer));
     };
-  }, []);
+  }, [decodedId]);
+
+  useEffect(() => {
+    if (!currentConvId || chatConversations.length === 0) return;
+    try {
+      localStorage.setItem(`sf_chat_convs_${decodedId}`, JSON.stringify(chatConversations));
+      localStorage.setItem(`sf_chat_active_${decodedId}`, currentConvId);
+    } catch {
+      // ignore quota errors
+    }
+  }, [chatConversations, currentConvId, decodedId]);
 
   useEffect(() => {
     setNodes([]);
@@ -1824,6 +1865,18 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
   async function handleExplain(payload: ExplainPackageRequest): Promise<void> {
     setIsAgentChatOpen(true);
+
+    // Ensure there is an active conversation
+    let convId = currentConvId;
+    if (!convId) {
+      const newId = crypto.randomUUID();
+      const title = `Explain ${payload.package_name}@${payload.package_version}`.slice(0, 45);
+      const newConv: ChatConversation = { id: newId, title, messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+      setChatConversations((prev) => [newConv, ...prev]);
+      setCurrentConvId(newId);
+      convId = newId;
+    }
+
     const assistantMsgId = crypto.randomUUID();
     setAgentMessages((prev) => [
       ...prev,
@@ -1831,6 +1884,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       { id: assistantMsgId, role: "assistant", content: "", streaming: true },
     ]);
     setAgentIsStreaming(true);
+
+    const persistMessages = (finalMessages: Array<{ id: string; role: "user" | "assistant"; content: string }>) => {
+      setChatConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId ? { ...c, messages: finalMessages, updatedAt: Date.now() } : c
+        )
+      );
+    };
+
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
@@ -1839,33 +1901,79 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           setAgentMessages((prev) =>
             prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
           ),
-        onDone: () =>
-          setAgentMessages((prev) =>
-            prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m))
-          ),
-        onError: (msg) =>
-          setAgentMessages((prev) =>
-            prev.map((m) =>
+        onDone: () => {
+          setAgentMessages((prev) => {
+            const final = prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m));
+            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
+            return final;
+          });
+        },
+        onError: (msg) => {
+          setAgentMessages((prev) => {
+            const final = prev.map((m) =>
               m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-            )
-          ),
+            );
+            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
+            return final;
+          });
+        },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "AI explanation failed.";
-      setAgentMessages((prev) =>
-        prev.map((m) =>
+      setAgentMessages((prev) => {
+        const final = prev.map((m) =>
           m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-        )
-      );
+        );
+        persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
+        return final;
+      });
     } finally {
       setAgentIsStreaming(false);
     }
+  }
+
+  function startNewChat() {
+    const id = crypto.randomUUID();
+    const conv: ChatConversation = {
+      id,
+      title: "New conversation",
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setChatConversations((prev) => [conv, ...prev]);
+    setCurrentConvId(id);
+    setAgentMessages([]);
+    setShowChatHistory(false);
+  }
+
+  function switchToConversation(conv: ChatConversation) {
+    setCurrentConvId(conv.id);
+    setAgentMessages(conv.messages);
+    setShowChatHistory(false);
   }
 
   async function handleAgentSend(): Promise<void> {
     const text = agentInput.trim();
     if (!text || agentIsStreaming) return;
     setAgentInput("");
+
+    // Ensure there is an active conversation
+    let convId = currentConvId;
+    if (!convId) {
+      const newId = crypto.randomUUID();
+      const newConv: ChatConversation = {
+        id: newId,
+        title: text.slice(0, 45),
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      setChatConversations((prev) => [newConv, ...prev]);
+      setCurrentConvId(newId);
+      convId = newId;
+    }
+
     const assistantMsgId = crypto.randomUUID();
     const updatedMessages = [
       ...agentMessages,
@@ -1876,6 +1984,22 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
       { id: assistantMsgId, role: "assistant", content: "", streaming: true },
     ]);
     setAgentIsStreaming(true);
+
+    const persistMessages = (finalMessages: Array<{ id: string; role: "user" | "assistant"; content: string }>) => {
+      setChatConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId
+            ? {
+                ...c,
+                messages: finalMessages,
+                title: c.title === "New conversation" ? text.slice(0, 45) : c.title,
+                updatedAt: Date.now(),
+              }
+            : c
+        )
+      );
+    };
+
     try {
       const { owner, repoName, headers } = await resolveRepoCoordinates();
       const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
@@ -1885,24 +2009,32 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           setAgentMessages((prev) =>
             prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
           ),
-        onDone: () =>
-          setAgentMessages((prev) =>
-            prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m))
-          ),
-        onError: (msg) =>
-          setAgentMessages((prev) =>
-            prev.map((m) =>
+        onDone: () => {
+          setAgentMessages((prev) => {
+            const final = prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m));
+            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
+            return final;
+          });
+        },
+        onError: (msg) => {
+          setAgentMessages((prev) => {
+            const final = prev.map((m) =>
               m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-            )
-          ),
+            );
+            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
+            return final;
+          });
+        },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Chat failed.";
-      setAgentMessages((prev) =>
-        prev.map((m) =>
+      setAgentMessages((prev) => {
+        const final = prev.map((m) =>
           m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-        )
-      );
+        );
+        persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
+        return final;
+      });
     } finally {
       setAgentIsStreaming(false);
     }
@@ -2069,7 +2201,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                       : "border-slate-600/50 bg-slate-800/30 text-slate-400";
                                 const scoreValue = row.riskScore ?? row.malwareScore;
                                 return (
-                                  <tr key={row.id} className="border-t border-slate-800 hover:bg-slate-900/40">
+                                  <tr
+                                    key={row.id}
+                                    className="border-t border-slate-800 cursor-pointer hover:bg-slate-900/60"
+                                    onClick={() => setGraphDetailNode({
+                                      label: `${row.packageName}@${row.version}`,
+                                      features: row.staticFeatures,
+                                      scanEntry: scanResultsMap[`${row.packageName}@${row.version}`] ?? null,
+                                    })}
+                                  >
                                     <td className="px-3 py-2 font-mono text-[11px]">{row.packageName}@{row.version}</td>
                                     <td className="px-3 py-2">
                                       {verdictStatus ? (
@@ -2351,7 +2491,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     risk_status: scanEntry?.risk_overall_status ?? null,
                                     risk_score: scanEntry?.risk_overall_score ?? null,
                                     static_features: graphDetailNode.features,
-                                    vulnerability_details: (scanEntry?.vulnerability_details ?? []) as Array<Record<string, unknown>>,
+                                    vulnerability_details: scanEntry?.vulnerability_details ?? null,
                                     dynamic_findings: scanEntry?.dynamic_findings ?? null,
                                     reputation_metadata: scanEntry?.reputation_metadata ?? null,
                                   })}
@@ -2707,35 +2847,45 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           <div
                             key={job.jobId}
                             onClick={() => setSelectedStaticJobId(job.jobId)}
-                            className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedStaticJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
+                            className={`rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedStaticJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
                           >
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2">
+                                {(job.status === "pending" || job.status === "running") ? (
+                                  <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                                ) : (
+                                  <span className={`h-2 w-2 rounded-full ${
+                                    SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                                    : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                                    : "bg-slate-500"
+                                  }`} />
+                                )}
+                                <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">{job.scanMode}</span>
+                                <span className="text-[10px] text-slate-500">
+                                  {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
+                                </span>
+                                {job.elapsedSeconds > 0 ? (
+                                  <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                                ) : null}
+                              </div>
                               {(job.status === "pending" || job.status === "running") ? (
-                                <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
-                              ) : (
-                                <span className={`h-2 w-2 rounded-full ${
-                                  SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
-                                  : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
-                                  : "bg-slate-500"
-                                }`} />
-                              )}
-                              <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">{job.scanMode}</span>
-                              <span className="text-[10px] text-slate-500">
-                                {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
-                              </span>
-                              {job.elapsedSeconds > 0 ? (
-                                <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); void cancelScanJob(job.jobId); }}
+                                  disabled={isCancellingScan}
+                                  className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                                >
+                                  Stop
+                                </button>
                               ) : null}
                             </div>
-                            {(job.status === "pending" || job.status === "running") ? (
-                              <button
-                                type="button"
-                                onClick={() => { void cancelScanJob(job.jobId); }}
-                                disabled={isCancellingScan}
-                                className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
-                              >
-                                Stop
-                              </button>
+                            {(job.status === "pending" || job.status === "running") && job.progress > 0 ? (
+                              <div className="mt-1.5 h-0.5 overflow-hidden rounded-full bg-slate-800">
+                                <div
+                                  className="h-full rounded-full bg-cyan-500 transition-all duration-500"
+                                  style={{ width: `${job.progress}%` }}
+                                />
+                              </div>
                             ) : null}
                           </div>
                         ))}
@@ -2762,6 +2912,38 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                 </div>
 
                 {/* Right column — findings */}
+                {(() => {
+                  const runningStaticJob = selectedStaticJobId ? activeScanJobs.get(selectedStaticJobId) : null;
+                  if (!runningStaticJob || (runningStaticJob.status !== "pending" && runningStaticJob.status !== "running")) return null;
+                  const d = runningStaticJob.details as { total_unique_packages?: number; scanned_packages?: number } | null;
+                  return (
+                    <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+                      <div className="flex items-center justify-between gap-4">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-300">
+                          {runningStaticJob.status === "running" ? "Scanning…" : "Starting…"}
+                        </p>
+                        {(d?.total_unique_packages ?? 0) > 0 ? (
+                          <span className="text-[11px] text-slate-400">
+                            {d?.scanned_packages ?? 0} / {d?.total_unique_packages} ({runningStaticJob.progress.toFixed(0)}%)
+                          </span>
+                        ) : (
+                          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400/40 border-t-cyan-400" />
+                        )}
+                      </div>
+                      {(d?.total_unique_packages ?? 0) > 0 ? (
+                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                          <div
+                            className="h-full rounded-full bg-cyan-500 transition-all duration-500"
+                            style={{ width: `${runningStaticJob.progress}%` }}
+                          />
+                        </div>
+                      ) : null}
+                      {runningStaticJob.elapsedSeconds > 0 ? (
+                        <p className="mt-1 text-[10px] text-slate-500">Elapsed {formatDuration(runningStaticJob.elapsedSeconds)}</p>
+                      ) : null}
+                    </div>
+                  );
+                })()}
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Scan Results</p>
@@ -3001,35 +3183,45 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                           <div
                             key={job.jobId}
                             onClick={() => setSelectedDynamicJobId(job.jobId)}
-                            className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedDynamicJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
+                            className={`rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedDynamicJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
                           >
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2">
+                                {(job.status === "pending" || job.status === "running") ? (
+                                  <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                                ) : (
+                                  <span className={`h-2 w-2 rounded-full ${
+                                    SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                                    : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                                    : "bg-slate-500"
+                                  }`} />
+                                )}
+                                <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">{job.scanMode}</span>
+                                <span className="text-[10px] text-slate-500">
+                                  {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
+                                </span>
+                                {job.elapsedSeconds > 0 ? (
+                                  <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                                ) : null}
+                              </div>
                               {(job.status === "pending" || job.status === "running") ? (
-                                <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
-                              ) : (
-                                <span className={`h-2 w-2 rounded-full ${
-                                  SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
-                                  : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
-                                  : "bg-slate-500"
-                                }`} />
-                              )}
-                              <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">{job.scanMode}</span>
-                              <span className="text-[10px] text-slate-500">
-                                {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
-                              </span>
-                              {job.elapsedSeconds > 0 ? (
-                                <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); void cancelScanJob(job.jobId); }}
+                                  disabled={isCancellingScan}
+                                  className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                                >
+                                  Stop
+                                </button>
                               ) : null}
                             </div>
-                            {(job.status === "pending" || job.status === "running") ? (
-                              <button
-                                type="button"
-                                onClick={() => { void cancelScanJob(job.jobId); }}
-                                disabled={isCancellingScan}
-                                className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
-                              >
-                                Stop
-                              </button>
+                            {(job.status === "pending" || job.status === "running") && job.progress > 0 ? (
+                              <div className="mt-1.5 h-0.5 overflow-hidden rounded-full bg-slate-800">
+                                <div
+                                  className="h-full rounded-full bg-cyan-500 transition-all duration-500"
+                                  style={{ width: `${job.progress}%` }}
+                                />
+                              </div>
                             ) : null}
                           </div>
                         ))}
@@ -3039,6 +3231,38 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
                 </div>
 
+                {(() => {
+                  const runningDynamicJob = selectedDynamicJobId ? activeScanJobs.get(selectedDynamicJobId) : null;
+                  if (!runningDynamicJob || (runningDynamicJob.status !== "pending" && runningDynamicJob.status !== "running")) return null;
+                  const d = runningDynamicJob.details as { total_unique_packages?: number; scanned_packages?: number } | null;
+                  return (
+                    <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+                      <div className="flex items-center justify-between gap-4">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-300">
+                          {runningDynamicJob.status === "running" ? "Scanning…" : "Starting…"}
+                        </p>
+                        {(d?.total_unique_packages ?? 0) > 0 ? (
+                          <span className="text-[11px] text-slate-400">
+                            {d?.scanned_packages ?? 0} / {d?.total_unique_packages} ({runningDynamicJob.progress.toFixed(0)}%)
+                          </span>
+                        ) : (
+                          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400/40 border-t-cyan-400" />
+                        )}
+                      </div>
+                      {(d?.total_unique_packages ?? 0) > 0 ? (
+                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                          <div
+                            className="h-full rounded-full bg-cyan-500 transition-all duration-500"
+                            style={{ width: `${runningDynamicJob.progress}%` }}
+                          />
+                        </div>
+                      ) : null}
+                      {runningDynamicJob.elapsedSeconds > 0 ? (
+                        <p className="mt-1 text-[10px] text-slate-500">Elapsed {formatDuration(runningDynamicJob.elapsedSeconds)}</p>
+                      ) : null}
+                    </div>
+                  );
+                })()}
                 <div className="space-y-4 rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Scan Results</p>
@@ -4008,7 +4232,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                             {selectedHistoryJob.error_message ? <div><p className="text-slate-500 uppercase tracking-[0.1em]">Error</p><p className="mt-1 text-rose-200">{selectedHistoryJob.error_message}</p></div> : null}
                                           </div>
                                           {selectedHistoryJob.results && selectedHistoryJob.results.length > 0 ? (
-                                            <div className="max-h-[480px] overflow-auto rounded-lg border border-slate-800">
+                                            <div>
+                                            <input
+                                              type="text"
+                                              placeholder="Filter packages…"
+                                              value={historyResultSearch}
+                                              onChange={(e) => setHistoryResultSearch(e.target.value)}
+                                              className="mb-2 w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60"
+                                            />
+                                            <div className="max-h-[68vh] overflow-auto rounded-lg border border-slate-800">
                                               <table className="w-full text-left text-[11px] text-slate-300">
                                                 <thead className="sticky top-0 bg-slate-900/80 text-slate-500">
                                                   <tr>
@@ -4021,7 +4253,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                   </tr>
                                                 </thead>
                                                 <tbody>
-                                                  {selectedHistoryJob.results.slice(0, 100).map((result) => {
+                                                  {selectedHistoryJob.results.filter(r => !historyResultSearch || r.package_name.toLowerCase().includes(historyResultSearch.toLowerCase())).map((result) => {
                                                     const cveCount = Math.max(
                                                       result.advisory_references.length,
                                                       result.vulnerability_details?.length ?? 0,
@@ -4251,6 +4483,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                 </tbody>
                                               </table>
                                             </div>
+                                            </div>
                                           ) : null}
                                         </div>
                                       ) : null}
@@ -4447,39 +4680,49 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       <div
                         key={job.jobId}
                         onClick={() => setSelectedLightweightJobId(job.jobId)}
-                        className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedLightweightJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
+                        className={`rounded-lg border px-2 py-1.5 cursor-pointer transition ${selectedLightweightJobId === job.jobId ? "border-cyan-500/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-900/60 hover:bg-slate-800/60"}`}
                       >
-                        <div className="flex items-center gap-2">
-                          {(job.status === "pending" || job.status === "running") ? (
-                            <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
-                          ) : (
-                            <span className={`h-2 w-2 rounded-full ${
-                              SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
-                              : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
-                              : "bg-slate-500"
-                            }`} />
-                          )}
-                          <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">
-                            {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
-                          </span>
-                          {(job.details as {total_unique_packages?: number} | null)?.total_unique_packages ? (
-                            <span className="text-[10px] text-slate-500">
-                              {(job.details as {scanned_packages?: number} | null)?.scanned_packages ?? 0} / {(job.details as {total_unique_packages?: number} | null)?.total_unique_packages}
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            {(job.status === "pending" || job.status === "running") ? (
+                              <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+                            ) : (
+                              <span className={`h-2 w-2 rounded-full ${
+                                SCAN_TERMINAL_DONE.has(job.status) ? "bg-emerald-400"
+                                : SCAN_TERMINAL_FAILED.has(job.status) ? "bg-rose-400"
+                                : "bg-slate-500"
+                              }`} />
+                            )}
+                            <span className="text-[10px] uppercase tracking-[0.1em] text-slate-300">
+                              {job.progress > 0 ? `${job.progress.toFixed(0)}%` : job.status}
                             </span>
-                          ) : null}
-                          {job.elapsedSeconds > 0 ? (
-                            <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                            {(job.details as {total_unique_packages?: number} | null)?.total_unique_packages ? (
+                              <span className="text-[10px] text-slate-500">
+                                {(job.details as {scanned_packages?: number} | null)?.scanned_packages ?? 0} / {(job.details as {total_unique_packages?: number} | null)?.total_unique_packages}
+                              </span>
+                            ) : null}
+                            {job.elapsedSeconds > 0 ? (
+                              <span className="text-[10px] text-slate-600">{formatDuration(job.elapsedSeconds)}</span>
+                            ) : null}
+                          </div>
+                          {(job.status === "pending" || job.status === "running") ? (
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); void cancelScanJob(job.jobId); }}
+                              disabled={isCancellingScan}
+                              className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
+                            >
+                              Stop
+                            </button>
                           ) : null}
                         </div>
-                        {(job.status === "pending" || job.status === "running") ? (
-                          <button
-                            type="button"
-                            onClick={() => { void cancelScanJob(job.jobId); }}
-                            disabled={isCancellingScan}
-                            className="text-[9px] uppercase tracking-wide text-rose-300 hover:text-rose-100"
-                          >
-                            Stop
-                          </button>
+                        {(job.status === "pending" || job.status === "running") && job.progress > 0 ? (
+                          <div className="mt-1.5 h-0.5 overflow-hidden rounded-full bg-slate-800">
+                            <div
+                              className="h-full rounded-full bg-cyan-500 transition-all duration-500"
+                              style={{ width: `${job.progress}%` }}
+                            />
+                          </div>
                         ) : null}
                       </div>
                     ))}
@@ -4776,22 +5019,84 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
             className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize transition-colors hover:bg-cyan-400/30 active:bg-cyan-400/50"
             onMouseDown={handleSidebarResizeMouseDown}
           />
-          <div className="flex items-start justify-between gap-3 border-b border-gray-800 p-4">
-            <div>
+          <div className="flex items-start justify-between gap-3 border-b border-gray-800 px-4 py-3">
+            <div className="min-w-0">
               <p className="text-sm font-semibold text-slate-100">SentinelFlow Agent</p>
-              <p className="mt-1 text-xs text-slate-400">Repository assistant</p>
+              <p className="mt-0.5 truncate text-xs text-slate-400">
+                {chatConversations.find((c) => c.id === currentConvId)?.title ?? "Repository assistant"}
+              </p>
             </div>
-            <button
-              type="button"
-              onClick={() => setIsAgentChatOpen(false)}
-              className="grid h-9 w-9 place-items-center rounded-full border border-cyan-400/40 bg-cyan-500/15 text-cyan-100 transition hover:bg-cyan-500/25"
-              aria-label="Close AI chat"
-              title="Close AI chat"
-            >
-              <span className="text-sm font-semibold leading-none">✕</span>
-            </button>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {/* New chat */}
+              <button
+                type="button"
+                onClick={startNewChat}
+                className="grid h-8 w-8 place-items-center rounded-lg border border-slate-700 bg-slate-800/60 text-slate-300 transition hover:bg-slate-700 hover:text-slate-100"
+                title="New chat"
+              >
+                <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M8 3H3a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V9" />
+                  <path d="M12 1l3 3-7 7H5v-3l7-7z" />
+                </svg>
+              </button>
+              {/* History toggle */}
+              <button
+                type="button"
+                onClick={() => setShowChatHistory((v) => !v)}
+                className={`grid h-8 w-8 place-items-center rounded-lg border transition ${
+                  showChatHistory
+                    ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-200"
+                    : "border-slate-700 bg-slate-800/60 text-slate-300 hover:bg-slate-700 hover:text-slate-100"
+                }`}
+                title="Chat history"
+              >
+                <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M1 4h14M1 8h10M1 12h7" />
+                </svg>
+              </button>
+              {/* Close */}
+              <button
+                type="button"
+                onClick={() => setIsAgentChatOpen(false)}
+                className="grid h-8 w-8 place-items-center rounded-full border border-cyan-400/40 bg-cyan-500/15 text-cyan-100 transition hover:bg-cyan-500/25"
+                aria-label="Close AI chat"
+                title="Close AI chat"
+              >
+                <span className="text-sm font-semibold leading-none">✕</span>
+              </button>
+            </div>
           </div>
 
+          {showChatHistory ? (
+            <div className="flex-1 overflow-y-auto border-b border-gray-800 bg-slate-950/80">
+              {chatConversations.length === 0 ? (
+                <p className="p-4 text-xs text-slate-500">No conversations yet.</p>
+              ) : (
+                <ul className="divide-y divide-slate-800/60">
+                  {[...chatConversations]
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((conv) => (
+                      <li key={conv.id}>
+                        <button
+                          type="button"
+                          onClick={() => switchToConversation(conv)}
+                          className={`w-full px-4 py-3 text-left transition hover:bg-slate-800/60 ${
+                            conv.id === currentConvId ? "bg-slate-800/40" : ""
+                          }`}
+                        >
+                          <p className="truncate text-xs font-medium text-slate-200">{conv.title}</p>
+                          <p className="mt-0.5 text-[10px] text-slate-500">
+                            {new Date(conv.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                            {" · "}
+                            {conv.messages.length} msg{conv.messages.length !== 1 ? "s" : ""}
+                          </p>
+                        </button>
+                      </li>
+                    ))}
+                </ul>
+              )}
+            </div>
+          ) : (
           <div className="flex-1 overflow-y-auto p-4">
             {agentMessages.length === 0 ? (
               <div className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 p-3 text-sm text-cyan-100">
@@ -4819,6 +5124,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
               </div>
             )}
           </div>
+          )}
 
           <div className="border-t border-gray-800 p-3">
             <div className="flex items-center gap-2">
