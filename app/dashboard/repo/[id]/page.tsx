@@ -7,7 +7,7 @@ import { DependencyTree } from "@/app/components/dependency-tree";
 import { DependencyNode, Ecosystem } from "@/app/types/dashboard";
 import { clientSessionStorage } from "@/app/lib/auth/client-session";
 import { createCacheKey, getCachedValue, hashString, setCachedValue } from "@/app/lib/browser-cache";
-import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, streamExplainPackage, streamAgentChat, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest } from "@/app/lib/api/scan-api";
+import { triggerScan, pollScanJob as apiPollScanJob, cancelScan as apiCancelScan, getLatestScan, getLatestScanResults, getScanHistory, generateSbom, generateCycloneDxSbom, downloadSbom, streamExplainPackage, streamAgentChat, createChatSession, listChatSessions, getChatSession, deleteChatSession, ScanApiError, ScanJobResponse, ScanResultResponse, ScanHistoryItem, SbomDocument, ScanApiContext, DynamicFinding, VulnerabilityDetail, LookupStatus, ScanMode, ExplainPackageRequest, ChatSessionSummary, ChatSessionDetail } from "@/app/lib/api/scan-api";
 import { fetchPackageDetails, type PackageDetailsResponse } from "@/app/lib/api/dependency-pr";
 import { deriveScanDisplay, computeScanProgress, normalizeLiveElapsedSeconds, SCAN_TERMINAL_DONE, SCAN_TERMINAL_FAILED, SCAN_TERMINAL_CANCELLED, isPollingStatus, normalizeScanPhase, normalizeStatusValue, normalizeLatestCompletedScan, resolvePollErrorMeta, SCAN_POLL_INTERVAL_MS, SCAN_RETRY_MAX_DELAY_MS, POLL_RETRY_SILENT_ATTEMPTS, POLL_ERROR_VISIBLE_RETRY_DELAY_MS } from "@/app/lib/scan-display";
 
@@ -51,13 +51,7 @@ type ScanResultMapEntry = {
   dynamic_findings?: DynamicFinding | null;
 };
 
-type ChatConversation = {
-  id: string;
-  title: string;
-  messages: Array<{ id: string; role: "user" | "assistant"; content: string }>;
-  createdAt: number;
-  updatedAt: number;
-};
+type ChatConversation = ChatSessionSummary;
 
 type ScanResultRow = {
   id: string;
@@ -815,23 +809,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     isMountedRef.current = true;
     setIsHydrated(true);
 
-    try {
-      const storedConvs = localStorage.getItem(`sf_chat_convs_${decodedId}`);
-      const storedActiveId = localStorage.getItem(`sf_chat_active_${decodedId}`);
-      if (storedConvs) {
-        const parsed: ChatConversation[] = JSON.parse(storedConvs);
-        setChatConversations(parsed);
-        const activeId =
-          storedActiveId && parsed.find((c) => c.id === storedActiveId)
-            ? storedActiveId
-            : (parsed[0]?.id ?? null);
-        setCurrentConvId(activeId);
-        const active = parsed.find((c) => c.id === activeId);
-        if (active) setAgentMessages(active.messages);
-      }
-    } catch {
-      // ignore malformed localStorage data
-    }
+    // Chat sessions are loaded from the backend after hydration (see loadChatSessions below)
 
     return () => {
       isMountedRef.current = false;
@@ -840,15 +818,30 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     };
   }, [decodedId]);
 
+  // Load chat sessions from the backend once the component is hydrated
   useEffect(() => {
-    if (!currentConvId || chatConversations.length === 0) return;
-    try {
-      localStorage.setItem(`sf_chat_convs_${decodedId}`, JSON.stringify(chatConversations));
-      localStorage.setItem(`sf_chat_active_${decodedId}`, currentConvId);
-    } catch {
-      // ignore quota errors
+    if (!isHydrated) return;
+    let cancelled = false;
+    async function loadSessions() {
+      try {
+        const { owner, repoName, headers } = await resolveRepoCoordinates();
+        const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+        const sessions = await listChatSessions(ctx, owner, repoName);
+        if (cancelled) return;
+        setChatConversations(sessions);
+        if (sessions.length > 0) {
+          const first = sessions[0];
+          setCurrentConvId(first.id);
+          const detail = await getChatSession(ctx, first.id);
+          if (cancelled) return;
+          setAgentMessages(detail.messages);
+        }
+      } catch { /* ignore — chat is non-critical */ }
     }
-  }, [chatConversations, currentConvId, decodedId]);
+    void loadSessions();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isHydrated]);
 
   useEffect(() => {
     setNodes([]);
@@ -1866,15 +1859,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   async function handleExplain(payload: ExplainPackageRequest): Promise<void> {
     setIsAgentChatOpen(true);
 
-    // Ensure there is an active conversation
+    const { owner, repoName, headers } = await resolveRepoCoordinates();
+    const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+
+    // Ensure there is a persistent session on the backend
     let convId = currentConvId;
     if (!convId) {
-      const newId = crypto.randomUUID();
-      const title = `Explain ${payload.package_name}@${payload.package_version}`.slice(0, 45);
-      const newConv: ChatConversation = { id: newId, title, messages: [], createdAt: Date.now(), updatedAt: Date.now() };
-      setChatConversations((prev) => [newConv, ...prev]);
-      setCurrentConvId(newId);
-      convId = newId;
+      try {
+        const title = `Explain ${payload.package_name}@${payload.package_version}`.slice(0, 45);
+        const session = await createChatSession(context, owner, repoName, title);
+        setChatConversations((prev) => [session, ...prev]);
+        setCurrentConvId(session.id);
+        convId = session.id;
+      } catch { /* ignore — continue without session */ }
     }
 
     const assistantMsgId = crypto.randomUUID();
@@ -1885,72 +1882,82 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     ]);
     setAgentIsStreaming(true);
 
-    const persistMessages = (finalMessages: Array<{ id: string; role: "user" | "assistant"; content: string }>) => {
-      setChatConversations((prev) =>
-        prev.map((c) =>
-          c.id === convId ? { ...c, messages: finalMessages, updatedAt: Date.now() } : c
-        )
-      );
+    const refreshSessions = () => {
+      void (async () => {
+        try {
+          const sessions = await listChatSessions(context, owner, repoName);
+          setChatConversations(sessions);
+        } catch { /* ignore */ }
+      })();
     };
 
     try {
-      const { owner, repoName, headers } = await resolveRepoCoordinates();
-      const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
       await streamExplainPackage(context, payload, {
         onToken: (token) =>
           setAgentMessages((prev) =>
             prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
           ),
         onDone: () => {
-          setAgentMessages((prev) => {
-            const final = prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m));
-            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
-            return final;
-          });
+          setAgentMessages((prev) =>
+            prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m))
+          );
+          refreshSessions();
         },
         onError: (msg) => {
-          setAgentMessages((prev) => {
-            const final = prev.map((m) =>
+          setAgentMessages((prev) =>
+            prev.map((m) =>
               m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-            );
-            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
-            return final;
-          });
+            )
+          );
         },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "AI explanation failed.";
-      setAgentMessages((prev) => {
-        const final = prev.map((m) =>
+      setAgentMessages((prev) =>
+        prev.map((m) =>
           m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-        );
-        persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
-        return final;
-      });
+        )
+      );
     } finally {
       setAgentIsStreaming(false);
     }
   }
 
-  function startNewChat() {
-    const id = crypto.randomUUID();
-    const conv: ChatConversation = {
-      id,
-      title: "New conversation",
-      messages: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    setChatConversations((prev) => [conv, ...prev]);
-    setCurrentConvId(id);
-    setAgentMessages([]);
-    setShowChatHistory(false);
+  async function startNewChat(): Promise<void> {
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const session = await createChatSession(ctx, owner, repoName, "New conversation");
+      setChatConversations((prev) => [session, ...prev]);
+      setCurrentConvId(session.id);
+      setAgentMessages([]);
+      setShowChatHistory(false);
+    } catch { /* ignore */ }
   }
 
-  function switchToConversation(conv: ChatConversation) {
+  async function switchToConversation(conv: ChatConversation): Promise<void> {
     setCurrentConvId(conv.id);
-    setAgentMessages(conv.messages);
     setShowChatHistory(false);
+    setAgentMessages([]);
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const detail: ChatSessionDetail = await getChatSession(ctx, conv.id);
+      setAgentMessages(detail.messages);
+    } catch { /* ignore */ }
+  }
+
+  async function deleteConversation(sessionId: string): Promise<void> {
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const ctx: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      await deleteChatSession(ctx, sessionId);
+      setChatConversations((prev) => prev.filter((s) => s.id !== sessionId));
+      if (currentConvId === sessionId) {
+        setCurrentConvId(null);
+        setAgentMessages([]);
+      }
+    } catch { /* ignore */ }
   }
 
   async function handleAgentSend(): Promise<void> {
@@ -1958,20 +1965,20 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     if (!text || agentIsStreaming) return;
     setAgentInput("");
 
-    // Ensure there is an active conversation
+    const { owner, repoName, headers } = await resolveRepoCoordinates();
+    const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+
+    // Ensure there is a persistent session on the backend
     let convId = currentConvId;
     if (!convId) {
-      const newId = crypto.randomUUID();
-      const newConv: ChatConversation = {
-        id: newId,
-        title: text.slice(0, 45),
-        messages: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      setChatConversations((prev) => [newConv, ...prev]);
-      setCurrentConvId(newId);
-      convId = newId;
+      try {
+        const session = await createChatSession(context, owner, repoName, text.slice(0, 45));
+        setChatConversations((prev) => [session, ...prev]);
+        setCurrentConvId(session.id);
+        convId = session.id;
+      } catch {
+        // If session creation fails, continue in stateless mode
+      }
     }
 
     const assistantMsgId = crypto.randomUUID();
@@ -1985,56 +1992,51 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     ]);
     setAgentIsStreaming(true);
 
-    const persistMessages = (finalMessages: Array<{ id: string; role: "user" | "assistant"; content: string }>) => {
-      setChatConversations((prev) =>
-        prev.map((c) =>
-          c.id === convId
-            ? {
-                ...c,
-                messages: finalMessages,
-                title: c.title === "New conversation" ? text.slice(0, 45) : c.title,
-                updatedAt: Date.now(),
-              }
-            : c
-        )
-      );
+    // Refresh the session list after streaming to update title and message_count
+    const refreshSessions = () => {
+      void (async () => {
+        try {
+          const sessions = await listChatSessions(context, owner, repoName);
+          setChatConversations(sessions);
+        } catch { /* ignore */ }
+      })();
     };
 
     try {
-      const { owner, repoName, headers } = await resolveRepoCoordinates();
-      const context: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
       const chatHistory = updatedMessages.map(({ role, content }) => ({ role, content }));
-      await streamAgentChat(context, chatHistory, buildScanContextSummary(), {
-        onToken: (token) =>
-          setAgentMessages((prev) =>
-            prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
-          ),
-        onDone: () => {
-          setAgentMessages((prev) => {
-            const final = prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m));
-            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
-            return final;
-          });
-        },
-        onError: (msg) => {
-          setAgentMessages((prev) => {
-            const final = prev.map((m) =>
-              m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
+      await streamAgentChat(
+        context,
+        chatHistory,
+        buildScanContextSummary(),
+        {
+          onToken: (token) =>
+            setAgentMessages((prev) =>
+              prev.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + token } : m))
+            ),
+          onDone: () => {
+            setAgentMessages((prev) =>
+              prev.map((m) => (m.id === assistantMsgId ? { ...m, streaming: false } : m))
             );
-            persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
-            return final;
-          });
+            refreshSessions();
+          },
+          onError: (msg) => {
+            setAgentMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
+              )
+            );
+          },
         },
-      });
+        undefined,
+        convId ?? undefined,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Chat failed.";
-      setAgentMessages((prev) => {
-        const final = prev.map((m) =>
+      setAgentMessages((prev) =>
+        prev.map((m) =>
           m.id === assistantMsgId ? { ...m, content: `⚠ ${msg}`, streaming: false } : m
-        );
-        persistMessages(final.map(({ id, role, content }) => ({ id, role, content })));
-        return final;
-      });
+        )
+      );
     } finally {
       setAgentIsStreaming(false);
     }
@@ -2491,7 +2493,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     risk_status: scanEntry?.risk_overall_status ?? null,
                                     risk_score: scanEntry?.risk_overall_score ?? null,
                                     static_features: graphDetailNode.features,
-                                    vulnerability_details: scanEntry?.vulnerability_details ?? null,
+                                    vulnerability_details: scanEntry?.vulnerability_details ?? [],
                                     dynamic_findings: scanEntry?.dynamic_findings ?? null,
                                     reputation_metadata: scanEntry?.reputation_metadata ?? null,
                                   })}
@@ -5030,7 +5032,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
               {/* New chat */}
               <button
                 type="button"
-                onClick={startNewChat}
+                onClick={() => void startNewChat()}
                 className="grid h-8 w-8 place-items-center rounded-lg border border-slate-700 bg-slate-800/60 text-slate-300 transition hover:bg-slate-700 hover:text-slate-100"
                 title="New chat"
               >
@@ -5074,22 +5076,30 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
               ) : (
                 <ul className="divide-y divide-slate-800/60">
                   {[...chatConversations]
-                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
                     .map((conv) => (
-                      <li key={conv.id}>
+                      <li key={conv.id} className="flex items-stretch">
                         <button
                           type="button"
-                          onClick={() => switchToConversation(conv)}
-                          className={`w-full px-4 py-3 text-left transition hover:bg-slate-800/60 ${
+                          onClick={() => void switchToConversation(conv)}
+                          className={`flex-1 px-4 py-3 text-left transition hover:bg-slate-800/60 ${
                             conv.id === currentConvId ? "bg-slate-800/40" : ""
                           }`}
                         >
-                          <p className="truncate text-xs font-medium text-slate-200">{conv.title}</p>
+                          <p className="truncate text-xs font-medium text-slate-200">{conv.title ?? "Untitled"}</p>
                           <p className="mt-0.5 text-[10px] text-slate-500">
-                            {new Date(conv.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                            {new Date(conv.updated_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                             {" · "}
-                            {conv.messages.length} msg{conv.messages.length !== 1 ? "s" : ""}
+                            {conv.message_count} msg{conv.message_count !== 1 ? "s" : ""}
                           </p>
+                        </button>
+                        <button
+                          type="button"
+                          title="Delete conversation"
+                          onClick={() => void deleteConversation(conv.id)}
+                          className="px-3 text-slate-600 transition hover:text-rose-400"
+                        >
+                          ✕
                         </button>
                       </li>
                     ))}
