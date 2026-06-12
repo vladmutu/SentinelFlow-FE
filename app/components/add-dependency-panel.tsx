@@ -9,14 +9,16 @@ import {
   DependencyApiError,
   fetchPackageVersions as fetchPackageVersionsApi,
   mapDependencyApiError,
+  prescanDependencies as prescanDependenciesApi,
   type CreateDependencyPrRequest,
   type CreateDependencyPrResponse,
   type DependencyDraft,
   type PackagePrescanResult,
   type PackageSearchResult,
+  type PrescanResponse,
   searchPackages as searchPackagesApi,
 } from "@/app/lib/api/dependency-pr";
-import { checkDependencyCompatibility, type CompatibilityCheckResponse } from "@/app/lib/api/scan-api";
+import { checkDependencyCompatibility, type CompatibilityCheckResponse, type ExplainPackageRequest } from "@/app/lib/api/scan-api";
 
 type RepoCoordinates = {
   owner: string;
@@ -28,6 +30,7 @@ type DependencyApiClient = {
   searchPackages: typeof searchPackagesApi;
   fetchPackageVersions: typeof fetchPackageVersionsApi;
   createDependencyPr: typeof createDependencyPrApi;
+  prescanDependencies: typeof prescanDependenciesApi;
 };
 
 type SelectionEntry = {
@@ -43,6 +46,8 @@ interface AddDependencyPanelProps {
   resolveRepoCoordinates: () => Promise<RepoCoordinates>;
   className?: string;
   client?: DependencyApiClient;
+  /** Opens the AI side panel to explain a scanned package. */
+  onExplain?: (payload: ExplainPackageRequest) => void;
 }
 
 const SEARCH_DEBOUNCE_MS = 150;
@@ -52,7 +57,37 @@ const defaultDependencyApiClient: DependencyApiClient = {
   searchPackages: searchPackagesApi,
   fetchPackageVersions: fetchPackageVersionsApi,
   createDependencyPr: createDependencyPrApi,
+  prescanDependencies: prescanDependenciesApi,
 };
+
+// Map a prescan result into the AI "explain" request shape.
+function prescanToExplainRequest(
+  result: PackagePrescanResult,
+  ecosystem: Ecosystem,
+): ExplainPackageRequest {
+  return {
+    package_name: result.package_name,
+    package_version: result.package_version,
+    ecosystem,
+    malware_status: result.overall_status,
+    malware_score: result.overall_score,
+    risk_status: result.overall_status,
+    risk_score: result.overall_score,
+    static_features: result.static_features,
+    vulnerability_details: result.advisory_references.map((ref) => ({
+      advisory_id: ref,
+      source: "advisory",
+    })),
+    dynamic_findings: result.dynamic_status
+      ? {
+          status: result.dynamic_status,
+          risk_score: result.dynamic_risk_score,
+          vm_evasion_observed: result.vm_evasion_observed ?? undefined,
+          ioc_hit: result.ioc_hit ?? undefined,
+        }
+      : null,
+  };
+}
 
 function getTyposquatSeverity(confidence: number): "high" | "medium" {
   return confidence >= 0.75 ? "high" : "medium";
@@ -221,6 +256,7 @@ export function AddDependencyPanel({
   resolveRepoCoordinates,
   className,
   client,
+  onExplain,
 }: AddDependencyPanelProps) {
   const apiClient = useMemo(() => client ?? defaultDependencyApiClient, [client]);
   const selectableEcosystems = useMemo(() => {
@@ -251,7 +287,11 @@ export function AddDependencyPanel({
   const [submitLoading, setSubmitLoading] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitSuccess, setSubmitSuccess] = useState<CreateDependencyPrResponse | null>(null);
-  const [showScanResults, setShowScanResults] = useState(false);
+  // Two-step flow: scan first (no PR), then create the PR explicitly.
+  const [prescan, setPrescan] = useState<PrescanResponse | null>(null);
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [showScanResults, setShowScanResults] = useState(true);
   const [expandedScanResultId, setExpandedScanResultId] = useState<string | null>(null);
   const [compatibilityResult, setCompatibilityResult] = useState<CompatibilityCheckResponse | null>(null);
   const [isCheckingCompat, setIsCheckingCompat] = useState(false);
@@ -606,8 +646,60 @@ export function AddDependencyPanel({
     }
   }, [apiBaseUrl, ecosystem, isCheckingCompat, resolveRepoCoordinates, selection]);
 
+  // Step 1: run the security scan only. No PR is created here, so an accidental
+  // click can never open a PR or kick off a webhook scan. A confirmed malicious
+  // package surfaces as a 400 error from the backend.
+  const scanSelection = useCallback(async () => {
+    if (scanLoading || selection.length === 0) {
+      return;
+    }
+
+    const safeBaseUrl = apiBaseUrl?.trim();
+    if (!safeBaseUrl) {
+      setScanError("Missing NEXT_PUBLIC_API_URL configuration.");
+      return;
+    }
+
+    setScanLoading(true);
+    setScanError(null);
+    setPrescan(null);
+    setSubmitSuccess(null);
+    setSubmitError(null);
+
+    try {
+      const repo = await resolveRepoCoordinates();
+      const dependencies: DependencyDraft[] = selection.map((entry) => ({
+        name: entry.name,
+        version: normalizeVersionForEcosystem(ecosystem, entry.version),
+      }));
+
+      const result = await apiClient.prescanDependencies(
+        { baseUrl: safeBaseUrl, authHeaders: repo.headers },
+        repo.owner,
+        repo.repoName,
+        { ecosystem, dependencies },
+      );
+
+      setPrescan(result);
+      setShowScanResults(true);
+      setExpandedScanResultId(null);
+    } catch (error) {
+      setScanError(mapDependencyApiError(error));
+    } finally {
+      setScanLoading(false);
+    }
+  }, [apiBaseUrl, apiClient, ecosystem, resolveRepoCoordinates, scanLoading, selection]);
+
+  const prescanHasMalicious = useMemo(
+    () => (prescan?.prescan_results ?? []).some((r) => r.overall_status === "malicious"),
+    [prescan],
+  );
+
+  // Step 2: create the PR. Packages were already scanned in step 1, so the
+  // backend skips the (potentially long) re-scan and embeds the scan summary
+  // into the PR body.
   const submitSelection = useCallback(async () => {
-    if (submitLoading || selection.length === 0) {
+    if (submitLoading || selection.length === 0 || !prescan || prescanHasMalicious) {
       return;
     }
 
@@ -633,6 +725,9 @@ export function AddDependencyPanel({
         ecosystem,
         dependencies,
         idempotency_key: createDependencyIdempotencyKey(repo.owner, repo.repoName),
+        // Already scanned in step 1 — don't re-run the heavy pipeline.
+        run_prescan: false,
+        scan_summary_markdown: prescan.scan_summary_markdown,
       };
 
       if (ecosystem === "npm") {
@@ -666,6 +761,7 @@ export function AddDependencyPanel({
 
       setSubmitSuccess(response);
       setSelection([]);
+      setPrescan(null);
       setPendingSuspicious(null);
     } catch (error) {
       setSubmitError(mapDependencyApiError(error));
@@ -678,14 +774,22 @@ export function AddDependencyPanel({
     branchName,
     ecosystem,
     prBody,
+    prescan,
+    prescanHasMalicious,
     prTitle,
     resolveRepoCoordinates,
     selection,
     submitLoading,
   ]);
 
+  // Any change to the selection invalidates a prior scan result (the user must
+  // re-scan before creating a PR). Note: submitSelection clears the selection on
+  // success, so we must NOT clear submitSuccess here or the "PR created" banner
+  // would be wiped immediately.
   useEffect(() => {
     setCompatibilityResult(null);
+    setPrescan(null);
+    setScanError(null);
   }, [selection]);
 
   const handleSuggestionSearch = useCallback((suggestion: string) => {
@@ -1057,6 +1161,154 @@ export function AddDependencyPanel({
             />
           </div>
 
+          {scanError ? (
+            <div className="mt-3 rounded-lg border border-rose-400/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
+              {scanError}
+            </div>
+          ) : null}
+
+          {prescan ? (
+            <div className="mt-3 rounded-lg border border-slate-700 bg-slate-900/50 px-3 py-3 text-xs">
+              <button
+                type="button"
+                onClick={() => setShowScanResults((v) => !v)}
+                className="flex w-full items-center justify-between gap-2 text-left"
+              >
+                <span className="font-semibold uppercase tracking-[0.12em] text-slate-300">
+                  Security Scan Results · {prescan.prescan_results.length} package(s)
+                </span>
+                <span className="text-slate-500">{showScanResults ? "▲" : "▼"}</span>
+              </button>
+              {prescanHasMalicious ? (
+                <p className="mt-2 rounded-md border border-rose-400/40 bg-rose-500/10 px-2 py-1.5 text-rose-100">
+                  A malicious package was detected — PR creation is blocked until it is removed.
+                </p>
+              ) : null}
+              {showScanResults ? (
+                <div className="mt-2 space-y-1.5">
+                  {prescan.prescan_results.map((result: PackagePrescanResult) => {
+                    const resultId = `${result.package_name}@${result.package_version}`;
+                    const isExpanded = expandedScanResultId === resultId;
+                    const verdict = result.overall_status;
+                    const verdictCls =
+                      verdict === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                      : verdict === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
+                      : verdict === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
+                      : "border-slate-600/50 bg-slate-800/30 text-slate-400";
+                    return (
+                      <div key={resultId} className="rounded-lg border border-slate-700 bg-slate-900/60 text-xs">
+                        <div className="flex items-stretch">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedScanResultId(isExpanded ? null : resultId)}
+                            className="flex-1 p-2.5 text-left"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono text-slate-200">
+                                {result.package_name}
+                                <span className="text-slate-500">@{result.package_version}</span>
+                              </span>
+                              <div className="flex items-center gap-1.5">
+                                <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase ${verdictCls}`}>
+                                  {verdict}
+                                </span>
+                                <span className="text-[10px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
+                              </div>
+                            </div>
+                            {(result.overall_score != null || result.cve_count > 0) ? (
+                              <p className="mt-0.5 text-[10px] text-slate-500">
+                                {result.overall_score != null ? `Risk: ${(result.overall_score * 100).toFixed(1)}%` : ""}
+                                {result.overall_score != null && result.cve_count > 0 ? " · " : ""}
+                                {result.cve_count > 0 ? `${result.cve_count} CVE(s)` : ""}
+                              </p>
+                            ) : null}
+                          </button>
+                          {onExplain ? (
+                            <button
+                              type="button"
+                              onClick={() => onExplain(prescanToExplainRequest(result, ecosystem))}
+                              title="Ask AI to explain this package"
+                              className="flex shrink-0 items-center gap-1 border-l border-slate-700 px-2.5 text-[10px] font-semibold uppercase tracking-wide text-violet-300 transition hover:bg-violet-500/10 hover:text-violet-200"
+                            >
+                              <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                                <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
+                              </svg>
+                              Ask AI
+                            </button>
+                          ) : null}
+                        </div>
+                        {isExpanded ? (
+                          <div className="space-y-2 border-t border-slate-700/60 px-2.5 pb-2.5 pt-2">
+                            {result.advisory_references.length > 0 ? (
+                              <div>
+                                <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE / Advisory References</p>
+                                <div className="flex flex-wrap gap-1">
+                                  {result.advisory_references.map((ref) => (
+                                    <span key={ref} className="rounded border border-amber-400/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">{ref}</span>
+                                  ))}
+                                </div>
+                              </div>
+                            ) : null}
+                            {result.static_features && Object.keys(result.static_features).length > 0 ? (
+                              <div>
+                                <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Static Features</p>
+                                <div className="grid grid-cols-2 gap-1">
+                                  {Object.entries(result.static_features).slice(0, 6).map(([k, v]) => (
+                                    <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1">
+                                      <p className="text-[9px] uppercase tracking-wide text-slate-500">{k.replace(/_/g, " ")}</p>
+                                      <p className="mt-0.5 font-mono text-[10px] text-slate-200">
+                                        {v >= 0 && v <= 1 ? `${(v * 100).toFixed(1)}%` : String(v)}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            ) : null}
+                            {result.dynamic_status && result.dynamic_status !== "skipped" ? (
+                              <div>
+                                <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Dynamic Analysis</p>
+                                <div className="grid grid-cols-2 gap-1">
+                                  {([
+                                    ["Status", result.dynamic_status],
+                                    ["Risk Score", result.dynamic_risk_score != null ? `${(result.dynamic_risk_score * 100).toFixed(1)}%` : null],
+                                    ["VM Evasion", result.vm_evasion_observed != null ? (result.vm_evasion_observed ? "Detected" : "None") : null],
+                                    ["IOC Hit", result.ioc_hit != null ? (result.ioc_hit ? "Yes" : "None") : null],
+                                  ] as [string, string | null][])
+                                    .filter(([, v]) => v !== null)
+                                    .map(([label, value]) => (
+                                      <div key={label} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1">
+                                        <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
+                                        <p className={`mt-0.5 font-mono text-[10px] ${(label === "VM Evasion" || label === "IOC Hit") && value !== "None" ? "text-rose-300" : "text-slate-200"}`}>{value}</p>
+                                      </div>
+                                    ))}
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
+              {prescan.typosquat_warnings.length > 0 ? (
+                <div className="mt-3 rounded-md border border-amber-300/35 bg-amber-500/10 px-3 py-2">
+                  <p className="font-semibold uppercase tracking-[0.12em] text-amber-200">Typosquat warnings</p>
+                  <ul className="mt-2 space-y-2">
+                    {prescan.typosquat_warnings.map((warning) => (
+                      <li key={warning.package_name} className="text-amber-100/90">
+                        <span className="font-medium">{warning.package_name}</span>
+                        {warning.reasons[0] ? (
+                          <p className="mt-0.5 text-[11px] text-amber-100/75">{warning.reasons[0]}</p>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           {submitSuccess ? (
             <div className="mt-3 rounded-lg border border-emerald-300/35 bg-emerald-500/10 px-3 py-3 text-xs text-emerald-100">
               <p className="font-semibold uppercase tracking-[0.12em]">PR request accepted</p>
@@ -1069,110 +1321,6 @@ export function AddDependencyPanel({
               ) : null}
               {submitSuccess.status ? <p className="mt-1">Status: {submitSuccess.status}</p> : null}
               {submitSuccess.message ? <p className="mt-1">{submitSuccess.message}</p> : null}
-              {submitSuccess.prescan_results && submitSuccess.prescan_results.length > 0 ? (
-                <div className="mt-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowScanResults((v) => !v)}
-                    className="flex w-full items-center justify-between gap-2 rounded-lg border border-slate-600/60 bg-slate-800/50 px-3 py-2 text-left text-xs transition hover:bg-slate-700/50"
-                  >
-                    <span className="font-semibold uppercase tracking-[0.12em] text-slate-300">Security Scan Results</span>
-                    <span className="text-slate-500">{showScanResults ? "▲" : "▼"}</span>
-                  </button>
-                  {showScanResults ? (
-                    <div className="mt-2 space-y-1.5">
-                      {submitSuccess.prescan_results.map((result: PackagePrescanResult) => {
-                        const resultId = `${result.package_name}@${result.package_version}`;
-                        const isExpanded = expandedScanResultId === resultId;
-                        const verdict = result.overall_status;
-                        const verdictCls =
-                          verdict === "malicious" ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
-                          : verdict === "suspicious" ? "border-amber-400/50 bg-amber-500/15 text-amber-200"
-                          : verdict === "clean" ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-200"
-                          : "border-slate-600/50 bg-slate-800/30 text-slate-400";
-                        return (
-                          <div key={resultId} className="rounded-lg border border-slate-700 bg-slate-900/60 text-xs">
-                            <button
-                              type="button"
-                              onClick={() => setExpandedScanResultId(isExpanded ? null : resultId)}
-                              className="w-full p-2.5 text-left"
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="font-mono text-slate-200">
-                                  {result.package_name}
-                                  <span className="text-slate-500">@{result.package_version}</span>
-                                </span>
-                                <div className="flex items-center gap-1.5">
-                                  <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase ${verdictCls}`}>
-                                    {verdict}
-                                  </span>
-                                  <span className="text-[10px] text-slate-500">{isExpanded ? "▲" : "▼"}</span>
-                                </div>
-                              </div>
-                              {(result.overall_score != null || result.cve_count > 0) ? (
-                                <p className="mt-0.5 text-[10px] text-slate-500">
-                                  {result.overall_score != null ? `Risk: ${(result.overall_score * 100).toFixed(1)}%` : ""}
-                                  {result.overall_score != null && result.cve_count > 0 ? " · " : ""}
-                                  {result.cve_count > 0 ? `${result.cve_count} CVE(s)` : ""}
-                                </p>
-                              ) : null}
-                            </button>
-                            {isExpanded ? (
-                              <div className="space-y-2 border-t border-slate-700/60 px-2.5 pb-2.5 pt-2">
-                                {result.advisory_references.length > 0 ? (
-                                  <div>
-                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">CVE / Advisory References</p>
-                                    <div className="flex flex-wrap gap-1">
-                                      {result.advisory_references.map((ref) => (
-                                        <span key={ref} className="rounded border border-amber-400/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">{ref}</span>
-                                      ))}
-                                    </div>
-                                  </div>
-                                ) : null}
-                                {result.static_features && Object.keys(result.static_features).length > 0 ? (
-                                  <div>
-                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Static Features</p>
-                                    <div className="grid grid-cols-2 gap-1">
-                                      {Object.entries(result.static_features).slice(0, 6).map(([k, v]) => (
-                                        <div key={k} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1">
-                                          <p className="text-[9px] uppercase tracking-wide text-slate-500">{k.replace(/_/g, " ")}</p>
-                                          <p className="mt-0.5 font-mono text-[10px] text-slate-200">
-                                            {v >= 0 && v <= 1 ? `${(v * 100).toFixed(1)}%` : String(v)}
-                                          </p>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  </div>
-                                ) : null}
-                                {result.dynamic_status && result.dynamic_status !== "skipped" ? (
-                                  <div>
-                                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Dynamic Analysis</p>
-                                    <div className="grid grid-cols-2 gap-1">
-                                      {([
-                                        ["Status", result.dynamic_status],
-                                        ["Risk Score", result.dynamic_risk_score != null ? `${(result.dynamic_risk_score * 100).toFixed(1)}%` : null],
-                                        ["VM Evasion", result.vm_evasion_observed != null ? (result.vm_evasion_observed ? "Detected" : "None") : null],
-                                        ["IOC Hit", result.ioc_hit != null ? (result.ioc_hit ? "Yes" : "None") : null],
-                                      ] as [string, string | null][])
-                                        .filter(([, v]) => v !== null)
-                                        .map(([label, value]) => (
-                                          <div key={label} className="rounded border border-slate-700/60 bg-slate-900/60 px-2 py-1">
-                                            <p className="text-[9px] uppercase tracking-wide text-slate-500">{label}</p>
-                                            <p className={`mt-0.5 font-mono text-[10px] ${(label === "VM Evasion" || label === "IOC Hit") && value !== "None" ? "text-rose-300" : "text-slate-200"}`}>{value}</p>
-                                          </div>
-                                        ))}
-                                    </div>
-                                  </div>
-                                ) : null}
-                              </div>
-                            ) : null}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
               {submitSuccess.typosquat_warnings && submitSuccess.typosquat_warnings.length > 0 ? (
                 <div className="mt-3 rounded-md border border-amber-300/35 bg-amber-500/10 px-3 py-2">
                   <p className="font-semibold uppercase tracking-[0.12em] text-amber-200">Typosquat warnings</p>
@@ -1235,16 +1383,31 @@ export function AddDependencyPanel({
             </div>
           ) : null}
 
+          {/* Step 1 — scan only (never opens a PR). */}
           <button
             type="button"
             onClick={() => {
-              void submitSelection();
+              void scanSelection();
             }}
-            disabled={submitLoading || selection.length === 0}
+            disabled={scanLoading || submitLoading || selection.length === 0}
             className="mt-4 inline-flex w-full items-center justify-center rounded-lg border border-cyan-400/55 bg-cyan-500/15 px-4 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-cyan-100 transition hover:bg-cyan-500/30 disabled:cursor-not-allowed disabled:opacity-55"
           >
-            {submitLoading ? "Creating PR..." : "Create Dependency PR"}
+            {scanLoading ? "Scanning..." : prescan ? "Re-scan packages" : "Scan packages"}
           </button>
+
+          {/* Step 2 — create the PR (enabled only after a clean/suspicious scan). */}
+          {prescan && !prescanHasMalicious ? (
+            <button
+              type="button"
+              onClick={() => {
+                void submitSelection();
+              }}
+              disabled={submitLoading || selection.length === 0}
+              className="mt-2 inline-flex w-full items-center justify-center rounded-lg border border-emerald-400/55 bg-emerald-500/15 px-4 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-emerald-100 transition hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-55"
+            >
+              {submitLoading ? "Creating PR..." : "Create Dependency PR"}
+            </button>
+          ) : null}
         </section>
       </div>
     </div>

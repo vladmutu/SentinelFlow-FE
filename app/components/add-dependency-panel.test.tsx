@@ -55,6 +55,14 @@ function makeSearchResponse(overrides?: Partial<PackageSearchResponse>): Package
   };
 }
 
+function makePrescanResponse() {
+  return {
+    prescan_results: [],
+    typosquat_warnings: [],
+    scan_summary_markdown: "### SentinelFlow Dependency Scan\n\nclean",
+  };
+}
+
 function makeResult(index: number, version: string | null = `1.0.${index}`) {
   return {
     ecosystem: "npm" as const,
@@ -91,7 +99,7 @@ describe("AddDependencyPanel", () => {
         apiBaseUrl="http://localhost:8000"
         initialEcosystem="npm"
         resolveRepoCoordinates={async () => ({ owner: "octo", repoName: "repo", headers: {} })}
-        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr, prescanDependencies: vi.fn().mockResolvedValue(makePrescanResponse()) }}
       />,
     );
 
@@ -211,7 +219,7 @@ describe("AddDependencyPanel", () => {
         apiBaseUrl="http://localhost:8000"
         initialEcosystem="npm"
         resolveRepoCoordinates={async () => ({ owner: "octo", repoName: "repo", headers: {} })}
-        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr, prescanDependencies: vi.fn().mockResolvedValue(makePrescanResponse()) }}
       />,
     );
 
@@ -291,7 +299,7 @@ describe("AddDependencyPanel", () => {
         apiBaseUrl="http://localhost:8000"
         initialEcosystem="npm"
         resolveRepoCoordinates={async () => ({ owner: "octo", repoName: "repo", headers: {} })}
-        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr, prescanDependencies: vi.fn().mockResolvedValue(makePrescanResponse()) }}
       />,
     );
 
@@ -348,7 +356,7 @@ describe("AddDependencyPanel", () => {
         initialEcosystem="pypi"
         allowedEcosystems={["pypi"]}
         resolveRepoCoordinates={async () => ({ owner: "octo", repoName: "repo", headers: {} })}
-        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr, prescanDependencies: vi.fn().mockResolvedValue(makePrescanResponse()) }}
       />,
     );
 
@@ -408,7 +416,7 @@ describe("AddDependencyPanel", () => {
           repoName: "repo",
           headers: { Authorization: "Bearer token" },
         })}
-        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr, prescanDependencies: vi.fn().mockResolvedValue(makePrescanResponse()) }}
       />,
     );
 
@@ -417,7 +425,8 @@ describe("AddDependencyPanel", () => {
 
     await user.click(await screen.findByRole("button", { name: "Select" }));
     await user.selectOptions(await screen.findByLabelText("Version"), "19.1.0");
-    await user.click(screen.getByRole("button", { name: "Create Dependency PR" }));
+    await user.click(screen.getByRole("button", { name: "Scan packages" }));
+    await user.click(await screen.findByRole("button", { name: "Create Dependency PR" }));
 
     await waitFor(() => expect(createDependencyPr).toHaveBeenCalledTimes(1));
 
@@ -425,6 +434,7 @@ describe("AddDependencyPanel", () => {
     expect(payload.ecosystem).toBe("npm");
     expect(payload.dependencies).toEqual([{ name: "react", version: "19.1.0" }]);
     expect(payload.generate_lockfile_server_side).toBe(true);
+    expect(payload.run_prescan).toBe(false);
     expect(typeof payload.idempotency_key).toBe("string");
     expect(payload.idempotency_key).toContain("dep-add-octo-repo");
   });
@@ -466,7 +476,7 @@ describe("AddDependencyPanel", () => {
         apiBaseUrl="http://localhost:8000"
         initialEcosystem="npm"
         resolveRepoCoordinates={async () => ({ owner: "octo", repoName: "repo", headers: {} })}
-        client={{ searchPackages, fetchPackageVersions, createDependencyPr }}
+        client={{ searchPackages, fetchPackageVersions, createDependencyPr, prescanDependencies: vi.fn().mockResolvedValue(makePrescanResponse()) }}
       />,
     );
 
@@ -474,14 +484,16 @@ describe("AddDependencyPanel", () => {
     await user.type(screen.getByLabelText("Search package"), "react");
 
     await user.click(await screen.findByRole("button", { name: "Select" }));
-    await user.click(screen.getByRole("button", { name: "Create Dependency PR" }));
+    await user.click(screen.getByRole("button", { name: "Scan packages" }));
+    await user.click(await screen.findByRole("button", { name: "Create Dependency PR" }));
 
     expect(await screen.findByText(/PR #10/i)).toBeInTheDocument();
 
     await user.type(screen.getByLabelText("Search package"), "react");
     const selectButtons = await screen.findAllByRole("button", { name: "Select" });
     await user.click(selectButtons[0]);
-    await user.click(screen.getByRole("button", { name: "Create Dependency PR" }));
+    await user.click(screen.getByRole("button", { name: "Scan packages" }));
+    await user.click(await screen.findByRole("button", { name: "Create Dependency PR" }));
 
     expect(await screen.findByText(/Dependency PR conflict/i)).toBeInTheDocument();
   });

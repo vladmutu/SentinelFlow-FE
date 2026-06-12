@@ -137,6 +137,24 @@ function coerceNonNegativeNumber(value: unknown): number | null {
   return value;
 }
 
+// Map a scan mode back to the tab whose panel owns/displays that scan, so a
+// resumed in-progress job reappears in the right place.
+function sourceTabForMode(
+  mode: ScanMode | "unknown",
+): "graph" | "static-analysis" | "dynamic-analysis" | "lightweight" {
+  switch (mode) {
+    case "dynamic":
+      return "dynamic-analysis";
+    case "static":
+    case "static_enrichment":
+      return "static-analysis";
+    case "lightweight":
+      return "lightweight";
+    default:
+      return "graph";
+  }
+}
+
 function formatDuration(totalSeconds: number): string {
   const safeSeconds = Math.max(0, Math.floor(totalSeconds));
   const hours = Math.floor(safeSeconds / 3600);
@@ -684,6 +702,8 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const [activeScanMode, setActiveScanMode] = useState<ScanMode>("full");
   const [forceRescan, setForceRescan] = useState(false);
   const [graphScanPackageSearch, setGraphScanPackageSearch] = useState("");
+  const [graphScanCardCollapsed, setGraphScanCardCollapsed] = useState(false);
+  const [scannedResultsSearch, setScannedResultsSearch] = useState("");
   const isMountedRef = useRef(true);
   const scanPollTimersRef = useRef<Map<string, number>>(new Map());
   const elapsedTickersRef = useRef<Map<string, number>>(new Map());
@@ -719,6 +739,17 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
   const liveFailedRowsCount = useMemo(
     () => scanResultRows.filter((row) => row.errorMessage !== null || row.status === "failed").length,
     [scanResultRows],
+  );
+  const filteredScanResultRows = useMemo(() => {
+    const query = scannedResultsSearch.trim().toLowerCase();
+    if (!query) return scanResultRows;
+    return scanResultRows.filter((row) =>
+      `${row.packageName}@${row.version}`.toLowerCase().includes(query),
+    );
+  }, [scanResultRows, scannedResultsSearch]);
+  const hasRunningHistoryJob = useMemo(
+    () => scanHistoryJobs.some((j) => j.status === "running" || j.status === "pending"),
+    [scanHistoryJobs],
   );
   const canCancelScan = primaryJob !== null &&
     (primaryJob.status === "pending" || primaryJob.status === "running");
@@ -1250,6 +1281,11 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
         if (Array.isArray(payload.results)) {
           const liveResults = normalizeScanResultsPayload({ results: payload.results });
           appendLiveResultRows(liveResults.rows);
+          // Merge partial results into the verdict map so the dependency-graph
+          // overlay updates live while the scan is still running.
+          if (liveResults.rows.length > 0) {
+            setScanResultsMap(prev => ({ ...prev, ...liveResults.map }));
+          }
         }
 
         if (SCAN_TERMINAL_DONE.has(statusValue)) {
@@ -1494,6 +1530,56 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [pollScanJob, resolveRepoCoordinates, selectedAnalysisPackages]);
 
+  // Force a full dynamic (sandbox) analysis on a single package, regardless of
+  // the reputation/score gating that normally skips dynamic analysis for popular
+  // packages. Lets the user deep-inspect anything by hand.
+  const triggerSinglePackageDeepScan = useCallback(async (packageLabel: string) => {
+    setScanError(null);
+    liveResultKeysRef.current = new Set();
+    try {
+      const { owner, repoName, headers, ecosystem } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL!, authHeaders: headers, owner, repoName };
+      const triggerPayload = await triggerScan(scanContext, {
+        ecosystem,
+        scan_mode: "dynamic",
+        selected_packages: [packageLabel],
+        force_rescan: true,
+      });
+
+      if (!triggerPayload.job_id) {
+        throw new Error("Scan trigger did not return a job id.");
+      }
+
+      const jobId = String(triggerPayload.job_id);
+      const newJob: ActiveScanJob = {
+        jobId,
+        scanMode: "dynamic",
+        status: "pending",
+        progress: 0,
+        details: { status: "pending", scanned_packages: 0, total_unique_packages: 1, progress_percent: 0 },
+        error: null,
+        elapsedSeconds: 0,
+        sourceTab: "dynamic-analysis",
+      };
+
+      setActiveScanJobs(current => new Map(current).set(jobId, newJob));
+      setHasScanned(true);
+      setSelectedDynamicJobId(jobId);
+      setActiveSection("dynamic-analysis");
+      setGraphDetailNode(null);
+
+      const timer = window.setTimeout(() => {
+        void pollScanJob(owner, repoName, jobId, headers);
+      }, SCAN_POLL_INTERVAL_MS);
+      scanPollTimersRef.current.set(jobId, timer);
+    } catch (err) {
+      const is409 = err instanceof ScanApiError && err.status === 409;
+      setScanError(is409
+        ? "A dynamic scan is already in progress. Please wait or cancel it first."
+        : err instanceof Error ? err.message : "Unexpected error while starting deep scan.");
+    }
+  }, [pollScanJob, resolveRepoCoordinates]);
+
   const triggerLightweightScan = useCallback(async () => {
     setScanError(null);
 
@@ -1605,6 +1691,91 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     }
   }, [resolveRepoCoordinates, scanHistoryModeFilter, scanHistoryStatusFilter]);
 
+  // Resume polling of any scan that is still running server-side. Called on
+  // mount/return so progress (and live partial results) reappear instead of
+  // being lost just because the client navigated away. The scan itself never
+  // stopped — it runs in the background and is fully persisted.
+  const resumeActiveScans = useCallback(async () => {
+    if (!API_BASE_URL) return;
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const result = await getScanHistory(scanContext, { page: 1, per_page: 10 });
+      if (!isMountedRef.current) return;
+
+      const running = result.jobs.filter(j => j.status === "pending" || j.status === "running");
+      if (running.length === 0) return;
+
+      let resumedGraphJob = false;
+      running.forEach((item) => {
+        if (scanPollTimersRef.current.has(item.id)) return; // already polling
+        const sourceTab = sourceTabForMode(item.scan_mode);
+        const resumeMode: ScanMode = item.scan_mode === "unknown" ? "full" : item.scan_mode;
+        const total = item.total_unique_packages ?? item.total_packages ?? 0;
+        const processed = item.processed_packages ?? item.scanned_packages ?? 0;
+        const progress = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+        const elapsed = item.started_at
+          ? Math.max(0, Math.floor((Date.now() - new Date(item.started_at).getTime()) / 1000))
+          : 0;
+
+        setActiveScanJobs((current) => {
+          if (current.has(item.id)) return current;
+          const next = new Map(current);
+          next.set(item.id, {
+            jobId: item.id,
+            scanMode: resumeMode,
+            status: item.status,
+            progress,
+            details: { status: item.status, scanned_packages: processed, total_unique_packages: total, progress_percent: progress },
+            error: null,
+            elapsedSeconds: elapsed,
+            sourceTab,
+          });
+          return next;
+        });
+
+        if (sourceTab === "graph") resumedGraphJob = true;
+        if (sourceTab === "static-analysis") setSelectedStaticJobId(item.id);
+        if (sourceTab === "dynamic-analysis") setSelectedDynamicJobId(item.id);
+        if (sourceTab === "lightweight") setSelectedLightweightJobId(item.id);
+
+        const timer = window.setTimeout(() => {
+          void pollScanJob(owner, repoName, item.id, headers);
+        }, 0);
+        scanPollTimersRef.current.set(item.id, timer);
+      });
+
+      if (resumedGraphJob) {
+        // The running graph job becomes the live view; clear stale completed rows
+        // so the live partial results (merged in by pollScanJob) show cleanly.
+        liveResultKeysRef.current = new Set();
+        setScanResultRows([]);
+        setGraphScanView("progress");
+        setHasScanned(true);
+      }
+    } catch { /* best-effort resume */ }
+  }, [resolveRepoCoordinates, pollScanJob]);
+
+  // Silently refresh just the counts/status of jobs already on the history page
+  // (no list clear, no flicker) so running rows advance even when this client
+  // isn't actively polling the job itself.
+  const refreshRunningHistoryJobs = useCallback(async () => {
+    if (!API_BASE_URL) return;
+    try {
+      const { owner, repoName, headers } = await resolveRepoCoordinates();
+      const scanContext: ScanApiContext = { baseUrl: API_BASE_URL, authHeaders: headers, owner, repoName };
+      const result = await getScanHistory(scanContext, {
+        page: 1,
+        per_page: 25,
+        scan_mode: scanHistoryModeFilter === "all" ? undefined : scanHistoryModeFilter,
+        status: scanHistoryStatusFilter === "all" ? undefined : scanHistoryStatusFilter,
+      });
+      if (!isMountedRef.current) return;
+      const updates = new Map(result.jobs.map((j) => [j.id, j]));
+      setScanHistoryJobs((current) => current.map((j) => updates.get(j.id) ?? j));
+    } catch { /* silent */ }
+  }, [resolveRepoCoordinates, scanHistoryModeFilter, scanHistoryStatusFilter]);
+
   const loadMoreScanHistory = useCallback(async () => {
     if (!API_BASE_URL || isScanHistoryLoading || scanHistoryJobs.length >= scanHistoryTotal) {
       return;
@@ -1707,8 +1878,13 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
 
   useEffect(() => {
     setIsLoadingTree(true);
-    void Promise.all([loadDependencyTree(), loadLatestScanResults()]);
-  }, [decodedId, loadDependencyTree, loadLatestScanResults]);
+    void (async () => {
+      await Promise.all([loadDependencyTree(), loadLatestScanResults()]);
+      // Resume any still-running scan after the latest completed results load,
+      // so a running job's live partial results take over the view cleanly.
+      await resumeActiveScans();
+    })();
+  }, [decodedId, loadDependencyTree, loadLatestScanResults, resumeActiveScans]);
 
   useEffect(() => {
     if (activeSection === "history") {
@@ -1724,6 +1900,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
     // Only re-run when the active section or filter changes, not every loadScanHistory recreation
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSection, decodedId, scanHistoryModeFilter, scanHistoryStatusFilter]);
+
+  // While viewing history with a running/pending job, silently refresh counts so
+  // the in-row progress bar advances even without an active poll for that job.
+  useEffect(() => {
+    if (activeSection !== "history" || !hasRunningHistoryJob) return;
+    const interval = window.setInterval(() => {
+      void refreshRunningHistoryJobs();
+    }, 4000);
+    return () => window.clearInterval(interval);
+  }, [activeSection, hasRunningHistoryJob, refreshRunningHistoryJobs]);
 
   // When history refreshes and the currently-selected job transitions from running→done, re-fetch its details.
   useEffect(() => {
@@ -2116,14 +2302,21 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
               <div className="relative h-full overflow-hidden rounded-2xl border border-gray-800 bg-gray-950/90">
                 <div className="absolute left-4 top-4 z-10 max-w-md rounded-2xl border border-gray-700/80 bg-gray-950/90 px-4 py-3 shadow-[0_18px_50px_-24px_rgba(2,6,23,0.95)] backdrop-blur">
                   <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Malware Package Scan</p>
-                      <p className="mt-1 text-sm text-slate-400">Progress stays in the graph. Results appear here after completion.</p>
-                    </div>
-                    {/* Removed "View Results" toggle button per UI update request */}
+                    <button
+                      type="button"
+                      onClick={() => setGraphScanCardCollapsed((v) => !v)}
+                      className="flex flex-1 items-center justify-between gap-3 text-left"
+                      aria-expanded={!graphScanCardCollapsed}
+                    >
+                      <span>
+                        <span className="block text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300">Malware Package Scan</span>
+                        <span className="mt-1 block text-sm text-slate-400">Progress stays in the graph. Results appear here after completion.</span>
+                      </span>
+                      <span className="shrink-0 text-slate-400">{graphScanCardCollapsed ? "▼" : "▲"}</span>
+                    </button>
                   </div>
 
-                  {graphScanView === "progress" ? (
+                  {!graphScanCardCollapsed && graphScanView === "progress" ? (
                     <div className="mt-3 space-y-2">
                       <p className="text-xs text-slate-400">{scanStatus}</p>
                       {shouldShowScanRuntime ? (
@@ -2170,7 +2363,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                       ) : null}
 
                       {scanResultRows.length > 0 ? (
-                        <div className="max-h-[28vh] overflow-auto rounded-lg border border-slate-800">
+                        <div className="space-y-2">
+                          <input
+                            type="text"
+                            value={scannedResultsSearch}
+                            onChange={(e) => setScannedResultsSearch(e.target.value)}
+                            placeholder="Search scanned packages..."
+                            className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400/60"
+                          />
+                          <div className="max-h-[28vh] overflow-auto rounded-lg border border-slate-800">
                           <table className="w-full text-left text-xs text-slate-200">
                             <thead className="sticky top-0 bg-slate-900/95 text-slate-400">
                               <tr>
@@ -2180,7 +2381,12 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               </tr>
                             </thead>
                             <tbody>
-                              {scanResultRows.map((row) => {
+                              {filteredScanResultRows.length === 0 ? (
+                                <tr>
+                                  <td colSpan={3} className="px-3 py-3 text-center text-slate-500">No packages match &ldquo;{scannedResultsSearch}&rdquo;</td>
+                                </tr>
+                              ) : null}
+                              {filteredScanResultRows.map((row) => {
                                 const verdictStatus = row.riskStatus ?? row.malwareStatus;
                                 const verdictClass = verdictStatus === "malicious"
                                   ? "border-rose-400/50 bg-rose-500/15 text-rose-200"
@@ -2216,6 +2422,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                               })}
                             </tbody>
                           </table>
+                          </div>
                         </div>
                       ) : null}
 
@@ -2382,11 +2589,26 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                             </button>
                           ) : null}
                         </div>
+                        <details className="mt-2 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-[11px] text-slate-400">
+                          <summary className="cursor-pointer select-none font-semibold uppercase tracking-[0.12em] text-slate-400">
+                            Why do most packages score low?
+                          </summary>
+                          <p className="mt-2 leading-relaxed">
+                            The risk score is a Bayesian posterior: it starts from a very low prior
+                            (most packages are benign), and trusted reputation signals (high downloads,
+                            stars, age) push it lower. Costly dynamic sandbox analysis only runs for
+                            packages that look suspicious or have very low reputation, so popular,
+                            well-known packages legitimately land in the &ldquo;clean&rdquo; band.
+                            To inspect any package by hand, open it from the graph and use
+                            <span className="font-semibold text-orange-300"> Deep scan</span> to force a
+                            full dynamic analysis, or run a partial scan in the Lightweight / Dynamic tabs.
+                          </p>
+                        </details>
                       </div>
                     </div>
                   ) : null}
 
-                      {graphScanView === "results" && canShowGraphScanResults ? (
+                      {!graphScanCardCollapsed && graphScanView === "results" && canShowGraphScanResults ? (
                     <div className="mt-3 rounded-xl border border-gray-800 bg-gray-900/70 p-3 text-xs text-slate-300">
                       <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Results</p>
                       {latestScanSummary.status === null ? (
@@ -2491,6 +2713,15 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     <path d="M8 2v2M8 12v2M2 8h2M12 8h2M4.2 4.2l1.4 1.4M10.4 10.4l1.4 1.4M4.2 11.8l1.4-1.4M10.4 5.6l1.4-1.4" />
                                   </svg>
                                   Ask AI
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isScanRunning}
+                                  title="Run a full dynamic (sandbox) analysis on just this package"
+                                  onClick={() => void triggerSinglePackageDeepScan(`${pkgName}@${pkgVersion ?? "unknown"}`)}
+                                  className="flex items-center gap-1 rounded-lg border border-orange-400/40 bg-orange-500/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-orange-300 transition hover:bg-orange-500/20 hover:text-orange-200 disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  Deep scan
                                 </button>
                               </div>
                             </div>
@@ -4173,6 +4404,16 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                   ? "border-rose-400/50 bg-rose-500/15 text-rose-100"
                                   : "border-slate-500/50 bg-slate-500/15 text-slate-300";
                             const isExpanded = selectedHistoryJobId === job.id;
+                            const isJobRunning = job.status === "running" || job.status === "pending";
+                            // Prefer live progress from an active/resumed poll; fall back to the
+                            // history snapshot counts the backend already returns.
+                            const liveHistJob = activeScanJobs.get(job.id);
+                            const histTotal = liveHistJob?.details?.total_unique_packages
+                              ?? job.total_unique_packages ?? job.total_packages ?? 0;
+                            const histProcessed = liveHistJob?.details?.scanned_packages
+                              ?? job.processed_packages ?? job.scanned_packages ?? 0;
+                            const histProgressPercent = liveHistJob?.progress
+                              ?? (histTotal > 0 ? Math.min(100, Math.round((histProcessed / histTotal) * 100)) : 0);
 
                             return (
                               <React.Fragment key={job.id}>
@@ -4190,7 +4431,21 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                     </span>
                                   </td>
                                   <td className="px-4 py-3 text-slate-300">{job.total_packages}</td>
-                                  <td className="px-4 py-3 text-slate-400">{duration}</td>
+                                  <td className="px-4 py-3 text-slate-400">
+                                    {isJobRunning ? (
+                                      <div className="min-w-[120px]">
+                                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                                          <div
+                                            className="h-full rounded-full bg-cyan-400 transition-all duration-300"
+                                            style={{ width: `${Math.max(4, Math.min(100, histProgressPercent))}%` }}
+                                          />
+                                        </div>
+                                        <p className="mt-1 text-[10px] text-slate-400">
+                                          {histProcessed}/{histTotal || "?"} · {histProgressPercent}%
+                                        </p>
+                                      </div>
+                                    ) : duration}
+                                  </td>
                                   <td className="px-4 py-3">
                                     <button
                                       type="button"
@@ -4238,6 +4493,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                     <th className="px-3 py-2">Status</th>
                                                     <th className="px-3 py-2">Score</th>
                                                     <th className="px-3 py-2">CVEs</th>
+                                                    <th className="px-3 py-2">Classifier</th>
                                                     <th className="px-3 py-2">Analysis</th>
                                                     <th className="px-3 py-2">Details</th>
                                                   </tr>
@@ -4261,6 +4517,9 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                           <td className={`px-3 py-1.5 font-semibold uppercase text-[10px] ${verdictBadgeClass(result.risk_overall_status)}`}>{formatVerdict(result.risk_overall_status)}</td>
                                                           <td className="px-3 py-1.5">{(result.risk_overall_score * 100).toFixed(0)}%</td>
                                                           <td className="px-3 py-1.5">{cveCount > 0 ? cveCount : "—"}</td>
+                                                          <td className="px-3 py-1.5 font-mono text-slate-300">
+                                                            {result.malware_score != null ? `${(result.malware_score * 100).toFixed(1)}%` : "—"}
+                                                          </td>
                                                           <td className="px-3 py-1.5">
                                                             <div className="flex flex-wrap gap-1">
                                                               {(result.analyzed_by ?? []).map((a) => (
@@ -4288,7 +4547,7 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
                                                                 type="button"
                                                                 title="Ask AI to explain this package"
                                                                 disabled={agentIsStreaming}
-                                                                onClick={() => void handleExplain({ package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, static_features: result.static_features ?? null, vulnerability_details: result.vulnerability_details ?? [], dynamic_findings: result.dynamic_findings ?? null, reputation_metadata: result.reputation_metadata ?? null })}
+                                                                onClick={() => void handleExplain({ package_name: result.package_name, package_version: result.package_version, ecosystem: result.ecosystem, malware_status: result.malware_status, malware_score: result.malware_score, risk_status: result.risk_overall_status, risk_score: result.risk_overall_score, static_features: result.static_features ?? null, vulnerability_details: result.vulnerability_details ?? [], dynamic_findings: result.dynamic_findings ?? null, reputation_metadata: result.reputation_metadata ?? null })}
                                                                 className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide text-violet-400 transition hover:text-violet-300 disabled:cursor-wait disabled:opacity-40"
                                                               >
                                                                 <svg viewBox="0 0 16 16" className="h-3 w-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
@@ -4967,16 +5226,19 @@ export default function RepoDetailsPage({ params }: RepoDetailsPageProps) {
           </div>
           ) : null}
 
-          {activeSection === "add" ? (
-            <div className="h-full overflow-y-auto px-4 pb-6 pt-4">
-              <AddDependencyPanel
-                apiBaseUrl={API_BASE_URL}
-                initialEcosystem={addDependencyEcosystems[0] ?? repositoryEcosystem ?? "npm"}
-                allowedEcosystems={addDependencyEcosystems}
-                resolveRepoCoordinates={resolveRepoCoordinates}
-              />
-            </div>
-          ) : null}
+          {/* Kept mounted (hidden when inactive) so the selected-dependency list and
+              scan results persist across tab switches. Keyed by repo so it resets
+              only when navigating to a different repository. */}
+          <div className={activeSection === "add" ? "h-full overflow-y-auto px-4 pb-6 pt-4" : "hidden"}>
+            <AddDependencyPanel
+              key={decodedId}
+              apiBaseUrl={API_BASE_URL}
+              initialEcosystem={addDependencyEcosystems[0] ?? repositoryEcosystem ?? "npm"}
+              allowedEcosystems={addDependencyEcosystems}
+              resolveRepoCoordinates={resolveRepoCoordinates}
+              onExplain={(payload) => { void handleExplain(payload); }}
+            />
+          </div>
           </main>
         </div>
       </div>

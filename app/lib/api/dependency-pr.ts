@@ -96,6 +96,21 @@ export interface CreateDependencyPrRequest {
   pr_body?: string;
   updated_package_lock_json?: string | null;
   generate_lockfile_server_side?: boolean;
+  /** When false, the backend skips the heavy re-scan (packages already scanned via prescan). */
+  run_prescan?: boolean;
+  /** Pre-built markdown summary embedded into the PR body when run_prescan is false. */
+  scan_summary_markdown?: string;
+}
+
+export interface PrescanRequest {
+  ecosystem: Ecosystem;
+  dependencies: DependencyDraft[];
+}
+
+export interface PrescanResponse {
+  prescan_results: PackagePrescanResult[];
+  typosquat_warnings: TyposquatWarning[];
+  scan_summary_markdown: string;
 }
 
 export type PackagePrescanResult = {
@@ -547,5 +562,57 @@ export async function createDependencyPr(
     message: typeof record.message === "string" ? record.message : undefined,
     typosquat_warnings: typosquatWarnings.length > 0 ? typosquatWarnings : undefined,
     prescan_results: Array.isArray(record.prescan_results) ? (record.prescan_results as PackagePrescanResult[]) : undefined,
+  };
+}
+
+function normalizeTyposquatWarnings(value: unknown): TyposquatWarning[] {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+        .map((item) => ({
+          package_name: typeof item.package_name === "string" ? item.package_name : "",
+          risk_level: typeof item.risk_level === "string" ? item.risk_level : "warning",
+          reasons: Array.isArray(item.reasons) ? item.reasons.filter((r): r is string => typeof r === "string") : [],
+          similar_to: typeof item.similar_to === "string" ? item.similar_to : null,
+          monthly_downloads: typeof item.monthly_downloads === "number" ? item.monthly_downloads : null,
+        }))
+    : [];
+}
+
+/**
+ * Run the full pre-PR security scan WITHOUT creating a pull request.
+ * The (potentially long) scan happens here; PR creation is a separate, explicit step.
+ */
+export async function prescanDependencies(
+  context: DependencyApiContext,
+  owner: string,
+  repoName: string,
+  request: PrescanRequest,
+): Promise<PrescanResponse> {
+  const url = `${context.baseUrl}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/dependencies/prescan`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...context.authHeaders,
+    },
+    credentials: "include",
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(150_000),
+  });
+
+  const payload = await parseJsonSafe(response);
+
+  if (!response.ok) {
+    throw new DependencyApiError(response.status, toErrorMessage(payload, `Dependency scan failed (${response.status}).`));
+  }
+
+  const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+
+  return {
+    prescan_results: Array.isArray(record.prescan_results) ? (record.prescan_results as PackagePrescanResult[]) : [],
+    typosquat_warnings: normalizeTyposquatWarnings(record.typosquat_warnings),
+    scan_summary_markdown: typeof record.scan_summary_markdown === "string" ? record.scan_summary_markdown : "",
   };
 }
